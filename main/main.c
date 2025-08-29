@@ -52,7 +52,9 @@ void app_main(void)
 
     // Init componenti applicativi
     ESP_ERROR_CHECK(storage_init());
-    ESP_ERROR_CHECK(eth_start());
+    if (eth_start() != ESP_OK) {
+        ESP_LOGW(TAG, "Ethernet not available. Continuing without it...");
+    }
     ESP_ERROR_CHECK(auth_init());
     ESP_ERROR_CHECK(mqtt_start());
     ESP_ERROR_CHECK(inputs_init());

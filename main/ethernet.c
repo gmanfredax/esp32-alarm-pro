@@ -74,7 +74,10 @@ esp_err_t eth_start(void)
     ESP_RETURN_ON_FALSE(phy, ESP_FAIL, TAG, "esp_eth_phy_new_lan87xx failed");
 
     esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
-    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_cfg, &s_eth));
+    if (esp_eth_driver_install(&eth_cfg, &s_eth) != ESP_OK) {
+        ESP_LOGE(TAG, "Ethernet driver install failed");
+        return ESP_FAIL;
+    }
 
     // 3) glue + attach
     void* glue = esp_eth_new_netif_glue(s_eth);
