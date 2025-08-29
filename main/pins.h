@@ -1,9 +1,10 @@
 // main/pins.h
 #pragma once
+#include "driver/gpio.h"
 #include "driver/spi_master.h"  // per SPIx_HOST
 #include "driver/i2c_master.h"
 
-#include "driver/gpio.h"
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OVERRIDE UTENTE (opzionale):
@@ -63,10 +64,10 @@
   #define I2C_PORT              0
 #endif
 #ifndef I2C_SDA_GPIO
-  #define I2C_SDA_GPIO          GPIO_NUM_33   // NON usare 21/22 perché RMII li occupa
+  #define I2C_SDA_GPIO          33   // NON usare 21/22 perché RMII li occupa
 #endif
 #ifndef I2C_SCL_GPIO
-  #define I2C_SCL_GPIO          GPIO_NUM_32
+  #define I2C_SCL_GPIO          32
 #endif
 #ifndef I2C_SPEED_HZ
   #define I2C_SPEED_HZ          400000
@@ -75,6 +76,34 @@
 // ============================== 1-Wire (DS18B20) =============================
 #ifndef ONEWIRE_GPIO
   #define ONEWIRE_GPIO          GPIO_NUM_15
+#endif
+
+// ===== MCP23017 =====
+// Indirizzo con A2..A0 = 0 -> 0x20 (modifica se usi altri strap)
+#ifndef MCP23017_ADDR
+#define MCP23017_ADDR       0x20
+#endif
+
+// Mappatura bit su PORTB (aggiorna se il tuo schema è diverso)
+#ifndef MCPB_RELAY_BIT
+#define MCPB_RELAY_BIT      0
+#endif
+
+#ifndef MCPB_LED_STATO_BIT
+#define MCPB_LED_STATO_BIT  1
+#endif
+
+#ifndef MCPB_LED_MANUT_BIT
+#define MCPB_LED_MANUT_BIT  2
+#endif
+
+#ifndef MCPB_TAMPER_BIT
+#define MCPB_TAMPER_BIT     3
+#endif
+
+// ===== 1-Wire (DS18B20) =====
+#ifndef ONEWIRE_GPIO
+#define ONEWIRE_GPIO        15
 #endif
 
 // ============================== USCITE / INGRESSI ============================

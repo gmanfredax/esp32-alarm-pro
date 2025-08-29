@@ -1,7 +1,7 @@
 // mcp23017.c — IDF 5.x (nuova API I2C bus/device)
 #include <string.h>
 #include "esp_log.h"
-#include "driver/i2c_master.h"
+#include "driver/i2c.h"
 #include "pins.h"   // I2C_SDA_GPIO, I2C_SCL_GPIO, I2C_SPEED_HZ, MCP23017_ADDR
 
 #define IODIRA 0x00

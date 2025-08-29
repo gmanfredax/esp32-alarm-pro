@@ -1,8 +1,9 @@
 #pragma once
+#include "pins.h"
 #include "esp_err.h"
 #include <stdint.h>
 #include <stdbool.h>
-#include "pins.h"
+
 
 esp_err_t inputs_init(void);
 esp_err_t inputs_read_all(uint16_t* gpioab);

@@ -21,7 +21,7 @@
 #define PN532_PIN_MISO  12
 
 // DS18B20
-#define ONEWIRE_PIN     15
+#define ONEWIRE_GPIO     15
 
 // Ethernet RMII (LAN8720)
 // refclk to GPIO0 is handled by hardware oscillator; pins set by esp-idf defaults + overridden in ethernet.c
