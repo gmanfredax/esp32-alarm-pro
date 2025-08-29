@@ -1,0 +1,37 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Centrale Allarme</title>
+<link rel="stylesheet" href="/style.css"></head>
+<body>
+<div class="container">
+  <h1>Centrale Allarme ESP32</h1>
+  <div class="card" id="login">
+    <h3>Login</h3>
+    <input id="u" placeholder="user" />
+    <input id="p" placeholder="password" type="password"/>
+    <input id="o" placeholder="OTP (se attivo)"/>
+    <button onclick="login()">Entra</button>
+  </div>
+  <div id="app" style="display:none">
+    <div class="card" id="status"></div>
+    <div class="actions">
+      <button onclick="arm('home')">Arma HOME</button>
+      <button onclick="arm('away')">Arma AWAY</button>
+      <button onclick="arm('night')">Arma NIGHT</button>
+      <button onclick="arm('custom')">Arma CUSTOM</button>
+      <button onclick="disarm()">Disarma</button>
+      <button onclick="refresh()">Aggiorna</button>
+    </div>
+    <div class="grid">
+      <div class="card"><h3>Zone</h3><pre id="zones"></pre></div>
+      <div class="card"><h3>Log</h3><pre id="logs"></pre></div>
+      <div class="card"><h3>Uscite</h3>
+        <label>Sirena <input type="checkbox" id="relay" onchange="setOutputs()"></label><br/>
+        <label>LED Stato <input type="checkbox" id="leds" onchange="setOutputs()"></label><br/>
+        <label>LED Manut <input type="checkbox" id="ledm" onchange="setOutputs()"></label><br/>
+      </div>
+    </div>
+  </div>
+</div>
+<script src="/script.js"></script>
+</body></html>

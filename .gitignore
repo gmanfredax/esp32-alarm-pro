@@ -1,0 +1,33 @@
+# Build & CMake
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+compile_commands.json
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+# Managed components: tieni solo il lock per riproducibilità
+managed_components/*
+!managed_components/dependencies.lock
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS e log
+.DS_Store
+Thumbs.db
+*.log
+
+# Segreti/certificati (non committarli!)
+secrets*.h
+certs/
+*.pem
+*.key
+*.crt
+*.p12
+*.der
