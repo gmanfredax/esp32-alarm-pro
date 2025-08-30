@@ -1,86 +1,100 @@
 #!/usr/bin/env bash
-# push-local-to-main.sh — Copia lo stato locale nel branch 'main' remoto (GitHub+GitLab)
-# NON fa pull/fetch/rebase. Solo commit locale (se serve) e push forzato verso 'main'.
+# push-local-to-main.sh — spinge SEMPRE lo stato locale online.
+# - GitHub (origin/main): push (usa --force-with-lease per essere unidirezionale da locale)
+# - GitLab (gitlab/main): se push rifiutato (branch protetto), crea branch di sync + Merge Request automatica.
+#
+# Variabili:
+#   REMOTE1=origin   REMOTE2=gitlab   TARGET=main
+#   GL_TOKEN=<PAT con scope api>      GL_PROJECT_ID=<ID numerico del progetto GitLab>
 #
 # Uso:
-#   bash ./push-local-to-main.sh            # push HEAD -> origin/main e gitlab/main con --force-with-lease
-#   bash ./push-local-to-main.sh -m "msg"   # con messaggio commit auto
-#   bash ./push-local-to-main.sh --hard     # usa --force (sovrascrive sempre, ignorando cambi remoti)
-#   TARGET=develop bash ./push-local-to-main.sh   # push su branch remoto diverso da 'main'
+#   bash ./push-local-to-main.sh
+#   bash ./push-local-to-main.sh -m "msg commit"
+#   TARGET=develop bash ./push-local-to-main.sh -m "sync develop"
 #
-# Variabili remoti (override facoltativo):
-#   REMOTE1=origin  REMOTE2=gitlab  TARGET=main  bash ./push-local-to-main.sh
+# NOTE: Nessun fetch/pull: non prende mai da online.
 
 set -e
 
-REMOTE1="${REMOTE1:-origin}"   # GitHub
-REMOTE2="${REMOTE2:-gitlab}"   # GitLab
-TARGET="${TARGET:-main}"       # branch remoto di destinazione
-
+REMOTE1="${REMOTE1:-origin}"
+REMOTE2="${REMOTE2:-gitlab}"
+TARGET="${TARGET:-main}"
 COMMIT_MSG=""
-HARD=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     -m|--message) shift; COMMIT_MSG="${1:-}";;
-    --hard)       HARD=1;;
     *) echo "Argomento non riconosciuto: $1" >&2; exit 2;;
   esac
   shift || true
 done
 
-# 0) Preflight
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "Non sei in una repo git"; exit 1; }
+
 CURBR="$(git rev-parse --abbrev-ref HEAD)"
+echo "== Locale HEAD ($CURBR) -> remoti ($TARGET) =="
 
-echo "== Push locale -> remoti: HEAD ($CURBR) -> $TARGET =="
-
-# 1) Commit automatico se ci sono modifiche locali
+# 1) Commit auto se ci sono modifiche
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "--> Commit automatico modifiche locali"
   git add -A
-  if [ -z "$COMMIT_MSG" ]; then
-    COMMIT_MSG="sync: push locale su $TARGET - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-  fi
+  [ -z "$COMMIT_MSG" ] && COMMIT_MSG="sync: push locale su $TARGET - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
   git commit -m "$COMMIT_MSG"
 else
   echo "--> Nessuna modifica locale da committare"
 fi
 
-# 2) Push verso GitHub (REMOTE1)
+# 2) Push su GitHub (origin)
 if git remote get-url "$REMOTE1" >/dev/null 2>&1; then
-  echo "--> Push su $REMOTE1: HEAD -> refs/heads/$TARGET"
-  if [ $HARD -eq 1 ]; then
-    git push --force "$REMOTE1" HEAD:"refs/heads/$TARGET"
-  else
-    # tenta in modo "sicuro" senza leggere da remoto; se fallisce, suggerisce --hard
-    git push --force-with-lease "$REMOTE1" HEAD:"refs/heads/$TARGET" || {
-      echo "!!  Push rifiutato su $REMOTE1. Rilancia con --hard per sovrascrivere comunque."
-      exit 1
-    }
-  fi
-  echo "OK  $REMOTE1 aggiornato."
+  echo "--> Push GitHub ($REMOTE1: HEAD -> $TARGET)"
+  git push --force-with-lease "$REMOTE1" HEAD:"refs/heads/$TARGET"
+  echo "OK  GitHub aggiornato"
 else
-  echo "!!  Remote '$REMOTE1' non configurato: salto"
+  echo "!!  Remote '$REMOTE1' non configurato: salto GitHub"
 fi
 
-# 3) Push verso GitLab (REMOTE2)
+# 3) Push su GitLab (gitlab)
 if git remote get-url "$REMOTE2" >/dev/null 2>&1; then
-  echo "--> Push su $REMOTE2: HEAD -> refs/heads/$TARGET"
-  if [ $HARD -eq 1 ]; then
-    git push --force "$REMOTE2" HEAD:"refs/heads/$TARGET" || {
-      echo "!!  Push rifiutato su $REMOTE2 (branch protetto?). Vedi note sotto."
-      exit 1
-    }
+  echo "--> Push GitLab ($REMOTE2: HEAD -> $TARGET)"
+  set +e
+  git push --force-with-lease "$REMOTE2" HEAD:"refs/heads/$TARGET"
+  rc=$?
+  set -e
+
+  if [ $rc -eq 0 ]; then
+    echo "OK  GitLab aggiornato"
   else
-    git push --force-with-lease "$REMOTE2" HEAD:"refs/heads/$TARGET" || {
-      echo "!!  Push rifiutato su $REMOTE2. Rilancia con --hard per sovrascrivere comunque."
-      exit 1
-    }
+    echo "!!  Push rifiutato su GitLab (branch protetto?). Avvio fallback MR."
+
+    # 3a) Crea branch di sync e pusha
+    TS="$(date -u +'%Y%m%d-%H%M%S')"
+    SYNC_BRANCH="sync/$TS"
+    echo "--> Creo branch di sync: $SYNC_BRANCH"
+    git branch -f "$SYNC_BRANCH" HEAD
+    git push "$REMOTE2" "$SYNC_BRANCH:refs/heads/$SYNC_BRANCH"
+
+    # 3b) Crea Merge Request via API (serve GL_TOKEN e GL_PROJECT_ID)
+    if [ -z "${GL_TOKEN:-}" ] || [ -z "${GL_PROJECT_ID:-}" ]; then
+      echo "!!  Variabili GL_TOKEN e/o GL_PROJECT_ID mancanti: non posso aprire la MR automaticamente."
+      echo "    Apri manualmente la MR: source_branch=$SYNC_BRANCH -> target_branch=$TARGET"
+      exit 0
+    fi
+
+    MR_TITLE="Sync from local $TS"
+    echo "--> Creo MR automatica: $SYNC_BRANCH -> $TARGET"
+
+    curl -sS -X POST "https://gitlab.com/api/v4/projects/${GL_PROJECT_ID}/merge_requests" \
+      -H "PRIVATE-TOKEN: ${GL_TOKEN}" \
+      --data-urlencode "source_branch=${SYNC_BRANCH}" \
+      --data-urlencode "target_branch=${TARGET}" \
+      --data-urlencode "title=${MR_TITLE}" \
+      --data-urlencode "remove_source_branch=true" \
+      --data "squash=0" >/dev/null
+
+    echo "OK  MR creata. Vai su GitLab e fai Merge."
   fi
-  echo "OK  $REMOTE2 aggiornato."
 else
-  echo "!!  Remote '$REMOTE2' non configurato: salto"
+  echo "!!  Remote '$REMOTE2' non configurato: salto GitLab"
 fi
 
 echo "== Finito =="
