@@ -118,8 +118,11 @@ esp_err_t eth_start(void)
 
     // Init stack di rete e loop eventi (idempotente)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_init());
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_loop_create_default());
-
+    esp_err_t __e = esp_event_loop_create_default();
+    if (__e != ESP_OK && __e != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(__e));
+        return __e;
+    }   
     // Registra eventi (idempotente)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &on_eth_event, NULL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &on_ip_event, NULL));

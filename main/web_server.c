@@ -228,6 +228,23 @@ static esp_err_t logs_get(httpd_req_t* req){
     return ESP_OK;
 }
 
+static esp_err_t favicon_get(httpd_req_t* req){
+    FILE* f = fopen("/spiffs/favicon.ico", "rb");
+    if(!f){
+        // Se non hai la favicon, rispondi 204 per far sparire i warning
+        httpd_resp_set_status(req, "204 No Content");
+        return httpd_resp_send(req, NULL, 0);
+    }
+    httpd_resp_set_type(req, "image/x-icon");
+    char b[512]; size_t n;
+    while((n=fread(b,1,sizeof(b),f))>0){
+        if(httpd_resp_send_chunk(req,b,n)!=ESP_OK){ fclose(f); return ESP_FAIL; }
+    }
+    fclose(f);
+    return httpd_resp_send_chunk(req,NULL,0);
+}
+
+
 esp_err_t web_server_start(void){
     // Monta SPIFFS con i file web
     esp_vfs_spiffs_conf_t conf = {
@@ -251,10 +268,11 @@ esp_err_t web_server_start(void){
 
     ESP_ERROR_CHECK(httpd_start(&s_server, &cfg));
 
-    httpd_uri_t u_root    = {.uri="/",           .method=HTTP_GET,  .handler=root_get};
-    httpd_uri_t u_css     = {.uri="/style.css",  .method=HTTP_GET,  .handler=style_get};
-    httpd_uri_t u_js      = {.uri="/script.js",  .method=HTTP_GET,  .handler=script_get};
+    httpd_uri_t u_root      = {.uri="/",           .method=HTTP_GET,  .handler=root_get};
+    httpd_uri_t u_css       = {.uri="/style.css",  .method=HTTP_GET,  .handler=style_get};
+    httpd_uri_t u_js        = {.uri="/script.js",  .method=HTTP_GET,  .handler=script_get};
 
+    httpd_uri_t u_fav       = {.uri="/favicon.ico", .method=HTTP_GET,  .handler=favicon_get };
     httpd_uri_t api_login   = {.uri="/api/login",   .method=HTTP_POST, .handler=login_post};
     httpd_uri_t api_status  = {.uri="/api/status",  .method=HTTP_GET,  .handler=status_get};
     httpd_uri_t api_zones   = {.uri="/api/zones",   .method=HTTP_GET,  .handler=zones_get};
@@ -267,6 +285,7 @@ esp_err_t web_server_start(void){
     httpd_register_uri_handler(s_server, &u_css);
     httpd_register_uri_handler(s_server, &u_js);
 
+    httpd_register_uri_handler(s_server, &u_fav);
     httpd_register_uri_handler(s_server, &api_login);
     httpd_register_uri_handler(s_server, &api_status);
     httpd_register_uri_handler(s_server, &api_zones);
