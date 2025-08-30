@@ -1,84 +1,87 @@
 #!/usr/bin/env bash
-# sync-to-main.sh — porta lo stato locale dentro 'main' e push su GitHub e GitLab
+# push-local-to-main.sh — Copia lo stato locale nel branch 'main' remoto (GitHub+GitLab)
+# NON fa pull/fetch/rebase. Solo commit locale (se serve) e push forzato verso 'main'.
+#
 # Uso:
-#   bash ./sync-to-main.sh          # usa 'main'
-#   bash ./sync-to-main.sh develop  # usa un branch target diverso
+#   bash ./push-local-to-main.sh            # push HEAD -> origin/main e gitlab/main con --force-with-lease
+#   bash ./push-local-to-main.sh -m "msg"   # con messaggio commit auto
+#   bash ./push-local-to-main.sh --hard     # usa --force (sovrascrive sempre, ignorando cambi remoti)
+#   TARGET=develop bash ./push-local-to-main.sh   # push su branch remoto diverso da 'main'
+#
+# Variabili remoti (override facoltativo):
+#   REMOTE1=origin  REMOTE2=gitlab  TARGET=main  bash ./push-local-to-main.sh
 
 set -e
 
 REMOTE1="${REMOTE1:-origin}"   # GitHub
 REMOTE2="${REMOTE2:-gitlab}"   # GitLab
-TARGET="${1:-main}"
+TARGET="${TARGET:-main}"       # branch remoto di destinazione
+
+COMMIT_MSG=""
+HARD=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--message) shift; COMMIT_MSG="${1:-}";;
+    --hard)       HARD=1;;
+    *) echo "Argomento non riconosciuto: $1" >&2; exit 2;;
+  esac
+  shift || true
+done
 
 # 0) Preflight
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "Non sei in una repo git"; exit 1; }
-SRC_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+CURBR="$(git rev-parse --abbrev-ref HEAD)"
 
-echo "== Sorgente: $SRC_BRANCH → Target: $TARGET =="
+echo "== Push locale -> remoti: HEAD ($CURBR) -> $TARGET =="
 
-# 1) Commit automatico delle modifiche locali (sul branch sorgente)
+# 1) Commit automatico se ci sono modifiche locali
 if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "--> Commit automatico delle modifiche locali su $SRC_BRANCH"
+  echo "--> Commit automatico modifiche locali"
   git add -A
-  git commit -m "sync: merge in $TARGET - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-else
-  echo "--> Nessuna modifica locale da committare su $SRC_BRANCH"
-fi
-
-# 2) Fetch dei remoti
-echo "--> Fetch remoti"
-git fetch "$REMOTE1" --prune || true
-git fetch "$REMOTE2" --prune || true
-
-# 3) Assicura che il branch TARGET esista localmente
-if ! git show-ref --verify --quiet "refs/heads/$TARGET"; then
-  echo "--> Creo branch locale $TARGET"
-  if git show-ref --verify --quiet "refs/remotes/$REMOTE1/$TARGET"; then
-    git branch "$TARGET" "$REMOTE1/$TARGET"
-  elif git show-ref --verify --quiet "refs/remotes/$REMOTE2/$TARGET"; then
-    git branch "$TARGET" "$REMOTE2/$TARGET"
-  else
-    # se non esiste da nessuna parte, lo inizializzo allo stato corrente
-    git branch "$TARGET" "$SRC_BRANCH"
+  if [ -z "$COMMIT_MSG" ]; then
+    COMMIT_MSG="sync: push locale su $TARGET - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
   fi
-fi
-
-# 4) Passa a TARGET e riallinea con il remoto principale (GitHub)
-echo "--> Switch a $TARGET"
-git switch "$TARGET" 2>/dev/null || git checkout "$TARGET"
-
-if git show-ref --verify --quiet "refs/remotes/$REMOTE1/$TARGET"; then
-  echo "--> Rebase di $TARGET su $REMOTE1/$TARGET"
-  git pull --rebase "$REMOTE1" "$TARGET"
-fi
-
-# 5) Merge del branch sorgente in TARGET (porta dentro i file locali)
-if [ "$SRC_BRANCH" != "$TARGET" ]; then
-  echo "--> Merge di $SRC_BRANCH in $TARGET"
-  git merge --no-ff --no-edit "$SRC_BRANCH" || {
-    echo "!! CONFLITTI: risolvili, poi esegui:"
-    echo "   git add -A && git commit"
-    echo "   git push $REMOTE1 $TARGET"
-    [ -n "$REMOTE2" ] && echo "   git push $REMOTE2 $TARGET"
-    exit 1
-  }
+  git commit -m "$COMMIT_MSG"
 else
-  echo "--> Sei già su $TARGET: nessun merge necessario"
+  echo "--> Nessuna modifica locale da committare"
 fi
 
-# 6) Push su GitHub e GitLab
-echo "--> Push su GitHub ($REMOTE1 → $TARGET)"
-git push "$REMOTE1" "$TARGET"
+# 2) Push verso GitHub (REMOTE1)
+if git remote get-url "$REMOTE1" >/dev/null 2>&1; then
+  echo "--> Push su $REMOTE1: HEAD -> refs/heads/$TARGET"
+  if [ $HARD -eq 1 ]; then
+    git push --force "$REMOTE1" HEAD:"refs/heads/$TARGET"
+  else
+    # tenta in modo "sicuro" senza leggere da remoto; se fallisce, suggerisce --hard
+    git push --force-with-lease "$REMOTE1" HEAD:"refs/heads/$TARGET" || {
+      echo "!!  Push rifiutato su $REMOTE1. Rilancia con --hard per sovrascrivere comunque."
+      exit 1
+    }
+  fi
+  echo "OK  $REMOTE1 aggiornato."
+else
+  echo "!!  Remote '$REMOTE1' non configurato: salto"
+fi
 
+# 3) Push verso GitLab (REMOTE2)
 if git remote get-url "$REMOTE2" >/dev/null 2>&1; then
-  echo "--> Push su GitLab ($REMOTE2 → $TARGET)"
-  git push "$REMOTE2" "$TARGET"
+  echo "--> Push su $REMOTE2: HEAD -> refs/heads/$TARGET"
+  if [ $HARD -eq 1 ]; then
+    git push --force "$REMOTE2" HEAD:"refs/heads/$TARGET" || {
+      echo "!!  Push rifiutato su $REMOTE2 (branch protetto?). Vedi note sotto."
+      exit 1
+    }
+  else
+    git push --force-with-lease "$REMOTE2" HEAD:"refs/heads/$TARGET" || {
+      echo "!!  Push rifiutato su $REMOTE2. Rilancia con --hard per sovrascrivere comunque."
+      exit 1
+    }
+  fi
+  echo "OK  $REMOTE2 aggiornato."
 else
-  echo "!! Remote '$REMOTE2' non configurato: salto"
+  echo "!!  Remote '$REMOTE2' non configurato: salto"
 fi
 
-# 7) Torna al branch di partenza
-echo "--> Torno a $SRC_BRANCH"
-git switch "$SRC_BRANCH" 2>/dev/null || git checkout "$SRC_BRANCH"
+echo "== Finito =="
 
-echo "== Fatto: $TARGET aggiornato su $REMOTE1 e $REMOTE2 =="
