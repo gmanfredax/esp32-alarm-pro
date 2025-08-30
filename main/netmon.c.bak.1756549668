@@ -30,9 +30,9 @@ static void on_ip_event(void* arg, esp_event_base_t base, int32_t id, void* data
         esp_netif_dns_info_t dns;
         for (int i=0;i<ESP_NETIF_DNS_MAX;i++){
             if (esp_netif_get_dns_info(event->esp_netif, i, &dns) == ESP_OK &&
-                dns.ip.u_addr.ip4.addr != 0){
+                dns.addr.u_addr.ip4.addr != 0){
                 char d[16];
-                esp_ip4addr_ntoa(&dns.ip.u_addr.ip4, d, sizeof d);
+                esp_ip4addr_ntoa(&dns.addr.u_addr.ip4, d, sizeof d);
                 ESP_LOGI(TAG, "DNS[%d]=%s", i, d);
             }
         }

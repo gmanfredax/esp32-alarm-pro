@@ -1,0 +1,53 @@
+diff --git a/main/netmon.c b/main/netmon.c
+index 1111111..2222222 100644
+--- a/main/netmon.c
++++ b/main/netmon.c
+@@ -25,14 +25,14 @@ static void on_ip_event(void* arg, esp_event_base_t base, int32_t id, void* data
+         case IP_EVENT_ETH_GOT_IP: {
+             ip_event_got_ip_t* e = (ip_event_got_ip_t*)data;
+             char d[16] = {0};
+-            esp_netif_dns_info_t dns;
++            esp_netif_dns_info_t dns;
+             esp_netif_t* netif = e->esp_netif;
+             if (esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK &&
+-                dns.addr.type == IPADDR_TYPE_V4 &&
+-                dns.addr.u_addr.ip4.addr != 0){
+-                esp_ip4addr_ntoa(&dns.addr.u_addr.ip4, d, sizeof d);
++                dns.ip.type == IPADDR_TYPE_V4 &&
++                dns.ip.u_addr.ip4.addr != 0){
++                esp_ip4addr_ntoa(&dns.ip.u_addr.ip4, d, sizeof d);
+             }
+-            ESP_LOGI(TAG, "ETH got IP: " IPSTR "  DNS: %s", IP2STR(&e->ip_info.ip), d[0] ? d : "-");
++            ESP_LOGI(TAG, "ETH got IP: " IPSTR "  DNS: %s", IP2STR(&e->ip_info.ip), d[0] ? d : "-");
+             break;
+         }
+         default:
+diff --git a/main/mqtt_client.c b/main/mqtt_client.c
+index 3333333..4444444 100644
+--- a/main/mqtt_client.c
++++ b/main/mqtt_client.c
+@@ -1,6 +1,7 @@
+ #include "esp_log.h"
+ #include "esp_check.h"
+ #include "esp_event.h"
++#include "esp_eth.h"          // ETH_EVENT + ETHERNET_EVENT_*
+ #include "mqtt_client.h"
+ 
+ static const char* TAG = "mqtt";
+@@ -225,6 +226,7 @@ static void on_eth_event(void* handler_args, esp_event_base_t base, int32_t id,
+     (void)handler_args; (void)base;
+     switch(id){
+     /* Event IDs come from esp_eth.h */
++    /* Ensure these enums resolve after including esp_eth.h */
+     case ETHERNET_EVENT_CONNECTED:
+         ESP_LOGI(TAG, "Ethernet CONNECTED");
+         break;
+@@ -262,7 +264,7 @@ static void mqtt_register_net_handlers_once(void)
+     static bool registered = false;
+     if (registered) return;
+     registered = true;
+-    ESP_ERROR_CHECK(esp_event_handler_instance_register(ETH_EVENT, ESP_EVENT_ANY_ID, &on_eth_event, NULL, NULL));
++    ESP_ERROR_CHECK(esp_event_handler_instance_register(ETH_EVENT, ESP_EVENT_ANY_ID, &on_eth_event, NULL, NULL));
+     ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, &on_ip_event, NULL, NULL));
+ }
+
