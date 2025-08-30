@@ -60,6 +60,8 @@ void app_main(void)
     esp_err_t eth_ret = eth_start();
     if (eth_ret != ESP_OK) ESP_LOGW(TAG, "Ethernet not available. Continuing without it...");
     ESP_ERROR_CHECK(auth_init());
+    for (int i=0; i<10; ++i) { eth_dump_link_once(); vTaskDelay(pdMS_TO_TICKS(2000)); }
+
     ESP_ERROR_CHECK(mqtt_start());
     ESP_ERROR_CHECK(inputs_init());
     ESP_ERROR_CHECK(outputs_init());

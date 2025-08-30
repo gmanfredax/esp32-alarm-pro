@@ -123,3 +123,12 @@ void eth_stop(void)
     }
     gpio_set_level(ETH_POWER_GPIO, 0);
 }
+
+void eth_dump_link_once(void) {
+    bool link = false;
+    if (s_eth && esp_eth_ioctl(s_eth, ETH_CMD_G_LINK, &link) == ESP_OK) {
+        ESP_LOGI("eth", "Link status: %s", link ? "UP" : "DOWN");
+    } else {
+        ESP_LOGW("eth", "Link status: unknown (handle non pronto)");
+    }
+}
