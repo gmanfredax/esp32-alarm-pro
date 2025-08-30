@@ -22,6 +22,7 @@
 #include "esp_eth_driver.h"
 #include "esp_eth_mac_esp.h"
 #include "esp_eth_phy.h"
+#include "esp_eth_netif_glue.h"   // per esp_eth_new_netif_glue()
 
 static const char *TAG = "eth";
 
@@ -30,11 +31,12 @@ static const char *TAG = "eth";
 #define ETH_MDIO_GPIO        GPIO_NUM_18
 #define ETH_POWER_GPIO       GPIO_NUM_17
 #define ETH_PHY_ADDR         1
-// RMII clock esterno a 50MHz su GPIO0 (come in ESPHome: clk_mode: GPIO0_IN)
+// RMII clock esterno a 50MHz su GPIO0
 #define ETH_RMII_CLK_IN_GPIO GPIO_NUM_0
 
 static esp_eth_handle_t s_eth = NULL;
 static esp_netif_t *s_eth_netif = NULL;
+static esp_eth_netif_glue_handle_t s_glue = NULL;
 static volatile bool s_eth_link_up = false; // aggiornato dagli eventi
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -65,7 +67,7 @@ static void rmii_pins_release(void)
 static void on_eth_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     switch (id) {
-    case ETHERNET_EVENT_STARTED:
+    case ETHERNET_EVENT_START:
         ESP_LOGI(TAG, "Ethernet STARTED");
         break;
     case ETHERNET_EVENT_CONNECTED:
@@ -76,7 +78,7 @@ static void on_eth_event(void *arg, esp_event_base_t base, int32_t id, void *dat
         s_eth_link_up = false;
         ESP_LOGW(TAG, "Ethernet LINK DOWN");
         break;
-    case ETHERNET_EVENT_STOPPED:
+    case ETHERNET_EVENT_STOP:
         ESP_LOGI(TAG, "Ethernet STOPPED");
         break;
     default:
@@ -114,11 +116,11 @@ esp_err_t eth_start(void)
     gpio_set_level(ETH_POWER_GPIO, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Init stack di rete e loop eventi (idempotente: non fallisce se già fatto)
+    // Init stack di rete e loop eventi (idempotente)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_netif_init());
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_loop_create_default());
 
-    // Registra eventi (idempotente: doppie registrazioni vengono ignorate con WARNING)
+    // Registra eventi (idempotente)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &on_eth_event, NULL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &on_ip_event, NULL));
 
@@ -126,12 +128,10 @@ esp_err_t eth_start(void)
     eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
     eth_esp32_emac_config_t esp32_cfg = ETH_ESP32_EMAC_DEFAULT_CONFIG();
 
-    // Priorità IRQ EMAC: tipicamente 2 va bene su ESP32 classico
+    // Priorità IRQ EMAC
     esp32_cfg.intr_priority = 2;
 
-    // SMI (MDIO/MDC)
-    // In IDF 5.x sono disponibili entrambe le forme: campi legacy e struttura smi_gpio.
-    // Questa è la forma nuova:
+    // SMI (MDIO/MDC) — forma nuova
     esp32_cfg.smi_gpio.mdc_num  = ETH_MDC_GPIO;
     esp32_cfg.smi_gpio.mdio_num = ETH_MDIO_GPIO;
 
@@ -162,12 +162,23 @@ esp_err_t eth_start(void)
     esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
     ESP_RETURN_ON_ERROR(esp_eth_driver_install(&eth_cfg, &s_eth), TAG, "driver_install");
 
-    // Crea l'interfaccia di rete di default per Ethernet
-    s_eth_netif = esp_netif_create_default_eth_netif(s_eth);
+    // Crea la netif “a mano” per compatibilità ampia (invece del helper)
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
+    s_eth_netif = esp_netif_new(&netif_cfg);
     if (!s_eth_netif) {
-        ESP_LOGE(TAG, "Failed to create default ETH netif");
+        ESP_LOGE(TAG, "esp_netif_new failed");
         esp_eth_driver_uninstall(s_eth);
         s_eth = NULL;
+        return ESP_FAIL;
+    }
+
+    // Collega driver ETH a netif (glue)
+    s_glue = esp_eth_new_netif_glue(s_eth);
+    if (!s_glue || esp_netif_attach(s_eth_netif, s_glue) != ESP_OK) {
+        ESP_LOGE(TAG, "netif glue attach failed");
+        if (s_glue) { esp_eth_del_netif_glue(s_glue); s_glue = NULL; }
+        esp_netif_destroy(s_eth_netif); s_eth_netif = NULL;
+        esp_eth_driver_uninstall(s_eth); s_eth = NULL;
         return ESP_FAIL;
     }
 
@@ -184,6 +195,10 @@ void eth_stop(void)
 {
     if (s_eth) {
         esp_eth_stop(s_eth);
+        if (s_glue) {
+            esp_eth_del_netif_glue(s_glue);
+            s_glue = NULL;
+        }
         if (s_eth_netif) {
             esp_netif_destroy(s_eth_netif);
             s_eth_netif = NULL;
@@ -197,9 +212,7 @@ void eth_stop(void)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Sostituisce il vecchio uso di ETH_CMD_G_LINK (non sempre esposto) con:
-//  - stato link dagli eventi (affidabile su IDF 5.x)
-//  - opzionale interrogazione di speed/duplex
+// Stato link dagli eventi + (opzionale) velocità
 void eth_dump_link_once(void)
 {
     if (!s_eth) {
@@ -209,18 +222,15 @@ void eth_dump_link_once(void)
 
     ESP_LOGI(TAG, "Link: %s", s_eth_link_up ? "UP" : "DOWN");
 
+    // Lettura velocità solo se il comando è disponibile nella toolchain
+#ifdef ETH_CMD_G_SPEED
     eth_speed_t sp = ETH_SPEED_10M;
-    eth_duplex_t dp = ETH_DUPLEX_HALF;
-
     if (esp_eth_ioctl(s_eth, ETH_CMD_G_SPEED, &sp) == ESP_OK) {
         ESP_LOGI(TAG, "Speed: %s", (sp == ETH_SPEED_100M) ? "100M" : "10M");
     } else {
         ESP_LOGW(TAG, "Speed: unknown");
     }
-
-    if (esp_eth_ioctl(s_eth, ETH_CMD_G_DUPLEX, &dp) == ESP_OK) {
-        ESP_LOGI(TAG, "Duplex: %s", (dp == ETH_DUPLEX_FULL) ? "FULL" : "HALF");
-    } else {
-        ESP_LOGW(TAG, "Duplex: unknown");
-    }
+#else
+    ESP_LOGI(TAG, "Speed: (not available in this IDF build)");
+#endif
 }
