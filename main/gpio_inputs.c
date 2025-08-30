@@ -1,11 +1,22 @@
-// ===== File: main/gpio_inputs.c =====
-// Scopo: soddisfare il riferimento in CMakeLists.txt.
-// Le funzioni sono implementate in mcp23017.c; qui basta includere l'header.
-
-
 #include "gpio_inputs.h"
+#include "mcp23017.h"
+#include "esp_log.h"
 
+static const char* TAG = "inputs";
 
-// Nessuna implementazione qui: inputs_init() e inputs_read_all()
-// sono definite in mcp23017.c. Questo file evita l'errore di CMake
-// "Cannot find source file: main/gpio_inputs.c".
+esp_err_t inputs_init(void)
+{
+    esp_err_t e = mcp23017_init();
+    if (e != ESP_OK) {
+        ESP_LOGE(TAG, "MCP23017 init failed: %s", esp_err_to_name(e));
+        return e;
+    }
+    ESP_LOGI(TAG, "Inputs ready (MCP23017).");
+    return ESP_OK;
+}
+
+esp_err_t inputs_read_all(uint16_t* gpioab)
+{
+    if (!gpioab) return ESP_ERR_INVALID_ARG;
+    return mcp23017_read_gpioab(gpioab);
+}

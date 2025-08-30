@@ -107,6 +107,9 @@ static esp_err_t status_get(httpd_req_t* req){
         httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "no token");
         return ESP_FAIL;
     }
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type,X-Auth-Token");
+
     const char* st = "UNKNOWN";
     switch(alarm_get_state()){
         case ALARM_DISARMED:      st = "DISARMED"; break;
@@ -237,6 +240,14 @@ esp_err_t web_server_start(void){
 
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
+    // <-- Aumenti i limiti qui
+    cfg.max_uri_handlers   = 24;    // default 8
+    cfg.max_open_sockets   = 12;    // default 7/8
+    cfg.stack_size         = 8192;  // default ~4096/6144 (alza se hai molte route)
+    cfg.lru_purge_enable   = true;  // opzionale: libera handler LRU quando serve
+    // opzionale:
+    // cfg.recv_wait_timeout = 10;
+    // cfg.send_wait_timeout = 10;
 
     ESP_ERROR_CHECK(httpd_start(&s_server, &cfg));
 

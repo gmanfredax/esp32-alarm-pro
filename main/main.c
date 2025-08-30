@@ -13,6 +13,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_netif.h"
+#include "esp_intr_alloc.h"
 #include "nvs_flash.h"
 
 // Header del progetto
@@ -28,6 +29,7 @@
 #include "log_system.h"
 #include "web_server.h"
 #include "pins.h"
+#include "i2c_bus.h"
 
 static const char *TAG = "app";
 
@@ -52,9 +54,11 @@ void app_main(void)
 
     // Init componenti applicativi
     ESP_ERROR_CHECK(storage_init());
-    if (eth_start() != ESP_OK) {
-        ESP_LOGW(TAG, "Ethernet not available. Continuing without it...");
-    }
+    ESP_ERROR_CHECK(i2c_bus_init());
+    ESP_LOGI(TAG, "Interrupts before ETH:");
+    esp_intr_dump(stdout);  // diagnostica: verifica chi occupa cosa
+    esp_err_t eth_ret = eth_start();
+    if (eth_ret != ESP_OK) ESP_LOGW(TAG, "Ethernet not available. Continuing without it...");
     ESP_ERROR_CHECK(auth_init());
     ESP_ERROR_CHECK(mqtt_start());
     ESP_ERROR_CHECK(inputs_init());

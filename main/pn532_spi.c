@@ -62,9 +62,9 @@ int pn532_read_uid(uint8_t* uid, int maxlen){
     for(int i=0;i<60;i++){
         // look for 0xD5 0x4B (response to InListPassiveTarget)
         if(readbuf[i]==0xD5 && readbuf[i+1]==0x4B){
-            int tgt = readbuf[i+2];
+//            int tgt = readbuf[i+2];
             int sensLen = readbuf[i+3];
-            int selRes = readbuf[i+4+sensLen];
+//            int selRes = readbuf[i+4+sensLen];
             int uidLen = readbuf[i+5+sensLen];
             if(uidLen>0 && uidLen<=maxlen){
                 memcpy(uid, &readbuf[i+6+sensLen], uidLen);

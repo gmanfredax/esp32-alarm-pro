@@ -44,6 +44,12 @@ CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 # Ethernet RMII (LAN8720): abilita solo Ethernet; ETH_USE_EMAC non esiste in IDF 5.3
 CONFIG_ETH_ENABLED=y
 # Se userai anche Wi-Fi abilitalo da menuconfig oppure aggiungi qui le tue opzioni Wi-Fi
+CONFIG_ESP_WIFI_ENABLED=n
+
+# ==== Bluetooth ===============================================================
+CONFIG_BT_ENABLED=n
+CONFIG_BT_NIMBLE_ENABLED=n
+CONFIG_BT_BLUEDROID_ENABLED=n
 
 # ==== SNTP / mDNS =============================================================
 CONFIG_LWIP_SNTP_MAX_SERVERS=3

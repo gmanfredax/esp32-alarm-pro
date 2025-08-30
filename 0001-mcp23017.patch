@@ -1,0 +1,48 @@
+diff --git a/main/mcp23017.c b/main/mcp23017.c
+index 7b4c3af..a61e9db 100644
+--- a/main/mcp23017.c
++++ b/main/mcp23017.c
+@@ -1,10 +1,9 @@
+ // mcp23017.c — IDF 5.x: nuova API I2C master + gestione errori + i2c scan
+ #include <string.h>
+ #include "esp_log.h"
+ #include "esp_check.h"
+ #include "driver/i2c_master.h"
+-#include "pins.h"   // I2C_SDA_GPIO, I2C_SCL_GPIO, I2C_SPEED_HZ, MCP23017_ADDR
++#include "pins.h"
++#include "i2c_bus.h"
+ 
+ static const char* TAG = "mcp23017";
+-static i2c_master_bus_handle_t s_i2c_bus = NULL;
+ static i2c_master_dev_handle_t s_dev     = NULL;
+ 
+-static esp_err_t mcp23017_bus_init(void)
+-{
+-    if (s_i2c_bus) return ESP_OK;
+-    i2c_master_bus_config_t bus_cfg = {
+-        .clk_source = I2C_CLK_SRC_DEFAULT,
+-        .sda_io_num = I2C_SDA_GPIO,
+-        .scl_io_num = I2C_SCL_GPIO,
+-        .glitch_ignore_cnt = 7,
+-        .flags = { .enable_internal_pullup = true }
+-    };
+-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &s_i2c_bus), TAG, "i2c_new_master_bus failed");
+-    return ESP_OK;
+-}
+-
+ static esp_err_t mcp23017_dev_init(void)
+ {
+     if (s_dev) return ESP_OK;
+-    ESP_RETURN_ON_ERROR(mcp23017_bus_init(), TAG, "bus init");
++    i2c_master_bus_handle_t bus = i2c_bus_get();
++    ESP_RETURN_ON_FALSE(bus != NULL, ESP_ERR_INVALID_STATE, TAG, "I2C bus not ready");
+     i2c_device_config_t dev_cfg = {
+         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+         .device_address  = MCP23017_ADDR,
+         .scl_speed_hz    = I2C_SPEED_HZ
+     };
+-    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_i2c_bus, &dev_cfg, &s_dev), TAG, "add dev");
++    ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &dev_cfg, &s_dev), TAG, "add dev");
+     return ESP_OK;
+ }
+

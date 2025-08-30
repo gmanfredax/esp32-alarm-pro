@@ -25,7 +25,7 @@ static int base32_decode(const char* in, uint8_t* out, int outlen){
 
 static uint32_t hotp(const uint8_t* key, int keylen, uint64_t counter){
     uint8_t msg[8]; for(int i=7;i>=0;i--){ msg[i]=counter&0xFF; counter>>=8; }
-    unsigned char hmac[20]; size_t olen=0;
+    unsigned char hmac[20];
     mbedtls_md_context_t ctx; const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
     mbedtls_md_init(&ctx); mbedtls_md_setup(&ctx, info, 1);
     mbedtls_md_hmac_starts(&ctx, key, keylen);
