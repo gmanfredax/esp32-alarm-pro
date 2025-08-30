@@ -27,7 +27,7 @@ TARGET_BRANCH=""
 
 msg(){ printf "▶ %s\n" "$*"; }
 ok(){ printf "✅ %s\n" "$*"; }
-warn(){ printf "⚠️  %s\n" "$*"; }
+warn(){ printf "�️  %s\n" "$*"; }
 err(){ printf "❌ %s\n" "$*" >&2; exit 1; }
 
 # --- Parse args ---
@@ -76,7 +76,7 @@ if git remote get-url "$REMOTE_GITLAB" >/dev/null 2>&1; then
   git fetch "$REMOTE_GITLAB" --prune || warn "Fetch GitLab fallito (continua)…"
 fi
 
-# --- Rebase (GitHub come sorgente di verità) ---
+# --- Rebase (GitHub come sorgente di verit�) ---
 if [[ "$REBASE_ON_GITHUB" == true ]]; then
   if git show-ref --verify --quiet "refs/remotes/$REMOTE_GITHUB/$BRANCH"; then
     msg "Rebase di '$BRANCH' su $REMOTE_GITHUB/$BRANCH…"
