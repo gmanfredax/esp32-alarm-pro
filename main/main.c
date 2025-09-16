@@ -30,6 +30,34 @@
 #include "web_server.h"
 #include "pins.h"
 #include "i2c_bus.h"
+#include "scenes.h"
+
+#include "lwip/apps/sntp.h"
+#include "esp_idf_version.h"
+#include <time.h>
+
+#include "utils.h"
+
+static void sntp_start_and_wait(void){
+    // API compatibile con IDF “classico” (LWIP SNTP)
+    sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    sntp_setservername(0, "pool.ntp.org");          // puoi usare anche "time.google.com"
+    sntp_init();
+
+    // Attendi che time() diventi plausibile (> 2020-01-01)
+    time_t now = 0;
+    int tries = 0;
+    do {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        time(&now);
+    } while (now < 1577836800 && ++tries < 30);     // ~30s timeout
+
+    if (now < 1577836800) {
+        ESP_LOGW("time", "SNTP non sincronizzato (timeout)");
+    } else {
+        ESP_LOGI("time", "SNTP ok: %ld", (long)now);
+    }
+}
 
 static const char *TAG = "app";
 
@@ -45,10 +73,22 @@ static void nvs_init_safe(void)
     }
 }
 
+static void nvs_erase_namespace_once(const char* ns){
+    nvs_handle_t h;
+    if (nvs_open(ns, NVS_READWRITE, &h) == ESP_OK){
+        nvs_erase_all(h);
+        nvs_commit(h);
+        nvs_close(h);
+        ESP_LOGW("nvs","namespace '%s' wiped", ns);
+    }
+}
+
+
 void app_main(void)
 {
     // Stack di rete/eventi prima di tutto
     nvs_init_safe();                              // RIMUOVI se già fatto in storage_init()
+    //nvs_erase_namespace_once("users");
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
@@ -64,14 +104,26 @@ void app_main(void)
 
     ESP_ERROR_CHECK(mqtt_start());
     ESP_ERROR_CHECK(inputs_init());
+    ESP_ERROR_CHECK(scenes_init(INPUT_ZONES_COUNT));
     ESP_ERROR_CHECK(outputs_init());
     ESP_ERROR_CHECK(pn532_init());
     ESP_ERROR_CHECK(ds18b20_init());
     ESP_ERROR_CHECK(log_system_init());
+    sntp_start_and_wait();
     alarm_init();
 
     // Avvia web server (serve i file SPIFFS)
+    //ESP_ERROR_CHECK(web_server_start());
     ESP_ERROR_CHECK(web_server_start());
+
+    // Riduci il rumore di handshake cancellati dal client (-0x0050) e altre riconnessioni
+    esp_log_level_set("esp-tls-mbedtls", ESP_LOG_WARN);
+    esp_log_level_set("esp_https_server", ESP_LOG_WARN);
+    esp_log_level_set("httpd",           ESP_LOG_WARN);
+    // opzionale:
+    // esp_log_level_set("esp-tls",      ESP_LOG_WARN);
+
+
 
     ESP_LOGI(TAG, "System ready.");
 

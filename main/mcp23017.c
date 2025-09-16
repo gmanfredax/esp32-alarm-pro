@@ -85,6 +85,10 @@ esp_err_t mcp23017_init(void)
 {
     ESP_RETURN_ON_ERROR(mcp_device_attach(), TAG, "attach");
 
+    // IOCON: BANK=0, SEQOP=0 (auto-increment abilitato), resto default
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IOCON,   0x00), TAG, "IOCON(A)");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IOCON+1, 0x00), TAG, "IOCON(B mirror)");
+
     // IOCON: valori “safe” (se serve, personalizza)
     //  - SEQOP=1 (no auto-increment? di default 1=disable sequential op, ma bank=0 consente increment)
     //  - MIRROR/INTPOL non usati qui
@@ -93,17 +97,22 @@ esp_err_t mcp23017_init(void)
 
     // Direzioni = input su tutte le linee
     ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRA, 0xFF), TAG, "IODIRA");
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRB, 0xFF), TAG, "IODIRB");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRB, 0x1F), TAG, "IODIRB");
 
     // Pull-up interni abilitati su tutte le linee
     ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUA,  0xFF), TAG, "GPPUA");
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUB,  0xFF), TAG, "GPPUB");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUB,  0x1F), TAG, "GPPUB");
 
-    // Lettura di prova
+    uint8_t olatb = 0x00;
+
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_OLATB, olatb), TAG, "OLATB");
+
+    // Lettura di prova + dump
     uint8_t a=0, b=0;
     (void)mcp_rd1(MCP_GPIOA, &a);
     (void)mcp_rd1(MCP_GPIOB, &b);
     ESP_LOGI(TAG, "MCP23017 ready @0x%02X  A=0x%02X  B=0x%02X", MCP23017_ADDR, a, b);
+    mcp23017_debug_dump();
 
     return ESP_OK;
 }
@@ -119,4 +128,15 @@ esp_err_t mcp23017_read_gpioab(uint16_t* out_ab)
 
     *out_ab = ( ((uint16_t)b) << 8 ) | a;
     return ESP_OK;
+}
+
+void mcp23017_debug_dump(void){
+    uint8_t iodira, iodirb, gppua, gppub, ipola, ipolb, ioc, a, b;
+    mcp_rd1(MCP_IOCON,  &ioc);
+    mcp_rd1(MCP_IODIRA, &iodira);  mcp_rd1(MCP_IODIRB, &iodirb);
+    mcp_rd1(MCP_GPPUA,  &gppua);   mcp_rd1(MCP_GPPUB,  &gppub);
+    mcp_rd1(MCP_IPOLA,  &ipola);   mcp_rd1(MCP_IPOLB,  &ipolb);
+    mcp_rd1(MCP_GPIOA,  &a);       mcp_rd1(MCP_GPIOB,  &b);
+    ESP_LOGI(TAG, "CFG @0x%02X | IOCON=%02X IODIR A=%02X B=%02X GPPU A=%02X B=%02X IPOL A=%02X B=%02X | GPIO A=%02X B=%02X",
+             MCP23017_ADDR, ioc, iodira, iodirb, gppua, gppub, ipola, ipolb, a, b);
 }

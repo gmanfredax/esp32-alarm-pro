@@ -5,8 +5,7 @@
 extern "C" {
 #endif
 
-esp_err_t web_server_start(void);
-esp_err_t web_server_stop(void);
+esp_err_t spiffs_init(void);
 
 #ifdef __cplusplus
 }

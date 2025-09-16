@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Impostazioni Sistema • Alarm Pro - NeXtorSystem</title>
+  <link rel="stylesheet" href="/css/style.css" />
+  <style>
+    /* Layout simile a index.html ma con sidebar sinistra */
+    .admin-grid{display:grid;grid-template-columns:220px 1fr;gap:12px;align-items:start}
+    .side{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:.6rem}
+    .side h4{margin:.2rem .4rem .4rem;font-size:.95rem;color:var(--muted);letter-spacing:.3px}
+    .side ul{list-style:none;margin:0;padding:.2rem}
+    .side li{margin:.2rem 0}
+    .side button{width:100%;text-align:left}
+    .side .active{background:rgba(255,255,255,.06);border-color:rgba(255,255,255,.18)}
+    .view{display:none}
+    .view.active{display:block}
+    .muted{color:var(--muted)}
+    .hidden{display:none}
+  </style>
+</head>
+<body>
+  <div id="adminDenied" class="container main hidden" style="padding:2rem;text-align:center;">
+    <div class="card" style="max-width:720px;margin:2rem auto;">
+      <h2>Accesso negato</h2>
+      <p class="muted">Questa pagina è accessibile solo all’amministratore.</p>
+    </div>
+  </div>
+  <div id="appRoot" class="app hidden">
+    <header class="site-header">
+      <div class="container head-inner">
+        <div class="brand">
+          <svg xmlns="http://www.w3.org/2000/svg" class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <path d="M7 11a5 5 0 1 1 10 0v4H7v-4Z"/><path d="M5 19h14"/>
+            <path d="M21 11h1"/><path d="M2 11h1"/><path d="M18.5 5.5 19 5"/><path d="m4.5 5.5-.5-.5"/>
+          </svg>
+          <span class="brand-name">Alarm Pro - NeXtorSystem</span>
+        </div>
+        <nav class="nav">
+          <div class="user user-menu">
+            <button id="userBtn" class="user-btn">
+              <svg xmlns="http://www.w3.org/2000/svg" class="ico s" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <circle cx="7.5" cy="7.5" r="3"/><path d="M10.2 10.2 21 21"/><path d="m18 15 3 3"/>
+              </svg>
+              <span id="userLabel"></span>
+            </button>
+            <div id="userDropdown" class="dropdown hidden">
+              <button data-act="logout">Logout</button>
+            </div>
+          </div>
+        </nav>
+      </div>
+    </header>
+
+    <main class="container main">
+      <div class="tabs">
+        <button class="tab-btn" data-tab="home">HOME</button>
+        <button class="tab-btn active" data-tab="sys_settings">IMPOSTAZIONI SISTEMA</button>
+      </div>
+      <h2 class="title" style="margin:1rem 0">Impostazioni di sistema</h2>
+
+      <div class="admin-grid">
+        <aside class="side">
+          <h4>Sezioni</h4>
+          <ul>
+            <li><button class="btn w-100 active" data-view="view-users">Utenti</button></li>
+            <li><button class="btn w-100" data-view="view-network">Rete</button></li>
+            <li><button class="btn w-100" data-view="view-mqtt">MQTT</button></li>
+          </ul>
+        </aside>
+
+        <section>
+          <!-- UTENTI -->
+          <section id="view-users" class="view active">
+            <div class="card">
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem">
+                <h3>Utenti</h3>
+                <button class="btn" id="btnNewUser">+ Nuovo utente</button>
+              </div>
+              <div class="table-wrap" style="margin-top:.5rem">
+                <table class="table">
+                  <thead>
+                    <tr><th>Username</th><th>Nome</th><th>Cognome</th><th>PIN</th><th>RFID</th><th>TOTP</th><th>Azioni</th></tr>
+                  </thead>
+                  <tbody id="usersTbody"><tr><td colspan="7">Caricamento…</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <!-- RETE -->
+          <section id="view-network" class="view">
+            <div class="card">
+              <h3>Rete</h3>
+              <form class="form" id="netForm">
+                <div class="row" style="gap:1rem;flex-wrap:wrap">
+                  <div class="field"><span>Hostname</span><input id="net_host" type="text" placeholder="centrale-esp32" /></div>
+                  <div class="field"><span>DHCP</span>
+                    <select id="net_dhcp"><option value="1">Abilitato</option><option value="0">Statico</option></select>
+                  </div>
+                </div>
+                <div id="net_static" class="row" style="gap:1rem;flex-wrap:wrap;margin-top:.4rem;display:none">
+                  <div class="field"><span>IP</span><input id="net_ip" type="text" placeholder="192.168.1.50" /></div>
+                  <div class="field"><span>Gateway</span><input id="net_gw" type="text" placeholder="192.168.1.1" /></div>
+                  <div class="field"><span>Subnet</span><input id="net_mask" type="text" placeholder="255.255.255.0" /></div>
+                  <div class="field"><span>DNS</span><input id="net_dns" type="text" placeholder="1.1.1.1" /></div>
+                </div>
+                <div class="row" style="justify-content:flex-end;margin-top:.6rem">
+                  <button class="btn" id="btnNetSave" type="button">Salva</button>
+                </div>
+                <small class="muted">Nota: le impostazioni di rete non sono ancora gestite dal firmware; il salvataggio verrà abilitato in seguito.</small>
+              </form>
+            </div>
+          </section>
+
+          <!-- MQTT -->
+          <section id="view-mqtt" class="view">
+            <div class="card">
+              <h3>MQTT</h3>
+              <form class="form" id="mqttForm">
+                <div class="row" style="gap:1rem;flex-wrap:wrap">
+                  <div class="field"><span>URI broker</span><input id="mq_uri" type="text" placeholder="mqtt://192.168.1.10:1883" /></div>
+                  <div class="field"><span>Client ID</span><input id="mq_cid" type="text" placeholder="CentraleESP32-xxxx" /></div>
+                </div>
+                <div class="row" style="gap:1rem;flex-wrap:wrap">
+                  <div class="field"><span>Username</span><input id="mq_user" type="text" /></div>
+                  <div class="field"><span>Password</span><input id="mq_pass" type="password" /></div>
+                  <div class="field"><span>Keepalive (s)</span><input id="mq_keep" type="number" min="10" max="600" value="60" /></div>
+                </div>
+                <div class="row" style="justify-content:flex-end;margin-top:.6rem">
+                  <button class="btn" id="btnMqttSave" type="button">Salva</button>
+                </div>
+                <small class="muted">Nota: le impostazioni MQTT sono attualmente da Kconfig; il salvataggio runtime verrà abilitato in seguito.</small>
+              </form>
+            </div>
+          </section>
+        </section>
+      </div>
+    </main>
+
+    <footer class="container foot">
+      <small>Powered by NeXtorSystem — &copy; <span id="year"></span></small>
+    </footer>
+  </div>
+
+  <div id="modals-root"></div>
+
+  <script src="/js/admin.js" defer></script>
+</body>
+</html>

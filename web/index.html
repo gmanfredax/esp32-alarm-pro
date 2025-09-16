@@ -1,37 +1,87 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Centrale Allarme</title>
-<link rel="stylesheet" href="/style.css"></head>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Centrale Allarme ESP32</title>
+  <link rel="stylesheet" href="/style.css?v=1">
+</head>
 <body>
 <div class="container">
   <h1>Centrale Allarme ESP32</h1>
+
   <div class="card" id="login">
     <h3>Login</h3>
-    <input id="u" placeholder="user" />
-    <input id="p" placeholder="password" type="password"/>
-    <input id="o" placeholder="OTP (se attivo)"/>
-    <button onclick="login()">Entra</button>
+    <form onsubmit="return login_on_submit(event)">
+      <input id="u" placeholder="user" autocomplete="username" />
+      <input id="p" placeholder="password" type="password" autocomplete="current-password"/>
+      <input id="o" placeholder="OTP (se attivo)"/>
+      <div id="loginerr" class="err"></div>
+      <button type="submit">Entra</button>
+    </form>
   </div>
+
   <div id="app" style="display:none">
-    <div class="card" id="status"></div>
-    <div class="actions">
-      <button onclick="arm('home')">Arma HOME</button>
-      <button onclick="arm('away')">Arma AWAY</button>
-      <button onclick="arm('night')">Arma NIGHT</button>
-      <button onclick="arm('custom')">Arma CUSTOM</button>
+    <div class="toolbar">
       <button onclick="disarm()">Disarma</button>
+      <button onclick="arm('home')">HOME</button>
+      <button onclick="arm('away')">AWAY</button>
+      <button onclick="arm('night')">NIGHT</button>
+      <button onclick="arm('custom')">CUSTOM</button>
       <button onclick="refresh()">Aggiorna</button>
+      <button onclick="logout()">Logout</button>
     </div>
+
+    <div class="card" id="status"></div>
+
     <div class="grid">
-      <div class="card"><h3>Zone</h3><pre id="zones"></pre></div>
-      <div class="card"><h3>Log</h3><pre id="logs"></pre></div>
-      <div class="card"><h3>Uscite</h3>
+      <div class="card">
+        <h3>Zone</h3>
+        <pre id="zones"></pre>
+      </div>
+
+      <div class="card">
+        <h3>Log</h3>
+        <pre id="logs"></pre>
+      </div>
+
+      <div class="card">
+        <h3>Uscite</h3>
         <label>Sirena <input type="checkbox" id="relay" onchange="setOutputs()"></label><br/>
         <label>LED Stato <input type="checkbox" id="leds" onchange="setOutputs()"></label><br/>
         <label>LED Manut <input type="checkbox" id="ledm" onchange="setOutputs()"></label><br/>
       </div>
     </div>
+
+    <div class="card">
+      <h3>Scenari</h3>
+      <div class="row">
+        <label>Scena: 
+          <select id="sceneSel" onchange="showSceneForEdit()">
+            <option value="home">HOME</option>
+            <option value="night">NIGHT</option>
+            <option value="custom">CUSTOM</option>
+          </select>
+        </label>
+        <label style="margin-left:12px">Copia da: 
+          <select id="copyFromSel" onchange="copyFrom()">
+            <option value="home">HOME</option>
+            <option value="night">NIGHT</option>
+            <option value="custom">CUSTOM</option>
+          </select>
+        </label>
+      </div>
+      <div id="sceneGrid" class="scene-grid"></div>
+      <div class="row">
+        <button onclick="selAll()">Tutte</button>
+        <button onclick="selNone()">Nessuna</button>
+        <button onclick="selInvert()">Inverti</button>
+        <button onclick="saveCurrentScene()">Salva scena</button>
+      </div>
+    </div>
   </div>
 </div>
-<script src="/script.js"></script>
-</body></html>
+
+<script src="/script.js?v=1"></script>
+</body>
+</html>

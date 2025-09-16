@@ -1,8 +1,12 @@
 #include "esp_random.h"   // <-- aggiungi questo
 #include "utils.h"
 #include "esp_timer.h"
+#include "esp_log.h"
 #include "esp_system.h"
 #include <stdlib.h>
+
+#include "nvs_flash.h"
+#include "nvs.h"
 
 uint64_t utils_millis(void){ return esp_timer_get_time()/1000ULL; }
 uint32_t utils_time(void){ return (uint32_t)(esp_timer_get_time()/1000000ULL); }

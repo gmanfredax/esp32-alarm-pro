@@ -25,6 +25,9 @@ esp_err_t mcp23017_init(void);
  */
 esp_err_t mcp23017_read_gpioab(uint16_t* out_ab);
 
+void mcp23017_debug_dump(void);
+
+
 #ifdef __cplusplus
 }
 #endif

@@ -1,0 +1,443 @@
+// /spiffs/js/admin.js
+(() => {
+  const $  = (s, r=document) => r.querySelector(s);
+  const $$ = (s, r=document) => Array.from(r.querySelectorAll(s));
+
+  // const getToken = () => { try { return localStorage.getItem("token") || sessionStorage.getItem("token") || ""; } catch { return ""; } };
+  // async function apiGet(url){ const r = await fetch(url, { headers: { "Accept":"application/json", "Authorization":"Bearer " + getToken() }, credentials:"same-origin" }); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+  // async function apiPost(url, data){ const r = await fetch(url, { method:"POST", headers: { "Content-Type":"application/json","Accept":"application/json", "Authorization":"Bearer " + getToken() }, credentials:"same-origin", body: JSON.stringify(data||{})}); if(!r.ok) throw new Error(await r.text()); return r.json(); }
+
+  // function showToast(msg, ok=true){
+  //   let el = $("#toast"); if(!el){ el = document.createElement("div"); el.id="toast"; el.className="toast"; document.body.appendChild(el); }
+  //   el.textContent = msg; el.classList.toggle("bad", !ok); el.classList.add("show");
+  //   setTimeout(()=>el.classList.remove("show"), 2200);
+  // }
+
+  // function clearModals(){ const el = $("#modals-root"); if (el) el.innerHTML = ""; }
+
+  // function showModal(html){
+  //   clearModals();
+  //   const root = $("#modals-root");
+  //   if (!root) return null;
+  //   root.innerHTML = `<div class="modal-overlay"><div class="card modal">${innerHtml}</div></div>`;
+  //   // opzionale: chiusura cliccando sul backdrop
+  //   const overlay = root.firstElementChild;
+  //   if (overlay) overlay.addEventListener("click", (e)=>{ if(e.target===overlay) clearModals(); });
+  //   const closeBtn = $("#m_close");
+  //   if (closeBtn) closeBtn.addEventListener("click", ()=> clearModals());
+  //   return overlay;
+  // }
+
+  // ====== Auth helpers ======
+  const getToken = () => {
+    try { return localStorage.getItem("token") || sessionStorage.getItem("token") || ""; }
+    catch { return ""; }
+  };
+  async function apiGet(url){
+    const r = await fetch(url, { headers: authHeaders(), credentials: "same-origin" });
+    if(!r.ok) throw new Error(await safeText(r));
+    const ct = r.headers.get("content-type") || "";
+    return ct.includes("application/json") ? r.json() : r.text();
+  }
+  async function apiPost(url, data){
+    const r = await fetch(url, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      credentials: "same-origin",
+      body: JSON.stringify(data || {})
+    });
+    if(!r.ok) throw new Error(await safeText(r));
+    const ct = r.headers.get("content-type") || "";
+    return ct.includes("application/json") ? r.json() : r.text();
+  }
+  function authHeaders(extra = {}){
+    const h = { ...extra };
+    const t = getToken();
+    if(t && !h["Authorization"]) h["Authorization"] = "Bearer " + t;
+    return h;
+  }
+  async function safeText(resp){ try{ return await resp.text(); }catch{ return resp.statusText || "HTTP "+resp.status; } }
+
+  async function ensureAdmin(){
+    try{
+      const me = await apiGet("/api/me");
+      if(!(me && (me.is_admin || me.role === "admin"))){
+        alert("Accesso negato.");
+        location.href = "/index.html";
+        return false;
+      }
+      return true;
+    }catch(e){
+      alert("Sessione scaduta. Effettua di nuovo il login.");
+      location.href = "/login.html";
+      return false;
+    }
+  }
+
+  // ====== Toast ======
+  function showToast(msg, ok=true){
+    let el = $("#toast");
+    if(!el){
+      el = document.createElement("div");
+      el.id = "toast";
+      el.className = "toast";
+      document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.classList.toggle("bad", !ok);
+    el.classList.add("show");
+    setTimeout(()=>el.classList.remove("show"), 2200);
+  }
+
+  // ====== Modal ======
+  function clearModals(){ const el = $("#modals-root"); if (el) el.innerHTML = ""; }
+  function showModal({title="", body="", onMount=null, onClose=null}){
+    clearModals();
+    const root = $("#modals-root");
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="card modal" role="dialog" aria-modal="true">
+        <div class="row" style="justify-content:space-between; align-items:center; margin-bottom:.4rem">
+          <h3 style="margin:0">${title}</h3>
+          <button class="btn ghost" data-close style="position: relative; top: -30px; left: 275px;">&times;</button>
+        </div>
+        <div class="modal-body">${body}</div>
+      </div>`;
+    root.appendChild(overlay);
+    document.body.classList.add("modal-open");
+    const close = ()=>{
+      document.body.classList.remove("modal-open");
+      clearModals();
+      if(onClose) try{ onClose(); }catch{}
+    };
+    overlay.addEventListener("click", (e)=>{
+      if(e.target === overlay || e.target.matches("[data-close]")) close();
+    });
+    document.addEventListener("keydown", function esc(e){
+      if(e.key === "Escape"){ document.removeEventListener("keydown", esc); close(); }
+    });
+    if(onMount) onMount(overlay.querySelector(".modal"));
+  }
+
+  // ====== Sidebar navigation ======
+  function switchView(view){
+    $$("#snav a").forEach(a => a.classList.toggle("active", a.dataset.view === view));
+    $("#view-utenti").classList.toggle("hidden", view!=="utenti");
+    $("#view-mqtt").classList.toggle("hidden", view!=="mqtt");
+    $("#view-rete").classList.toggle("hidden", view!=="rete");
+  }
+  function initSidebar(){
+    $$("#snav a").forEach(a=>{
+      a.onclick = (e)=>{ e.preventDefault(); switchView(a.dataset.view); };
+    });
+  }
+
+  // ====== Users ======
+  function renderUsers(list){
+    const tb = $("#usersTbody");
+    if(!Array.isArray(list) || !list.length){
+      tb.innerHTML = `<tr><td colspan="7">Nessun utente.</td></tr>`;
+      return;
+    }
+    tb.innerHTML = list.map(u => {
+      const pin = u.has_pin ? "✓" : "—";
+      const rfid = u.has_rfid ? (u.rfid_uid || "✓") : "—";
+      const totp = u.totp_enabled ? "✓" : "—";
+      return `<tr>
+        <td>${escapeHtml(u.username || u.user || "")}</td>
+        <td>${escapeHtml(u.first_name||"")}</td>
+        <td>${escapeHtml(u.last_name||"")}</td>
+        <td>${pin}</td>
+        <td>${escapeHtml(rfid)}</td>
+        <td>${totp}</td>
+        <td class="row" style="gap:.25rem;flex-wrap:wrap">
+          <button class="btn small" data-act="edit" data-u="${encodeAttr(u.username || u.user)}">Modifica</button>
+          // <button class="btn small" data-act="pw" data-u="${u.username}">Password</button>
+          // <button class="btn small" data-act="pin" data-u="${u.username}">PIN</button>
+          // <button class="btn small" data-act="rfid" data-u="${u.username}">Registra RFID</button>
+          // <button class="btn small ghost" data-act="rfid-clear" data-u="${u.username}">Rimuovi RFID</button>
+        </td>
+      </tr>`;
+    }).join("");
+    attachRowActions();
+  }
+
+  function attachRowActions(){
+    $$("#usersTbody [data-act=edit]").forEach(b => b.onclick = ()=> openEditUser(b.dataset.u));
+  //   $$("#usersTbody [data-act=pw]").forEach(b => b.onclick = ()=>{
+  //     const u=b.dataset.u;
+  //     showModal(`<h3>Imposta nuova password per <em>${u}</em></h3>
+  //       <div class="form">
+  //         <label class="field"><span>Nuova password</span><input id="np" type="password" autocomplete="new-password"></label>
+  //       </div>
+  //       <div class="row" style="justify-content:flex-end;gap:.5rem"><button class="btn" id="ok">Aggiorna</button></div>`);
+  //     $("#ok").onclick = async ()=>{
+  //       const np = $("#np").value.trim();
+  //       if(np.length<4){ showToast("Password troppo corta", false); return; }
+  //       try{ await apiPost("/api/users/password", {user:u, newpass:np}); showToast("Password aggiornata"); $("#modals-root").innerHTML=""; await loadUsers(); }
+  //       catch(e){ showToast("Errore: "+e.message, false); }
+  //     };
+  //   });
+
+  //   $$("#usersTbody [data-act=pin]").forEach(b => b.onclick = ()=>{
+  //     const u=b.dataset.u;
+  //     showModal(`<h3>Imposta PIN per <em>${u}</em></h3>
+  //       <div class="form">
+  //         <label class="field"><span>Nuovo PIN (4–8 cifre)</span><input id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="8"></label>
+  //       </div>
+  //       <div class="row" style="justify-content:flex-end;gap:.5rem"><button class="btn" id="ok">Salva</button></div>`);
+  //     $("#ok").onclick = async ()=>{
+  //       const pin = $("#pin").value.trim();
+  //       if(!/^[0-9]{4,8}$/.test(pin)){ showToast("PIN non valido", false); return; }
+  //       try{ await apiPost("/api/users/pin", {user:u, pin}); showToast("PIN impostato"); $("#modals-root").innerHTML=""; await loadUsers(); }
+  //       catch(e){ showToast("Errore: "+e.message, false); }
+  //     };
+  //   });
+
+  //   $$("#usersTbody [data-act=rfid]").forEach(b => b.onclick = ()=>{
+  //     const u=b.dataset.u;
+  //     showModal(`<h3>Avvicina un TAG RFID per <em>${u}</em></h3>
+  //       <p id="rfid_info">Preparazione lettore…</p>
+  //       <div id="rfid_msg" class="msg small"></div>`);
+  //     (async ()=>{
+  //       const infoEl = $("#rfid_info");
+  //       const msgEl  = $("#rfid_msg");
+  //       let done = false;
+
+  //       // Mostra “Hai 10 secondi” solo se la richiesta non fallisce subito
+  //       const showWindowTimer = setTimeout(()=>{
+  //         if(!done){
+  //           if(infoEl) infoEl.textContent = "Hai 10 secondi.";
+  //           if(msgEl)  msgEl.textContent  = "In ascolto…";
+  //         }
+  //       }, 250);
+
+  //       try{
+  //         done = true;
+  //         clearTimeout(showWindowTimer);
+  //         const res = await apiPost("/api/users/rfid/learn", {user:u, timeout:10});
+  //         $("#rfid_msg").textContent = "Registrato UID: " + (res?.uid_hex||"");
+  //         showToast("RFID registrato");
+  //         await loadUsers();
+  //       } catch(e){
+  //         done = true;
+  //         clearTimeout(showWindowTimer);
+  //         if(msgEl) msgEl.textContent = "Errore: " + e.message; $("#rfid_msg").textContent = "Errore: " + e.message; showToast("Errore RFID", false); }
+
+  //       // try{
+  //       //   const res = await apiPost("/api/users/rfid/learn", ...uid_hex||"");
+  //       //   done = true; clearTimeout(showWindowTimer);
+  //       //   showToast("RFID registrato");
+  //       //   await loadUsers();
+  //       // }catch(e){
+  //       //   done = true; clearTimeout(showWindowTimer);
+  //       //   if(msgEl) msgEl.textContent = "Errore: " + e.message;
+  //       //   showToast("Errore RFID", false);
+  //       // }
+  //     })();
+  //   });
+
+  //   $$("#usersTbody [data-act=rfid-clear]").forEach(b => b.onclick = async ()=>{
+  //     const u=b.dataset.u;
+  //     try{ await apiPost("/api/users/rfid/clear", {user:u}); showToast("RFID rimosso"); await loadUsers(); }
+  //     catch(e){ showToast("Errore: "+e.message, false); }
+  //   });
+  // }
+
+  // function attachNewUser(){
+  //   $("#btnNewUser").onclick = ()=>{
+  //     showModal(`<h3>Crea nuovo utente</h3>
+  //       <div class="form">
+  //         <label class="field"><span>Username</span><input id="u" autocomplete="off"></label>
+  //         <label class="field"><span>Nome</span><input id="fn" autocomplete="off"></label>
+  //         <label class="field"><span>Cognome</span><input id="ln" autocomplete="off"></label>
+  //         <label class="field"><span>Password iniziale (opz.)</span><input id="pw" type="password" autocomplete="new-password"></label>
+  //         <label class="field"><span>PIN (opz.)</span><input id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="8"></label>
+  //       </div>
+  //       <div class="row" style="justify-content:flex-end;gap:.5rem"><button class="btn" id="ok">Crea</button></div>`);
+  //     $("#ok").onclick = async ()=>{
+  //       const user = $("#u").value.trim();
+  //       const first_name = $("#fn").value.trim();
+  //       const last_name  = $("#ln").value.trim();
+  //       const password   = $("#pw").value.trim();
+  //       const pin        = $("#pin").value.trim();
+  //       if(!user){ showToast("Username obbligatorio", false); return; }
+  //       try{
+  //         await apiPost("/api/users/create", {user, first_name, last_name, password, pin});
+  //         showToast("Utente creato");
+  //         $("#modals-root").innerHTML="";
+  //         await loadUsers();
+  //       }catch(e){ showToast("Errore: "+e.message, false); }
+  //     };
+  //   };
+  }
+
+  async function loadUsers(){
+    const list = await apiGet("/api/admin/users");
+    renderUsers(list);
+  }
+
+  // ====== Edit User Modal ======
+  function openEditUser(username){
+    showModal({
+      title: `Modifica utente <em>${escapeHtml(username)}</em>`,
+      body: `
+        <form class="form" id="editForm">
+          <div class="field">
+            <label>Nome</label>
+            <input id="fn" type="text" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label>Cognome</label>
+            <input id="ln" type="text" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label>TAG RFID</label>
+            <div class="row" style="gap:.5rem; align-items:center">
+              <code id="rfidValue" class="badge">—</code>
+              <button class="btn small" type="button" id="btnRfidLearn">Aggiungi</button>
+              <button class="btn small ghost" type="button" id="btnRfidClear">Rimuovi</button>
+            </div>
+            <div class="muted" style="margin-top:.25rem">Avvicina un tag al lettore quando richiesto.</div>
+          </div>
+          <div class="actions">
+            <button class="btn ghost" type="button" data-close>Annulla</button>
+            <button class="btn" type="submit">Salva</button>
+          </div>
+        </form>
+      `,
+      onMount: async (dlg)=>{
+        // Preload current data from table row if available
+        const row = Array.from($("#usersTbody").rows).find(tr => (tr.cells[0].textContent||"").trim() === username);
+        if(row){
+          $("#fn", dlg).value = (row.cells[1].textContent||"").trim();
+          $("#ln", dlg).value = (row.cells[2].textContent||"").trim();
+          $("#rfidValue", dlg).textContent = (row.cells[4].textContent||"—").trim() || "—";
+        }else{
+          // fallback: fetch full list
+          try{
+            const list = await apiGet("/api/admin/users");
+            const u = (list||[]).find(x => (x.username||x.user) === username);
+            if(u){
+              $("#fn", dlg).value = u.first_name || "";
+              $("#ln", dlg).value = u.last_name || "";
+              $("#rfidValue", dlg).textContent = u.has_rfid ? (u.rfid_uid || "✓") : "—";
+            }
+          }catch{}
+        }
+
+        // Save names
+        $("#editForm", dlg).onsubmit = async (e)=>{
+          e.preventDefault();
+          const first_name = $("#fn", dlg).value.trim();
+          const last_name  = $("#ln", dlg).value.trim();
+          try{
+            await apiPost("/api/users/create", { user: username, first_name, last_name });
+            showToast("Salvato");
+            clearModals();
+            await loadUsers();
+          }catch(err){
+            showToast("Errore: "+err.message, false);
+          }
+        };
+
+        // RFID Learn
+        $("#btnRfidLearn", dlg).onclick = async ()=>{
+          const ctrl = new AbortController();
+          const btn = $("#btnRfidLearn", dlg);
+          btn.disabled = true; btn.textContent = "In ascolto…";
+          try{
+            await apiPost("/api/users/rfid/learn", { user: username, timeout: 10000, replace: true, _ts: Date.now() });
+            showToast("TAG registrato");
+            clearModals();
+            await loadUsers();
+          }catch(err){
+            showToast("Errore RFID: "+err.message, false);
+            btn.disabled = false; btn.textContent = "Aggiungi";
+          }
+        };
+
+        // RFID Clear
+        $("#btnRfidClear", dlg).onclick = async ()=>{
+          try{
+            await apiPost("/api/users/rfid/clear", { user: username });
+            showToast("TAG rimosso");
+            $("#rfidValue", dlg).textContent = "—";
+            await loadUsers();
+          }catch(err){
+            showToast("Errore: "+err.message, false);
+          }
+        };
+      }
+    });
+  }
+
+  // ====== New User Modal ======
+  function attachNewUser(){
+    const btn = $("#btnNewUser");
+    if(!btn) return;
+    btn.onclick = ()=>{
+      showModal({
+        title: "Nuovo utente",
+        body: `
+          <form class="form" id="newForm">
+            <div class="field"><label>Username</label><input id="u" type="text" required autocomplete="off"></div>
+            <div class="row">
+              <div class="field" style="flex:1"><label>Nome</label><input id="fn" type="text" autocomplete="off"></div>
+              <div class="field" style="flex:1"><label>Cognome</label><input id="ln" type="text" autocomplete="off"></div>
+            </div>
+            <div class="row">
+              <div class="field" style="flex:1"><label>Password</label><input id="pw" type="password" autocomplete="new-password"></div>
+              <div class="field" style="flex:1"><label>PIN (4–8 cifre)</label><input id="pin" type="text" inputmode="numeric" pattern="[0-9]{4,8}" autocomplete="off"></div>
+            </div>
+            <div class="actions">
+              <button class="btn ghost" type="button" data-close>Annulla</button>
+              <button class="btn" type="submit">Crea</button>
+            </div>
+          </form>
+        `,
+        onMount: (dlg)=>{
+          $("#newForm", dlg).onsubmit = async (e)=>{
+            e.preventDefault();
+            const user = $("#u", dlg).value.trim();
+            const first_name = $("#fn", dlg).value.trim();
+            const last_name  = $("#ln", dlg).value.trim();
+            const password   = $("#pw", dlg).value;
+            const pin        = $("#pin", dlg).value.trim();
+            if(!user){ showToast("Username obbligatorio", false); return; }
+            try{
+              await apiPost("/api/users/create", { user, first_name, last_name, password, pin });
+              showToast("Utente creato");
+              clearModals();
+              await loadUsers();
+            }catch(err){
+              showToast("Errore: "+err.message, false);
+            }
+          };
+        }
+      });
+    };
+  }
+
+  // ====== Utils ======
+  function escapeHtml(s){ return (s||"").replace(/[&<>"']/g, c=>({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c])); }
+  function encodeAttr(s){ return encodeURIComponent(s||""); }
+
+  // ====== Logout ======
+  function initLogout(){
+    const b = $("#btnLogout");
+    if(b) b.onclick = async ()=>{ try{ await apiPost("/api/logout", {}); }catch{} location.href="/login.html"; };
+  }
+
+  // ====== Init ======
+
+  (async function init(){
+//    await ensureAdmin();
+    if(!await ensureAdmin()) return;
+    initSidebar();
+    initLogout();
+    attachNewUser();
+    await loadUsers();
+  })();
+})();

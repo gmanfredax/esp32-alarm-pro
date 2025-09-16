@@ -92,16 +92,16 @@
 
 // Mappatura **BIT** (0..7) su PORTB del MCP23017 (NON sono GPIO dell’ESP32)
 #ifndef MCPB_RELAY_BIT
-  #define MCPB_RELAY_BIT        0
+  #define MCPB_RELAY_BIT        5
 #endif
 #ifndef MCPB_LED_STATO_BIT
-  #define MCPB_LED_STATO_BIT    1
+  #define MCPB_LED_STATO_BIT    6
 #endif
 #ifndef MCPB_LED_MANUT_BIT
-  #define MCPB_LED_MANUT_BIT    2
+  #define MCPB_LED_MANUT_BIT    7
 #endif
 #ifndef MCPB_TAMPER_BIT
-  #define MCPB_TAMPER_BIT       3
+  #define MCPB_TAMPER_BIT       4
 #endif
 
 // Controlli compile-time: bit validi 0..7

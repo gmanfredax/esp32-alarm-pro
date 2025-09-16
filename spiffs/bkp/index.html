@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Centrale Allarme — Dashboard</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="app-bar">
+  <div class="brand">Centrale <strong>ESP32</strong></div>
+  <nav class="nav">
+    <button class="tab-btn" data-tab="status">Stato</button>
+    <button class="tab-btn" data-tab="zones">Zone</button>
+    <button class="tab-btn" data-tab="scenes">Scenari</button>
+    <button class="tab-btn" data-tab="settings">Impostazioni</button>
+  </nav>
+  <div class="spacer"></div><div id="currentUserLabel" class="muted small mono"></div>
+  <button id="btnLogout" class="ghost">Logout</button>
+</header>
+
+<!-- Login box (mostrato se manca il token) -->
+<section id="loginBox" class="card hidden" style="max-width:480px;margin:2rem auto;">
+  <h2>Accedi</h2>
+  <form id="formLogin" class="form">
+    <label> Utente
+      <input type="text" name="user" autocomplete="username" required>
+    </label>
+    <label> Password
+      <input type="password" name="pass" autocomplete="current-password" required>
+    </label>
+    <label> OTP (se 2FA abilitata)
+      <input type="text" name="otp" inputmode="numeric" pattern="\d{6}" maxlength="6" placeholder="123456">
+    </label>
+    <div class="actions">
+      <button type="submit" class="primary">Login</button>
+    </div>
+  </form>
+</section>
+
+
+<main id="content">
+  <section id="tab-status" class="tab active">
+    <h1>Stato</h1>
+    <div id="statusCards" class="grid"></div>
+  </section>
+
+  <section id="tab-zones" class="tab">
+    <h1>Zone</h1>
+    <div id="zonesGrid" class="grid"></div>
+  </section>
+
+  <section id="tab-scenes" class="tab">
+    <h1>Scenari</h1>
+    <div id="scenesWrap"></div>
+  </section>
+
+  <section id="tab-settings" class="tab">
+    <h1>Impostazioni utente</h1>
+
+    <div class="card">
+      <h2>Cambia password</h2>
+      <form id="formPassword" class="form">
+        <label> Password attuale
+          <input type="password" name="current" required minlength="4" autocomplete="current-password">
+        </label>
+        <label> Nuova password
+          <input type="password" name="new1" required minlength="6" autocomplete="new-password">
+        </label>
+        <label> Ripeti nuova password
+          <input type="password" name="new2" required minlength="6" autocomplete="new-password">
+        </label>
+        <div class="actions">
+          <button type="submit" class="primary">Aggiorna password</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Autenticazione a 2 fattori (TOTP)</h2>
+      <p id="totpState" class="muted">Caricamento stato…</p>
+      <div class="totp-setup hidden" id="totpSetup">
+        <canvas id="qrcanvas"></canvas>
+        <div class="mono small" id="totpSecret"></div>
+        <p>Scansiona il QR con Google Authenticator, poi inserisci un codice a 6 cifre per confermare.</p>
+        <form id="formTotpConfirm" class="form inline">
+          <input type="text" inputmode="numeric" pattern="\d{6}" maxlength="6" name="otp" placeholder="Codice 6 cifre" required>
+          <button class="primary" type="submit">Conferma</button>
+          <button class="ghost" type="button" id="btnCancelTotp">Annulla</button>
+        </form>
+      </div>
+      <div class="actions" id="totpActions">
+        <button id="btnEnableTotp" class="primary">Abilita 2FA</button>
+        <button id="btnDisableTotp" class="danger hidden">Disabilita 2FA</button>
+      </div>
+      <div class="actions"><button id="btnRotateToken" class="ghost">Rigenera token sessione</button></div>
+    </div>
+
+    <div class="card" id="adminUsers">
+      <h2>Gestione utenti (solo admin)</h2>
+      <p class="muted small">Elenco utenti esistenti e azioni rapide.</p>
+      <div class="grid" id="usersList"></div>
+      <div class="form inline">
+        <input type="text" id="adm_user_name" placeholder="Utente" />
+        <input type="password" id="adm_new_pass" placeholder="Nuova password" />
+        <button id="adm_set_pass" class="primary">Imposta password</button>
+        <button id="adm_reset_totp" class="ghost">Reset 2FA</button>
+      </div>
+    </div>
+
+  </section>
+</main>
+
+<script src="/script.js"></script>
+</body>
+</html>
