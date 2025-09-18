@@ -1661,7 +1661,7 @@ static esp_err_t users_admin_list_get(httpd_req_t* req);
 static esp_err_t start_web(void){
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 12288;
-    cfg.max_uri_handlers = 40;
+    cfg.max_uri_handlers = 50;
     cfg.lru_purge_enable = true;
     cfg.server_port = 443;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
