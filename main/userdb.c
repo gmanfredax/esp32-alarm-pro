@@ -18,19 +18,36 @@
   #define mbedtls_sha256_finish_ret  mbedtls_sha256_finish
 #endif
 
+#include "totp.h"
+
 
 static const char* TAG="userdb";
 static nvs_handle_t s_nvs = 0;
 #define UDB_NS "usrdb"
-#define ITER_DEFAULT 50000
+#define ITER_DEFAULT 10000
+
+#define USER_REC_VER 2
+#define PIN_SALT_LEN  8
+#define PIN_HASH_LEN  32
+#define RFID_MAX_LEN  16
+#define TOTP_MAX_LEN  48
 
 typedef struct __attribute__((packed)){
-    uint8_t ver;      // =1
-    uint8_t role;     // 0 guest,1 user,2 admin
-    uint32_t iter;    // numero iterazioni hash
-    uint8_t salt[16]; // random
-    uint8_t hash[32]; // sha256 iterata
-} user_rec_v1_t;
+    uint8_t ver;               // versione record (2 = con metadati estesi)
+    uint8_t role;              // 0 guest,1 user,2 admin
+    uint32_t iter;             // numero iterazioni hash password
+    uint8_t salt[16];          // salt password
+    uint8_t hash[32];          // hash password iterata
+    char    first_name[32];    // nome (UTF-8)
+    char    last_name[32];     // cognome (UTF-8)
+    uint8_t pin_salt[PIN_SALT_LEN];
+    uint8_t pin_hash[PIN_HASH_LEN];
+    uint8_t pin_set;           // 0=no PIN, 1=PIN presente
+    uint8_t rfid_len;          // lunghezza UID RFID
+    uint8_t rfid[RFID_MAX_LEN];// dati UID RFID
+    uint8_t totp_enabled;      // 0=off, 1=abilitato
+    char    totp_secret[TOTP_MAX_LEN]; // segreto Base32 (pulito)
+} user_rec_t;
 
 static void k_userkey(const char* username, char out[32]){
     char u[20]={0};
@@ -65,28 +82,81 @@ static void hash_password_iter(const char* password, const uint8_t salt[16], uin
     }
 }
 
-static esp_err_t load_user(const char* username, user_rec_v1_t* out){
-    char key[32]; k_userkey(username,key);
-    size_t sz = sizeof(*out);
-    return nvs_get_blob(s_nvs, key, out, &sz);
+static void copy_string_field(char* dst, size_t cap, const char* src){
+    if (!dst || cap == 0) return;
+    if (!src){ dst[0] = 0; return; }
+    size_t len = strlen(src);
+    if (len >= cap) len = cap - 1;
+    memcpy(dst, src, len);
+    dst[len] = 0;
 }
 
-static esp_err_t store_user(const char* username, const user_rec_v1_t* rec){
+static bool pin_is_valid(const char* pin){
+    if (!pin) return false;
+    size_t len = strlen(pin);
+    if (len < 4 || len > 8) return false;
+    for (size_t i=0;i<len;i++){
+        if (pin[i] < '0' || pin[i] > '9') return false;
+    }
+    return true;
+}
+
+static void hash_pin_value(const char* pin, const uint8_t salt[PIN_SALT_LEN], uint8_t out32[PIN_HASH_LEN]){
+    uint8_t buf[PIN_SALT_LEN + 16];
+    size_t len = strlen(pin);
+    if (len > 16) len = 16;
+    memcpy(buf, salt, PIN_SALT_LEN);
+    memcpy(buf + PIN_SALT_LEN, pin, len);
+    sha256_once(buf, PIN_SALT_LEN + len, out32);
+    for (int i=0;i<999;i++){
+        sha256_once(out32, PIN_HASH_LEN, out32);
+    }
+}
+
+static size_t sanitize_base32(const char* in, char* out, size_t cap){
+    if (!out || cap == 0) return 0;
+    size_t w = 0;
+    if (!in){ out[0] = 0; return 0; }
+    for (const char* p=in; *p && w+1<cap; ++p){
+        char c = *p;
+        if (c==' ' || c=='-' || c=='\t') continue;
+        if (c>='a' && c<='z') c = (char)(c - ('a'-'A'));
+        if ((c>='A' && c<='Z') || (c>='2' && c<='7')){
+            out[w++] = c;
+        }
+    }
+    out[w] = 0;
+    return w;
+}
+
+static esp_err_t load_user(const char* username, user_rec_t* out){
     char key[32]; k_userkey(username,key);
+    memset(out, 0, sizeof(*out));
+    size_t sz = sizeof(*out);
+    esp_err_t err = nvs_get_blob(s_nvs, key, out, &sz);
+    if (err == ESP_OK && out->ver == 0) {
+        out->ver = 1; // record legacy senza campo ver esplicito
+    }
+    return err;
+}
+
+static esp_err_t store_user(const char* username, user_rec_t* rec){
+    char key[32]; k_userkey(username,key);
+    if (rec->ver < USER_REC_VER) rec->ver = USER_REC_VER;
     esp_err_t err = nvs_set_blob(s_nvs, key, rec, sizeof(*rec));
     if (err==ESP_OK) err = nvs_commit(s_nvs);
     return err;
 }
 
 bool userdb_exists(const char* username){
-    user_rec_v1_t r;
+    user_rec_t r;
     return load_user(username,&r)==ESP_OK;
 }
 
 esp_err_t userdb_create_user(const char* username, udb_role_t role, const char* password){
     if (!username || !*username || !password) return ESP_ERR_INVALID_ARG;
-    user_rec_v1_t rec = {0};
-    rec.ver = 1;
+    user_rec_t rec = {0};
+    rec.ver = USER_REC_VER;
     rec.role = (uint8_t)role;
     rec.iter = ITER_DEFAULT;
     random_bytes(rec.salt, sizeof(rec.salt));
@@ -96,7 +166,7 @@ esp_err_t userdb_create_user(const char* username, udb_role_t role, const char* 
 
 esp_err_t userdb_set_password(const char* username, const char* new_password){
     if (!username || !new_password) return ESP_ERR_INVALID_ARG;
-    user_rec_v1_t rec;
+    user_rec_t rec;
     esp_err_t err = load_user(username,&rec);
     if (err != ESP_OK) return err;
     random_bytes(rec.salt, sizeof(rec.salt));
@@ -115,13 +185,143 @@ esp_err_t userdb_delete_user(const char* username){
 }
 
 bool userdb_verify_password(const char* username, const char* password, udb_role_t* out_role){
-    user_rec_v1_t rec;
+    user_rec_t rec;
     if (load_user(username,&rec)!=ESP_OK) return false;
     uint8_t h[32];
     hash_password_iter(password, rec.salt, rec.iter, h);
     if (memcmp(h, rec.hash, 32)!=0) return false;
     if (out_role) *out_role = (udb_role_t)rec.role;
     return true;
+}
+
+esp_err_t userdb_set_name(const char* user, const char* first, const char* last){
+    if (!user) return ESP_ERR_INVALID_ARG;
+    user_rec_t rec;
+    esp_err_t err = load_user(user, &rec);
+    if (err != ESP_OK) return err;
+    copy_string_field(rec.first_name, sizeof(rec.first_name), first ? first : "");
+    copy_string_field(rec.last_name,  sizeof(rec.last_name),  last  ? last  : "");
+    return store_user(user, &rec);
+}
+
+esp_err_t userdb_get_name(const char* user, char* first, size_t fcap, char* last, size_t lcap){
+    if (!user) return ESP_ERR_INVALID_ARG;
+    user_rec_t rec;
+    esp_err_t err = load_user(user, &rec);
+    if (err != ESP_OK) return err;
+    if (first && fcap){ copy_string_field(first, fcap, rec.first_name); }
+    if (last  && lcap){ copy_string_field(last,  lcap, rec.last_name); }
+    return ESP_OK;
+}
+
+bool userdb_has_pin(const char* user){
+    if (!user) return false;
+    user_rec_t rec;
+    if (load_user(user, &rec) != ESP_OK) return false;
+    return rec.pin_set != 0;
+}
+
+esp_err_t userdb_set_pin(const char* user, const char* pin){
+    if (!user) return ESP_ERR_INVALID_ARG;
+    user_rec_t rec;
+    esp_err_t err = load_user(user, &rec);
+    if (err != ESP_OK) return err;
+
+    if (!pin || !*pin){
+        memset(rec.pin_salt, 0, sizeof(rec.pin_salt));
+        memset(rec.pin_hash, 0, sizeof(rec.pin_hash));
+        rec.pin_set = 0;
+        return store_user(user, &rec);
+    }
+
+    if (!pin_is_valid(pin)) return ESP_ERR_INVALID_ARG;
+    random_bytes(rec.pin_salt, sizeof(rec.pin_salt));
+    hash_pin_value(pin, rec.pin_salt, rec.pin_hash);
+    rec.pin_set = 1;
+    return store_user(user, &rec);
+}
+
+bool userdb_verify_pin(const char* user, const char* pin){
+    if (!user || !pin) return false;
+    if (!pin_is_valid(pin)) return false;
+    user_rec_t rec;
+    if (load_user(user, &rec) != ESP_OK) return false;
+    if (!rec.pin_set) return false;
+    uint8_t h[PIN_HASH_LEN];
+    hash_pin_value(pin, rec.pin_salt, h);
+    return memcmp(h, rec.pin_hash, PIN_HASH_LEN) == 0;
+}
+
+esp_err_t userdb_set_rfid(const char* user, const uint8_t* uid, size_t uid_len){
+    if (!user || !uid || uid_len == 0 || uid_len > RFID_MAX_LEN) return ESP_ERR_INVALID_ARG;
+    user_rec_t rec;
+    esp_err_t err = load_user(user, &rec);
+    if (err != ESP_OK) return err;
+    memset(rec.rfid, 0, sizeof(rec.rfid));
+    memcpy(rec.rfid, uid, uid_len);
+    rec.rfid_len = (uint8_t)uid_len;
+    return store_user(user, &rec);
+}
+
+int userdb_get_rfid(const char* user, uint8_t* uid_out, size_t max_len){
+    if (!user) return -1;
+    user_rec_t rec;
+    if (load_user(user, &rec) != ESP_OK) return -1;
+    if (rec.rfid_len == 0) return 0;
+    if (uid_out && max_len){
+        size_t n = rec.rfid_len;
+        if (n > max_len) n = max_len;
+        memcpy(uid_out, rec.rfid, n);
+    }
+    return rec.rfid_len;
+}
+
+esp_err_t userdb_clear_rfid(const char* user){
+    if (!user) return ESP_ERR_INVALID_ARG;
+    user_rec_t rec;
+    esp_err_t err = load_user(user, &rec);
+    if (err != ESP_OK) return err;
+    rec.rfid_len = 0;
+    memset(rec.rfid, 0, sizeof(rec.rfid));
+    return store_user(user, &rec);
+}
+
+esp_err_t userdb_totp_enable(const char* user, const char* base32_secret){
+    if (!user || !base32_secret) return ESP_ERR_INVALID_ARG;
+    user_rec_t rec;
+    esp_err_t err = load_user(user, &rec);
+    if (err != ESP_OK) return err;
+    char clean[TOTP_MAX_LEN];
+    size_t n = sanitize_base32(base32_secret, clean, sizeof(clean));
+    if (n < 8) return ESP_ERR_INVALID_ARG;
+    copy_string_field(rec.totp_secret, sizeof(rec.totp_secret), clean);
+    rec.totp_enabled = 1;
+    return store_user(user, &rec);
+}
+
+esp_err_t userdb_totp_disable(const char* user){
+    if (!user) return ESP_ERR_INVALID_ARG;
+    user_rec_t rec;
+    esp_err_t err = load_user(user, &rec);
+    if (err != ESP_OK) return err;
+    rec.totp_enabled = 0;
+    rec.totp_secret[0] = 0;
+    return store_user(user, &rec);
+}
+
+bool userdb_totp_is_enabled(const char* user){
+    if (!user) return false;
+    user_rec_t rec;
+    if (load_user(user, &rec) != ESP_OK) return false;
+    return rec.totp_enabled != 0 && rec.totp_secret[0] != 0;
+}
+
+bool userdb_totp_verify(const char* user, const char* otp){
+    if (!user || !otp) return false;
+    user_rec_t rec;
+    if (load_user(user, &rec) != ESP_OK) return false;
+    if (!rec.totp_enabled || rec.totp_secret[0] == 0) return false;
+    return totp_check(rec.totp_secret, otp);
 }
 
 static void bootstrap_if_missing(const char* username, udb_role_t role, const char* password){

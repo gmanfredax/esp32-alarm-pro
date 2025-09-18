@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include "mbedtls/md.h"
 #include "utils.h"
+#include "totp.h"
 
 static int base32_val(char c){
     if(c>='A'&&c<='Z') return c-'A';

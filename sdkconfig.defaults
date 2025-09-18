@@ -66,3 +66,6 @@ CONFIG_FREERTOS_ISR_STACKSIZE=4096
 # ==== OTA updates =============================================================
 CONFIG_ESP_HTTPS_OTA_ALLOW_HTTP=y
 # (non serve più "OTA_ALLOW_SECURE_HTTP": rimosso)
+
+# ==== OTHER ===================================================================
+CONFIG_MBEDTLS_HARDWARE_SHA=y
