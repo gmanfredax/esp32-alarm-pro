@@ -49,6 +49,31 @@
     try { return await r.json(); } catch { return {}; }
   }
 
+  const escapeHtml = (value = "") => (value ?? "").toString()
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
+  const fileToBase64 = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("lettura"));
+    reader.onload = () => {
+      try {
+        const bytes = new Uint8Array(reader.result);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        resolve(btoa(binary));
+      } catch (e) {
+        reject(e);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+
+  const WEB_TLS_MAX_PEM_LEN = 4096;
+
     // -------------- Header / menu utente --------------
   function syncHeader(){ $("#userLabel") && ($("#userLabel").textContent = `${currentUser}${isAdmin ? " (admin)" : ""}`); }
   
@@ -516,6 +541,100 @@
     await Promise.all([loadNetwork(), loadMqtt()]);
   }
 
+  function renderWebSecStatus(data){
+    const box = $("#websecStatus");
+    const fb = $("#websecFeedback");
+    if (!box) return;
+    if (!data){
+      box.textContent = "Stato non disponibile";
+      if (fb) fb.textContent = "";
+      return;
+    }
+    const activeLabel = data.using_builtin ? "Certificato predefinito incorporato" : "Certificato personalizzato";
+    let html = `<div><strong>Attivo:</strong> ${escapeHtml(activeLabel)}</div>`;
+    if (data.active_subject) html += `<div class="muted">Soggetto: ${escapeHtml(data.active_subject)}</div>`;
+    if (data.active_not_after) html += `<div class="muted">Valido fino al: ${escapeHtml(data.active_not_after)}</div>`;
+    if (data.active_fingerprint) html += `<div class="muted">SHA-256: <code>${escapeHtml(data.active_fingerprint)}</code></div>`;
+    if (data.custom_available){
+      if (data.custom_valid){
+        const subj = data.custom_subject ? escapeHtml(data.custom_subject) : "";
+        const installed = data.custom_installed_iso ? ` (${escapeHtml(data.custom_installed_iso)})` : "";
+        html += `<div class="muted" style="margin-top:.4rem">Ultimo certificato installato: ${subj}${installed}</div>`;
+        if (data.custom_not_after) html += `<div class="muted">Scadenza personalizzato: ${escapeHtml(data.custom_not_after)}</div>`;
+      } else {
+        html += `<div class="muted" style="margin-top:.4rem">Il certificato personalizzato salvato non è valido.</div>`;
+      }
+    } else {
+      html += `<div class="muted" style="margin-top:.4rem">Nessun certificato personalizzato installato.</div>`;
+    }
+    if (data.restart_pending){
+      html += `<div class="muted" style="margin-top:.4rem">Riavvio HTTPS in corso…</div>`;
+    }
+    box.innerHTML = html;
+    if (fb){
+      if (data.last_error){
+        fb.textContent = `Ultimo errore: ${data.last_error}`;
+      } else if (data.restart_pending){
+        fb.textContent = "Il server si riavvierà automaticamente per applicare il certificato.";
+      } else {
+        fb.textContent = "";
+      }
+    }
+  }
+
+  async function loadWebSecStatus(){
+    try{
+      const data = await apiGet("/api/sys/websec");
+      renderWebSecStatus(data);
+      return data;
+    }catch(err){
+      const box = $("#websecStatus");
+      if (box) box.textContent = "Errore caricando stato: " + err.message;
+      const fb = $("#websecFeedback");
+      if (fb) fb.textContent = "";
+      throw err;
+    }
+  }
+
+  async function setupWebSecForm(){
+    const btn = $("#btnWebsecUpload");
+    if (btn){
+      btn.addEventListener("click", async () => {
+        const certInput = $("#websecCert");
+        const keyInput = $("#websecKey");
+        const certFile = certInput?.files?.[0];
+        const keyFile = keyInput?.files?.[0];
+        if (!certFile || !keyFile){ toast("Seleziona certificato e chiave", false); return; }
+        if (certFile.size > WEB_TLS_MAX_PEM_LEN || keyFile.size > WEB_TLS_MAX_PEM_LEN){
+          toast("File troppo grandi (max 4 KB)", false);
+          return;
+        }
+        const prevText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = "Caricamento…";
+        const fb = $("#websecFeedback");
+        if (fb) fb.textContent = "Caricamento in corso…";
+        try{
+          const [certB64, keyB64] = await Promise.all([fileToBase64(certFile), fileToBase64(keyFile)]);
+          await apiPost("/api/sys/websec", { cert_b64: certB64, key_b64: keyB64 });
+          toast("Certificato aggiornato. Riavvio in corso…");
+          if (fb) fb.textContent = "Aggiornamento completato, il server HTTPS si riavvierà automaticamente.";
+          setTimeout(() => { loadWebSecStatus().catch(()=>{}); }, 1500);
+        }catch(err){
+          toast("Aggiornamento certificato: " + err.message, false);
+          const fb2 = $("#websecFeedback");
+          if (fb2) fb2.textContent = "Errore: " + err.message;
+        }finally{
+          btn.disabled = false;
+          btn.textContent = prevText;
+          if ($("#websecCert")) $("#websecCert").value = "";
+          if ($("#websecKey")) $("#websecKey").value = "";
+        }
+      });
+    }
+    try { await loadWebSecStatus(); } catch {}
+  }
+
   // ========== Logout (eventuale)
   $("#btnLogout")?.addEventListener("click", async () => {
     try{ await apiPost("/api/logout"); }catch{}
@@ -535,13 +654,14 @@
     syncHeader();
     mountUserMenu();
     setupSidebar();
-    setupNetMqttForms();
+    const setupPromises = [setupNetMqttForms(), setupWebSecForm()];
     document.querySelector('[data-tab="home"]')?.addEventListener('click', (e) => {
       e.preventDefault();
       location.href = "/index.html";
     });
     if (!(await ensureAdmin())) return;     // ora è un no-op che sblocca la UI
     attachNewUser();
-    await Promise.all([loadUsers(), loadNetwork(), loadMqtt()]);
+//    await Promise.all([loadUsers(), loadNetwork(), loadMqtt()]);
+    await Promise.all([loadUsers(), ...setupPromises]);
   })();
 })();

@@ -67,6 +67,7 @@
             <li><button class="btn w-100 active" data-view="view-users">Utenti</button></li>
             <li><button class="btn w-100" data-view="view-network">Rete</button></li>
             <li><button class="btn w-100" data-view="view-mqtt">MQTT</button></li>
+            <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
           </ul>
         </aside>
 
@@ -133,6 +134,30 @@
                 </div>
                 <small class="muted">Nota: le impostazioni MQTT sono attualmente da Kconfig; il salvataggio runtime verrà abilitato in seguito.</small>
               </form>
+            </div>
+          </section>
+
+          <!-- SICUREZZA WEB -->
+          <section id="view-websec" class="view">
+            <div class="card">
+              <h3>Sicurezza web</h3>
+              <p class="muted">Gestisci il certificato HTTPS utilizzato dal server integrato. I file devono essere in formato PEM e la chiave privata deve corrispondere al certificato.</p>
+              <div id="websecStatus" class="muted" style="margin-bottom:.6rem">Caricamento stato…</div>
+              <form class="form" id="websecForm">
+                <div class="row" style="gap:1rem;flex-wrap:wrap">
+                  <label class="field" style="min-width:220px"><span>Certificato (PEM)</span>
+                    <input id="websecCert" type="file" accept=".pem,.crt,.cer" />
+                  </label>
+                  <label class="field" style="min-width:220px"><span>Chiave privata (PEM)</span>
+                    <input id="websecKey" type="file" accept=".pem,.key" />
+                  </label>
+                </div>
+                <small class="muted">I file vengono inviati codificati in Base64. Dimensione massima consigliata: 4&nbsp;KB per file.</small>
+                <div class="row" style="justify-content:flex-end;margin-top:.6rem">
+                  <button class="btn" id="btnWebsecUpload" type="button">Aggiorna certificato</button>
+                </div>
+              </form>
+              <div id="websecFeedback" class="muted" style="margin-top:.4rem;font-size:.85rem"></div>
             </div>
           </section>
         </section>

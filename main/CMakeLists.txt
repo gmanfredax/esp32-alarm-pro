@@ -1,5 +1,5 @@
 # Colleziona tutti i .c nella cartella main (comodo se aggiungi file spesso)
-file(GLOB MAIN_SRCS "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
+file(GLOB MAIN_SRCS "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
 
 idf_component_register(
     SRCS
@@ -26,6 +26,9 @@ idf_component_register(
         spiffs
     PRIV_REQUIRES
         esp_https_server   # <— trascina da solo esp-tls e mbedtls
+    EMBED_TXTFILES
+        "certs/server_cert.pem"
+        "certs/server_key.pem"
 )
 
 # Genera l’immagine SPIFFS dalla cartella spiffs/

@@ -133,7 +133,7 @@ static void touch_session(session_t* s){
 static int build_cookie_sid(char* out, size_t outcap, const char* sid_b64){
     if (!out || outcap==0 || !sid_b64 || !sid_b64[0]) return -1;
     // Aggiungi "Secure" se servi in HTTPS
-    int n = snprintf(out, outcap, "SID=%s; HttpOnly; Path=/; SameSite=Lax", sid_b64);
+    int n = snprintf(out, outcap, "SID=%s; HttpOnly; Path=/; SameSite=Lax; Secure", sid_b64);
     return (n > 0 && n < (int)outcap) ? n : -1;
 }
 
@@ -170,6 +170,7 @@ static void security_headers(httpd_req_t* req){
     httpd_resp_set_hdr(req, "X-Content-Type-Options", "nosniff");
     httpd_resp_set_hdr(req, "X-Frame-Options", "DENY");
     httpd_resp_set_hdr(req, "Referrer-Policy", "same-origin");
+    httpd_resp_set_hdr(req, "Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     httpd_resp_set_hdr(req, "Content-Security-Policy",
         "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; frame-ancestors 'none'");
 }
@@ -357,7 +358,7 @@ esp_err_t auth_handle_logout(httpd_req_t* req){
         }
     }
     (void)done;
-    httpd_resp_set_hdr(req,"Set-Cookie","SID=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax");
+    httpd_resp_set_hdr(req,"Set-Cookie","SID=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax; Secure");
     audit_append("logout", who?who:"", 1, "ok");
     return json_reply(req,"{\"ok\":true}");
 }
