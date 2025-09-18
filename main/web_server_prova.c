@@ -360,6 +360,28 @@ static void web_tls_use_builtin(void){
     mbedtls_x509_crt_free(&crt);
 }
 
+static int web_tls_check_pk_pair(const mbedtls_pk_context* pub, const mbedtls_pk_context* prv){
+    if (!pub || !prv) return MBEDTLS_ERR_PK_BAD_INPUT_DATA;
+
+    mbedtls_entropy_context entropy; mbedtls_entropy_init(&entropy);
+    mbedtls_ctr_drbg_context ctr_drbg; mbedtls_ctr_drbg_init(&ctr_drbg);
+    const unsigned char pers[] = "web_tls_pair";
+
+    int ret = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
+                                    pers, sizeof(pers) - 1);
+    if (ret == 0){
+#if MBEDTLS_VERSION_NUMBER >= 0x03000000
+        ret = mbedtls_pk_check_pair(pub, prv, mbedtls_ctr_drbg_random, &ctr_drbg);
+#else
+        ret = mbedtls_pk_check_pair(pub, prv);
+#endif
+    }
+
+    mbedtls_ctr_drbg_free(&ctr_drbg);
+    mbedtls_entropy_free(&entropy);
+    return ret;
+}
+
 static esp_err_t web_tls_load_from_nvs(void){
     web_tls_state_set_last_error("");
     nvs_handle_t nvs = 0;
@@ -482,7 +504,7 @@ static esp_err_t web_tls_load_from_nvs(void){
         return ESP_ERR_INVALID_RESPONSE;
     }
 
-    ret = mbedtls_pk_check_pair(&crt.pk, &pk);
+    ret = web_tls_check_pk_pair(&crt.pk, &pk);
     if (ret != 0){
         free(cert); free(key);
         char msg[96]; mbedtls_strerror(ret, msg, sizeof(msg));
@@ -597,7 +619,7 @@ static esp_err_t web_tls_validate_pair(const uint8_t* cert, size_t cert_len,
         mbedtls_x509_crt_free(crt_out);
         return ESP_ERR_INVALID_RESPONSE;
     }
-    ret = mbedtls_pk_check_pair(&crt_out->pk, &pk);
+    ret = web_tls_check_pk_pair(&crt_out->pk, &pk);
     mbedtls_pk_free(&pk);
     if (ret != 0){
         if (errbuf) snprintf(errbuf, errbuf_len, "cert/key mismatch");
