@@ -102,7 +102,6 @@ void app_main(void)
     ESP_ERROR_CHECK(auth_init());
 // [debug disattivato] loop dump link rimosso per build pulita
 
-    ESP_ERROR_CHECK(mqtt_start());
     ESP_ERROR_CHECK(inputs_init());
     ESP_ERROR_CHECK(scenes_init(INPUT_ZONES_COUNT));
     ESP_ERROR_CHECK(outputs_init());
@@ -110,7 +109,22 @@ void app_main(void)
     ESP_ERROR_CHECK(ds18b20_init());
     ESP_ERROR_CHECK(log_system_init());
     sntp_start_and_wait();
+    ESP_ERROR_CHECK(mqtt_start());
+
     alarm_init();
+    mqtt_publish_state();
+    mqtt_publish_scenes();
+
+    uint16_t initial_gpio = 0;
+    if (inputs_read_all(&initial_gpio) == ESP_OK) {
+        uint16_t init_mask = 0;
+        for (int i = 1; i <= INPUT_ZONES_COUNT; ++i) {
+            if (inputs_zone_bit(initial_gpio, i)) {
+                init_mask |= (1u << (i - 1));
+            }
+        }
+        mqtt_publish_zones(init_mask);
+    }
 
     // Avvia web server (serve i file SPIFFS)
     //ESP_ERROR_CHECK(web_server_start());
@@ -128,19 +142,28 @@ void app_main(void)
     ESP_LOGI(TAG, "System ready.");
 
     // Main loop: leggi ingressi e alimenta la logica d’allarme
+    uint16_t last_mask = 0xFFFFu;
+    bool first_cycle = true;
+
     while (true) {
         uint16_t ab = 0;
         inputs_read_all(&ab);
 
         uint16_t zmask = 0;
-        for (int i = 1; i <= 12; i++) {
+        for (int i = 1; i <= INPUT_ZONES_COUNT; i++) {
             if (inputs_zone_bit(ab, i)) {
                 zmask |= (1u << (i - 1));
             }
         }
 
         // esempio: tamper su bit (8+4) come da tuo codice
-        bool tamper = (ab & (1u << (8 + 4))) != 0;
+        bool tamper = inputs_tamper(ab);
+
+        if (first_cycle || zmask != last_mask) {
+            mqtt_publish_zones(zmask);
+            last_mask = zmask;
+            first_cycle = false;
+        }
 
         alarm_tick(zmask, tamper);
 

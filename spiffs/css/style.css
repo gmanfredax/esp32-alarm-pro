@@ -176,3 +176,32 @@ body.modal-open { overflow: hidden; }
 .countdown { font-variant-numeric: tabular-nums; margin-left:.35rem; }
 .input-error { outline: 2px solid var(--danger); border-color: var(--danger) !important; }
 
+/* Wizard iniziale ---------------------------------------------------------- */
+.setup-wizard{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:1.5rem;background:rgba(4,10,24,.8);backdrop-filter:blur(8px);z-index:1200}
+.setup-wizard.hidden{display:none}
+.wizard-card{width:min(720px,96vw);background:var(--panel);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:1.8rem;box-shadow:0 28px 60px rgba(0,0,0,.45);display:flex;flex-direction:column;gap:1.2rem;position:relative;color:var(--text)}
+.wizard-close{position:absolute;top:.9rem;right:.9rem;background:transparent;border:0;color:var(--muted);font-size:1.5rem;cursor:pointer}
+.wizard-close:hover{color:#fff}
+.wizard-progress{display:flex;gap:.45rem}
+.wizard-progress span{flex:1;height:4px;border-radius:999px;background:rgba(255,255,255,.08);transition:background .25s ease}
+.wizard-progress span.active{background:linear-gradient(90deg,var(--accent),var(--accent-2))}
+.wizard-content{display:flex;flex-direction:column;gap:.75rem}
+.wizard-step-icon{font-size:2.4rem}
+.wizard-step-icon.hidden{display:none}
+.wizard-step-title{margin:0;font-size:1.55rem;letter-spacing:.4px}
+.wizard-step-body{color:var(--muted);font-size:.95rem;line-height:1.55}
+.wizard-step-body ul{padding-left:1.2rem;margin:.6rem 0 0}
+.wizard-step-body li{margin:.3rem 0}
+.wizard-actions{display:flex;justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap}
+.wizard-actions-nav{display:flex;gap:.6rem}
+.wizard-skip{background:transparent;border:0;color:var(--muted);cursor:pointer;text-decoration:underline;font-size:.9rem;padding:.4rem .2rem}
+.wizard-skip:hover{color:#fff}
+body.wizard-open{overflow:hidden}
+
+@media (max-width:520px){
+  .wizard-card{padding:1.3rem}
+  .wizard-step-title{font-size:1.4rem}
+  .wizard-actions{flex-direction:column;align-items:stretch}
+  .wizard-actions-nav{width:100%;justify-content:space-between}
+  .wizard-actions-nav .btn{flex:1}
+}

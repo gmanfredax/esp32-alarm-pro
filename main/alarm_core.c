@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 #include "scenes.h"
 #include "gpio_inputs.h"   // per INPUT_ZONES_COUNT e inputs_zone_bit()
+#include "app_mqtt.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Stato interno
@@ -130,6 +131,7 @@ void alarm_arm_home(void)
     s_state = ALARM_ARMED_HOME;
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_HOME");
+    mqtt_publish_state();
 }
 
 void alarm_arm_away(void)
@@ -137,6 +139,7 @@ void alarm_arm_away(void)
     s_state = ALARM_ARMED_AWAY;
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_AWAY");
+    mqtt_publish_state();
 }
 
 void alarm_arm_night(void)
@@ -144,6 +147,7 @@ void alarm_arm_night(void)
     s_state = ALARM_ARMED_NIGHT;
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_NIGHT");
+    mqtt_publish_state();
 }
 
 void alarm_arm_custom(void)
@@ -151,6 +155,7 @@ void alarm_arm_custom(void)
     s_state = ALARM_ARMED_CUSTOM;
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_CUSTOM");
+    mqtt_publish_state();
 }
 
 void alarm_disarm(void)
@@ -168,6 +173,7 @@ void alarm_disarm(void)
     s_entry_zone = -1;
 
     ESP_LOGI(TAG, "DISARMED");
+    mqtt_publish_state();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,9 +193,12 @@ void alarm_tick(uint16_t zmask, bool tamper)
     // Tamper ha priorità (eccetto manutenzione)
     if (tamper) {
         if (s_state != ALARM_MAINTENANCE) {
-            s_state = ALARM_ALARM;
-            outputs_siren(true);
-            ESP_LOGW(TAG, "TAMPER -> ALARM");
+            if (s_state != ALARM_ALARM) {
+                s_state = ALARM_ALARM;
+                outputs_siren(true);
+                ESP_LOGW(TAG, "TAMPER -> ALARM");
+                mqtt_publish_state();
+            }
         }
         return;
     }
@@ -208,9 +217,12 @@ void alarm_tick(uint16_t zmask, bool tamper)
         // allora allo scadere dell'exit, se una di quelle zone è ANCORA aperta, scatta l'allarme.
         if (s_exit_unified && s_exit_deadline_us != 0 && now >= s_exit_deadline_us) {
             if ((zmask & s_exit_guard_mask) != 0) {
-                s_state = ALARM_ALARM;
-                outputs_siren(true);
-                ESP_LOGW(TAG, "EXIT timeout (ritardo unico) con zona ancora aperta -> ALARM");
+                if (s_state != ALARM_ALARM) {
+                    s_state = ALARM_ALARM;
+                    outputs_siren(true);
+                    ESP_LOGW(TAG, "EXIT timeout (ritardo unico) con zona ancora aperta -> ALARM");
+                    mqtt_publish_state();
+                }
                 // reset stato entry eventuale
                 s_entry_pending = false;
                 s_entry_zmask = 0;
@@ -228,9 +240,12 @@ void alarm_tick(uint16_t zmask, bool tamper)
         // Se è in corso un entry delay, verifica la scadenza
         if (s_entry_pending) {
             if (now >= s_entry_deadline_us) {
-                s_state = ALARM_ALARM;
-                outputs_siren(true);
-                ESP_LOGW(TAG, "ENTRY timeout -> ALARM (Z%d)", s_entry_zone >= 0 ? (s_entry_zone + 1) : -1);
+                if (s_state != ALARM_ALARM) {
+                    s_state = ALARM_ALARM;
+                    outputs_siren(true);
+                    ESP_LOGW(TAG, "ENTRY timeout -> ALARM (Z%d)", s_entry_zone >= 0 ? (s_entry_zone + 1) : -1);
+                    mqtt_publish_state();
+                }
                 s_entry_pending = false;
             }
             // Non “return”: continuiamo comunque a valutare nuovi trigger
@@ -264,9 +279,12 @@ void alarm_tick(uint16_t zmask, bool tamper)
             }
         }
         if (any_instant) {
-            s_state = ALARM_ALARM;
-            outputs_siren(true);
-            ESP_LOGW(TAG, "ZONE instant -> ALARM");
+            if (s_state != ALARM_ALARM) {
+                s_state = ALARM_ALARM;
+                outputs_siren(true);
+                ESP_LOGW(TAG, "ZONE instant -> ALARM");
+                mqtt_publish_state();
+            }
             return;
         }
 

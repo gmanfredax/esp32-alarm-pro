@@ -29,6 +29,7 @@ idf_component_register(
     EMBED_TXTFILES
         "certs/server_cert.pem"
         "certs/server_key.pem"
+        "certs/broker_ca.pem"
 )
 
 # Genera l’immagine SPIFFS dalla cartella spiffs/

@@ -1,282 +1,293 @@
-// script.js — UI minima per Centrale ESP32
-let token = localStorage.getItem('token') || '';
+/* script.js — Gestione wizard UI e helper generici */
+(() => {
+  const globalCfg = window.APP_CONFIG || {};
+  const defaults = {
+    enabled: true,
+    autoShow: true,
+    alwaysShow: false,
+    storageKey: 'alarmpro_wizard_v1',
+    fallbackDelayMs: 3500,
+    reopenSelector: '[data-act="wizard"]',
+    prevLabel: 'Indietro',
+    nextLabel: 'Avanti',
+    doneLabel: 'Vai alla dashboard',
+    skipLabel: 'Mostra più tardi',
+    steps: []
+  };
 
-const hdrs = () => token ? {'X-Auth-Token': token, 'Content-Type':'application/json'} : {'Content-Type':'application/json'};
+  const wizardCfg = Object.assign({}, defaults, globalCfg.wizard || {});
+  const rawSteps = Array.isArray(wizardCfg.steps) ? wizardCfg.steps : [];
+  const steps = rawSteps
+    .map(step => step && typeof step === 'object' ? step : null)
+    .filter(Boolean);
 
-async function api(path, opt={}){
-  const r = await fetch(path, {headers: hdrs(), ...opt});
-  if(!r.ok){
-    let t = '';
-    try{ t = await r.text(); }catch{}
-    throw new Error(t || r.statusText || 'HTTP '+r.status);
+  const storageKey = wizardCfg.storageKey || defaults.storageKey;
+  const autoShowEnabled = wizardCfg.autoShow !== false;
+  const showEvenIfSeen = wizardCfg.alwaysShow === true;
+
+  function hasSeen() {
+    try {
+      return localStorage.getItem(storageKey) === '1';
+    } catch (_) {
+      return false;
+    }
   }
-  const ct = r.headers.get('content-type') || '';
-  return ct.includes('application/json') ? r.json() : r.text();
-}
 
-function setToken(t){
-  token = t || '';
-  if(token) localStorage.setItem('token', token);
-  else localStorage.removeItem('token');
-}
+  function markSeen() {
+    try {
+      localStorage.setItem(storageKey, '1');
+    } catch (_) {}
+  }
 
-// Tabs
-function setActiveTab(name){
-  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
-  document.querySelectorAll('.tab').forEach(s=>s.classList.toggle('active', s.id === 'tab-'+name));
-  if(name==='status' && window.refreshStatus) window.refreshStatus();
-if(name==='zones'  && window.refreshZones)  window.refreshZones();
-if(name==='scenes' && window.refreshScenes) window.refreshScenes();
-}
-document.querySelectorAll('.tab-btn').forEach(b=>b.addEventListener('click', ()=> setActiveTab(b.dataset.tab)));
+  function resetSeen() {
+    try {
+      localStorage.removeItem(storageKey);
+      sessionStorage.removeItem(storageKey);
+    } catch (_) {}
+  }
 
-// QR fallback (no lib esterne)
-function drawQRCodeToCanvas(text, canvas){
-  try{
-    const ctx=canvas.getContext('2d');
-    ctx.fillStyle='#fff'; ctx.fillRect(0,0,canvas.width,canvas.height);
-    ctx.fillStyle='#000'; ctx.font='14px monospace';
-    const lines=(text||'').match(/.{1,18}/g)||[text];
-    lines.forEach((ln,i)=>ctx.fillText(ln,8,24+i*18));
-  }catch(e){ console.warn('QR fallback', e); }
-}
-function drawQR(text, canvas){ drawQRCodeToCanvas(text, canvas); }
+  const api = window.ALARM_UI = Object.assign(window.ALARM_UI || {}, {
+    openWizard: (startIndex = 0) => {
+      const instance = ensureWizard();
+      instance.show(startIndex);
+    },
+    resetWizard: () => {
+      resetSeen();
+      const instance = ensureWizard(true);
+      instance.show(0);
+    },
+    hasSeenWizard: () => hasSeen()
+  });
 
-// Login UI
-function showLogin(){
-  const box = document.getElementById('loginBox');
-  const main = document.getElementById('content');
-  const logoutBtn = document.getElementById('btnLogout');
-  if(box){ box.classList.remove('hidden'); }
-  if(main){ main.classList.add('hidden'); }
-  if(logoutBtn){ logoutBtn.style.display='none'; }
-  document.getElementById('currentUserLabel').textContent='';
-}
-function showApp(){
-  const box = document.getElementById('loginBox');
-  const main = document.getElementById('content');
-  const logoutBtn = document.getElementById('btnLogout');
-  if(box){ box.classList.add('hidden'); }
-  if(main){ main.classList.remove('hidden'); }
-  if(logoutBtn){ logoutBtn.style.display=''; }
-  refreshStatus(); refreshZones(); refreshScenes();
-}
+  if (!wizardCfg.enabled || steps.length === 0) {
+    return;
+  }
 
-const loginForm = document.getElementById('formLogin');
-if(loginForm){
-  loginForm.addEventListener('submit', async (e)=>{
-    e.preventDefault();
-    const d = Object.fromEntries(new FormData(loginForm).entries());
-    try{
-      const res = await api('/api/login', {method:'POST', body: JSON.stringify({user:d.user, pass:d.pass, otp:d.otp||''})});
-      setToken(res.token);
-      loginForm.reset();
-      showApp();
-      await refreshMe();
-      await refreshTotp();
-    }catch(err){
-      alert('Login fallito: '+err.message);
+  let wizardInstance = null;
+
+  function ensureWizard(forceRebuild = false) {
+    if (!forceRebuild && wizardInstance) {
+      return wizardInstance;
+    }
+
+    const overlay = document.createElement('div');
+    overlay.className = 'setup-wizard hidden';
+    overlay.setAttribute('role', 'dialog');
+    overlay.setAttribute('aria-modal', 'true');
+
+    const progressDots = steps.map(() => '<span></span>').join('');
+
+    overlay.innerHTML = `
+      <div class="wizard-card">
+        <button class="wizard-close" type="button" aria-label="Chiudi">&times;</button>
+        <div class="wizard-progress" role="tablist">${progressDots}</div>
+        <div class="wizard-content">
+          <div class="wizard-step-icon hidden" aria-hidden="true"></div>
+          <h2 class="wizard-step-title"></h2>
+          <div class="wizard-step-body"></div>
+        </div>
+        <div class="wizard-actions">
+          <button class="wizard-skip" type="button">${wizardCfg.skipLabel || defaults.skipLabel}</button>
+          <div class="wizard-actions-nav">
+            <button class="btn wizard-prev" type="button">${wizardCfg.prevLabel || defaults.prevLabel}</button>
+            <button class="btn primary wizard-next" type="button">${wizardCfg.nextLabel || defaults.nextLabel}</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.body.appendChild(overlay);
+
+    const closeBtn = overlay.querySelector('.wizard-close');
+    const prevBtn = overlay.querySelector('.wizard-prev');
+    const nextBtn = overlay.querySelector('.wizard-next');
+    const skipBtn = overlay.querySelector('.wizard-skip');
+    const titleEl = overlay.querySelector('.wizard-step-title');
+    const bodyEl = overlay.querySelector('.wizard-step-body');
+    const iconEl = overlay.querySelector('.wizard-step-icon');
+    const dots = Array.from(overlay.querySelectorAll('.wizard-progress span'));
+
+    let currentIndex = 0;
+
+    const setStep = index => {
+      currentIndex = Math.max(0, Math.min(index, steps.length - 1));
+      const step = steps[currentIndex];
+      titleEl.textContent = step.title || '';
+
+      if (step.icon) {
+        iconEl.textContent = step.icon;
+        iconEl.classList.remove('hidden');
+      } else {
+        iconEl.textContent = '';
+        iconEl.classList.add('hidden');
+      }
+
+      bodyEl.innerHTML = '';
+      if (step.html) {
+        bodyEl.innerHTML = step.html;
+      } else {
+        if (step.description) {
+          const p = document.createElement('p');
+          p.textContent = step.description;
+          bodyEl.appendChild(p);
+        }
+        if (Array.isArray(step.bullets) && step.bullets.length) {
+          const ul = document.createElement('ul');
+          step.bullets.forEach(item => {
+            const li = document.createElement('li');
+            li.textContent = item;
+            ul.appendChild(li);
+          });
+          bodyEl.appendChild(ul);
+        }
+        if (Array.isArray(step.extra) && step.extra.length) {
+          step.extra.forEach(node => {
+            if (typeof node === 'string') {
+              const p = document.createElement('p');
+              p.textContent = node;
+              bodyEl.appendChild(p);
+            }
+          });
+        }
+      }
+
+      prevBtn.disabled = currentIndex === 0;
+      const nextLabel = currentIndex === steps.length - 1
+        ? (step.doneLabel || wizardCfg.doneLabel || defaults.doneLabel)
+        : (step.nextLabel || wizardCfg.nextLabel || defaults.nextLabel);
+      nextBtn.textContent = nextLabel;
+      dots.forEach((dot, idx) => {
+        dot.classList.toggle('active', idx <= currentIndex);
+        dot.setAttribute('aria-current', idx === currentIndex ? 'step' : 'false');
+      });
+    };
+
+    const hide = (mark = false) => {
+      overlay.classList.add('hidden');
+      document.body.classList.remove('wizard-open');
+      if (mark) {
+        markSeen();
+      }
+      document.removeEventListener('keydown', onKeyDown);
+    };
+
+    const show = (startIndex = 0) => {
+      setStep(startIndex);
+      overlay.classList.remove('hidden');
+      document.body.classList.add('wizard-open');
+      document.addEventListener('keydown', onKeyDown);
+      nextBtn.focus({ preventScroll: true });
+    };
+
+    const goNext = () => {
+      if (currentIndex >= steps.length - 1) {
+        hide(true);
+        return;
+      }
+      setStep(currentIndex + 1);
+    };
+
+    const goPrev = () => {
+      if (currentIndex > 0) {
+        setStep(currentIndex - 1);
+      }
+    };
+
+    const onKeyDown = evt => {
+      if (evt.key === 'Escape') {
+        evt.preventDefault();
+        hide(true);
+      } else if (evt.key === 'ArrowRight') {
+        evt.preventDefault();
+        goNext();
+      } else if (evt.key === 'ArrowLeft') {
+        evt.preventDefault();
+        goPrev();
+      }
+    };
+
+    nextBtn.addEventListener('click', goNext);
+    prevBtn.addEventListener('click', goPrev);
+    skipBtn.addEventListener('click', () => hide(true));
+    closeBtn.addEventListener('click', () => hide(true));
+    overlay.addEventListener('click', evt => {
+      if (evt.target === overlay) {
+        hide(true);
+      }
+    });
+    dots.forEach((dot, idx) => {
+      dot.addEventListener('click', () => {
+        setStep(idx);
+      });
+    });
+    wizardInstance = {
+      show,
+      hide,
+      isVisible: () => !overlay.classList.contains('hidden')
+    };
+
+    return wizardInstance;
+  }
+
+  function waitForAppReady(callback) {
+    const root = document.getElementById('appRoot');
+    if (!root) {
+      callback();
+      return;
+    }
+    if (!root.classList.contains('hidden')) {
+      callback();
+      return;
+    }
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      callback();
+    };
+    const observer = new MutationObserver(() => {
+      if (!root.classList.contains('hidden')) {
+        observer.disconnect();
+        finish();
+      }
+    });
+    observer.observe(root, { attributes: true, attributeFilter: ['class'] });
+    const timeout = Number.isFinite(wizardCfg.fallbackDelayMs) ? wizardCfg.fallbackDelayMs : defaults.fallbackDelayMs;
+    if (timeout > 0) {
+      setTimeout(() => {
+        try { observer.disconnect(); } catch (_) {}
+        finish();
+      }, timeout);
+    }
+  }
+
+  function autoShow() {
+    if (!autoShowEnabled) {
+      return;
+    }
+    if (hasSeen() && !showEvenIfSeen) {
+      return;
+    }
+    waitForAppReady(() => {
+      const instance = ensureWizard();
+      if (!instance.isVisible()) {
+        instance.show(0);
+      }
+    });
+  }
+
+  document.addEventListener('DOMContentLoaded', () => {
+    autoShow();
+    const selector = wizardCfg.reopenSelector || defaults.reopenSelector;
+    if (selector) {
+      document.querySelectorAll(selector).forEach(btn => {
+        btn.addEventListener('click', evt => {
+          evt.preventDefault();
+          const instance = ensureWizard();
+          instance.show(0);
+          try { btn.closest('.dropdown')?.classList.add('hidden'); } catch (_) {}
+        });
+      });
     }
   });
-}
-
-// Logout
-document.getElementById('btnLogout')?.addEventListener('click', async ()=>{
-  try{ await api('/api/logout', {method:'POST'}); }catch{}
-  setToken('');
-  showLogin();
-});
-
-// Rotazione token
-document.getElementById('btnRotateToken')?.addEventListener('click', async ()=>{
-  try{
-    const r = await api('/api/session/rotate', {method:'POST'});
-    setToken(r.token);
-    alert('Nuovo token generato.');
-  }catch(e){ alert('Errore rotazione token: '+e.message); }
-});
-
-// Cambio password (utente corrente)
-document.getElementById('formPassword')?.addEventListener('submit', async (e)=>{
-  e.preventDefault();
-  const d = Object.fromEntries(new FormData(e.target).entries());
-  if(d.new1 !== d.new2){ alert('Le nuove password non coincidono.'); return; }
-  try{
-    await api('/api/user/password', {method:'POST', body: JSON.stringify({current:d.current, newpass:d.new1})});
-    e.target.reset(); alert('Password aggiornata.');
-  }catch(err){ alert('Errore: '+err.message); }
-});
-
-// 2FA TOTP
-const stateEl = document.getElementById('totpState');
-const setupBox = document.getElementById('totpSetup');
-const btnEnable = document.getElementById('btnEnableTotp');
-const btnDisable = document.getElementById('btnDisableTotp');
-const secretEl = document.getElementById('totpSecret');
-const qrCanvas = document.getElementById('qrcanvas');
-
-async function refreshTotp(){
-  if(!token) return;
-  try{
-    const s = await api('/api/user/totp');
-    stateEl.textContent = s.enabled ? '2FA attiva' : '2FA disattivata';
-    btnEnable.classList.toggle('hidden', !!s.enabled);
-    btnDisable.classList.toggle('hidden', !s.enabled);
-  }catch(e){
-    stateEl.textContent='';
-    btnEnable.classList.add('hidden');
-    btnDisable.classList.add('hidden');
-  }
-}
-btnEnable?.addEventListener('click', async ()=>{
-  try{
-    const s = await api('/api/user/totp/enable', {method:'POST'});
-    secretEl.textContent = s.secret_base32 || '';
-    drawQR(s.otpauth_uri || '', qrCanvas);
-    setupBox.classList.remove('hidden');
-  }catch(err){ alert('Errore: '+err.message); }
-});
-btnDisable?.addEventListener('click', async ()=>{
-  if(!confirm('Disabilitare 2FA?')) return;
-  try{ await api('/api/user/totp/disable', {method:'POST'}); await refreshTotp(); }
-  catch(err){ alert('Errore: '+err.message); }
-});
-document.getElementById('formTotpConfirm')?.addEventListener('submit', async (e)=>{
-  e.preventDefault();
-  const otp = new FormData(e.target).get('otp');
-  try{
-    await api('/api/user/totp/confirm', {method:'POST', body: JSON.stringify({otp})});
-    alert('2FA abilitata!'); setupBox.classList.add('hidden'); await refreshTotp();
-  }catch(err){ alert('Codice non valido: '+err.message); }
-});
-document.getElementById('btnCancelTotp')?.addEventListener('click', ()=> setupBox.classList.add('hidden'));
-
-// Admin UI
-async function refreshMe(){
-  if(!token) return;
-  try{
-    const me = await api('/api/me');
-    const lbl = document.getElementById('currentUserLabel');
-    if(lbl) lbl.textContent = (me.user || '') + (me.is_admin ? ' (admin)' : '');
-    const adm = document.getElementById('adminUsers');
-    if(adm) adm.style.display = me.is_admin ? 'block' : 'none';
-    if(me.is_admin){ await refreshUsers(); }
-  }catch(e){
-    const lbl = document.getElementById('currentUserLabel');
-    if(lbl) lbl.textContent='';
-    const adm = document.getElementById('adminUsers');
-    if(adm) adm.style.display='none';
-  }
-}
-
-async function refreshUsers(){
-  if(!token) return;
-  try{
-    const users = await api('/api/users');
-    const box = document.getElementById('usersList'); 
-    if(box){
-      box.innerHTML='';
-      users.forEach(u=>{
-        const div = document.createElement('div'); div.className='card';
-        div.innerHTML = '<div><strong>'+u+'</strong></div><div class="small muted">Gestisci password e 2FA</div>';
-        box.appendChild(div);
-      });
-    }
-  }catch(e){ console.warn('users list', e); }
-}
-
-// --- HOME: STATO
-window.refreshStatus = async function(){
-  if(!token) return;
-  try{
-    const s = await api('/api/status');
-    const wrap = document.getElementById('statusCards');
-    if(!wrap) return;
-    wrap.innerHTML = '';
-    const card = (title, value) => `<div class="card"><div class="kpi"><div class="kpi-title">${title}</div><div class="kpi-value">${value}</div></div></div>`;
-    wrap.insertAdjacentHTML('beforeend', card('Stato', s.state));
-    wrap.insertAdjacentHTML('beforeend', card('Tamper', s.tamper ? 'ATTIVO' : 'OK'));
-    wrap.insertAdjacentHTML('beforeend', card('Zone attive', s.zones_active.filter(Boolean).length + ' / ' + s.zones_count));
-  }catch(e){ console.warn(e); }
-};
-
-// --- HOME: ZONE
-window.refreshZones = async function(){
-  if(!token) return;
-  try{
-    const z = await api('/api/zones');
-    const g = document.getElementById('zonesGrid');
-    if(!g) return;
-    g.innerHTML = '';
-    z.zones.forEach(zz=>{
-      const cls = zz.active ? 'chip on' : 'chip';
-      g.insertAdjacentHTML('beforeend', `<div class="card mini"><div class="${cls}">${zz.name}</div></div>`);
-    });
-  }catch(e){ console.warn(e); }
-};
-
-// --- HOME: SCENARI
-window.refreshScenes = async function(){
-  if(!token) return;
-  try{
-    const s = await api('/api/scenes');
-    const root = document.getElementById('scenesWrap');
-    if(!root) return;
-    root.innerHTML = '';
-
-    function renderScene(name, mask){
-      const num = s.zones;
-      const ids = [];
-      for(let i=1;i<=num;i++){ if(mask & (1<<(i-1))) ids.push(i); }
-      const checks = Array.from({length:num}, (_,i)=>{
-        const id=i+1; const on = ids.includes(id);
-        return `<label class="chk"><input type="checkbox" data-sc="${name}" data-id="${id}" ${on?'checked':''}>Z${id}</label>`;
-      }).join('');
-      return `<div class="card"><h2>${name.toUpperCase()}</h2><div class="checks">${checks}</div><div class="actions"><button class="primary" data-save="${name}">Salva</button></div></div>`;
-    }
-
-    root.insertAdjacentHTML('beforeend', renderScene('home', s.home));
-    root.insertAdjacentHTML('beforeend', renderScene('night', s.night));
-    root.insertAdjacentHTML('beforeend', renderScene('custom', s.custom));
-
-    root.querySelectorAll('button[data-save]').forEach(btn=>{
-      btn.addEventListener('click', async ()=>{
-        const name = btn.dataset.save;
-        const boxes = root.querySelectorAll(`input[type=checkbox][data-sc="${name}"]`);
-        const ids = Array.from(boxes).filter(b=>b.checked).map(b=>parseInt(b.dataset.id,10));
-        try{
-          await api('/api/scenes', {method:'POST', body: JSON.stringify({scene:name, ids})});
-          alert('Scena salvata.');
-          if(window.refreshScenes) window.refreshScenes();
-        }catch(e){ alert('Errore: '+e.message); }
-      });
-    });
-  }catch(e){ console.warn(e); }
-};
-
-
-document.getElementById('adm_set_pass')?.addEventListener('click', async ()=>{
-  const usr = document.getElementById('adm_user_name').value.trim();
-  const np  = document.getElementById('adm_new_pass').value;
-  if(!usr || !np) { alert('Inserisci utente e nuova password'); return; }
-  try{ await api('/api/users/password', {method:'POST', body: JSON.stringify({user:usr, newpass:np})}); alert('Password aggiornata.'); }
-  catch(e){ alert('Errore: '+e.message); }
-});
-
-document.getElementById('adm_reset_totp')?.addEventListener('click', async ()=>{
-  const usr = document.getElementById('adm_user_name').value.trim();
-  if(!usr) { alert('Inserisci utente'); return; }
-  if(!confirm('Reset 2FA per '+usr+'?')) return;
-  try{ await api('/api/users/totp/reset', {method:'POST', body: JSON.stringify({user:usr})}); alert('2FA resettata.'); }
-  catch(e){ alert('Errore: '+e.message); }
-});
-
-// Startup
-setActiveTab('status');
-if(token){ 
-  showApp(); 
-  refreshMe(); 
-  refreshTotp(); 
-} else { 
-  showLogin(); 
-}
+})();
