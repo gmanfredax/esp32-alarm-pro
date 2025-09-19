@@ -1564,6 +1564,9 @@ static esp_err_t four03_html_get(httpd_req_t* req){
 // Static assets (no gate)
 static esp_err_t js_get(httpd_req_t* req){
     const char* uri = req->uri;
+    if (strstr(uri,"config.js")) return send_file(req,"js/config.js");
+    if (strstr(uri,"legacy-script.js")) return send_file(req,"js/legacy-script.js");
+    if (strstr(uri,"script.js")) return send_file(req,"js/script.js");
     if (strstr(uri,"admin.js")) return send_file(req,"js/admin.js");
     if (strstr(uri,"qrcode.min.js")) return send_file(req,"js/qrcode.min.js");
     if (strstr(uri,"bootstrap.bundle.min.js")) return send_file(req,"js/bootstrap.bundle.min.js");
@@ -1616,7 +1619,7 @@ static esp_err_t users_admin_list_get(httpd_req_t* req);
 static esp_err_t start_web(void){
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 12288;
-    cfg.max_uri_handlers = 40;
+    cfg.max_uri_handlers = 50;
     cfg.lru_purge_enable = true;
     cfg.server_port = 443;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
@@ -1639,10 +1642,10 @@ static esp_err_t start_web(void){
     httpd_uri_t ui_admin_js  = {.uri="/js/admin.js",      .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
     httpd_uri_t ui_login_js  = {.uri="/js/login.js",      .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
     httpd_uri_t ui_qrcode_js = {.uri="/js/qrcode.min.js", .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
-    httpd_uri_t ui_bs_js     = {.uri="/js/bootstrap.bundle.min.js", .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
+    httpd_uri_t ui_bs_js     = {.uri="/js/bootstrap.bundle.min.js",     .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
     httpd_uri_t ui_bs_js_map = {.uri="/js/bootstrap.bundle.min.js.map", .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
-    httpd_uri_t ui_bs_css    = {.uri="/css/bootstrap.min.css",    .method=HTTP_GET,  .handler=css_get,            .user_ctx=NULL};
-    httpd_uri_t ui_bs_css_map= {.uri="/css/bootstrap.min.css.map",    .method=HTTP_GET,  .handler=css_get,            .user_ctx=NULL};
+    httpd_uri_t ui_bs_css    = {.uri="/css/bootstrap.min.css",          .method=HTTP_GET,  .handler=css_get,            .user_ctx=NULL};
+    httpd_uri_t ui_bs_css_map= {.uri="/css/bootstrap.min.css.map",      .method=HTTP_GET,  .handler=css_get,            .user_ctx=NULL};
     httpd_uri_t ui_css       = {.uri="/css/style.css",    .method=HTTP_GET,  .handler=css_get,            .user_ctx=NULL};
 
     httpd_uri_t u_api_login  = {.uri="/api/login",        .method=HTTP_POST, .handler=api_login_post,     .user_ctx=NULL};

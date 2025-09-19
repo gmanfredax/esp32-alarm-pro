@@ -1,8 +1,17 @@
 // main/mqtt_client.c
-// MQTT client per ESP-IDF 5.x con gating su ETH/IP e autostart sugli eventi di rete.
+// MQTT over TLS integration for the ESP32 alarm panel. The module connects to
+// a managed broker using credentials defined in sdkconfig, publishes telemetry
+// (state, zones, scenes) and listens for commands (arm/disarm, outputs, scenes).
+
+#include "app_mqtt.h"
+#include "sdkconfig.h"
 
 #include <string.h>
 #include <inttypes.h>
+#include <strings.h>
+#include <stdio.h>
+#include <time.h>
+
 #include "esp_check.h"
 #include "esp_event.h"
 #include "esp_eth.h"
@@ -11,263 +20,465 @@
 #include "esp_mac.h"
 #include "mqtt_client.h"
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Opzioni da Kconfig (impostale in sdkconfig / menuconfig → Component config → MQTT)
-#ifndef CONFIG_MQTT_URI
-#define CONFIG_MQTT_URI           "mqtt://192.168.1.10:1883"
-#endif
-#ifndef CONFIG_MQTT_USERNAME
-#define CONFIG_MQTT_USERNAME      ""
-#endif
-#ifndef CONFIG_MQTT_PASSWORD
-#define CONFIG_MQTT_PASSWORD      ""
-#endif
-#ifndef CONFIG_MQTT_CLIENT_ID_PREFIX
-#define CONFIG_MQTT_CLIENT_ID_PREFIX "CentraleESP32-"
-#endif
-#ifndef CONFIG_MQTT_KEEPALIVE
-#define CONFIG_MQTT_KEEPALIVE     60
-#endif
-#ifndef CONFIG_MQTT_DISABLE_AUTO_RECONNECT
-#define CONFIG_MQTT_DISABLE_AUTO_RECONNECT 0
-#endif
-// Se usi TLS, puoi abilitare le seguenti opzioni in Kconfig e caricare i certificati:
-// CONFIG_MQTT_TRANSPORT_SSL, CONFIG_MQTT_CERT_PEM, ecc.
-// ─────────────────────────────────────────────────────────────────────────────
+#include "alarm_core.h"
+#include "gpio_inputs.h"
+#include "outputs.h"
+#include "scenes.h"
 
-// Header opzionale (se hai già app_mqtt.h, usa il tuo)
-// /* app_mqtt.h
-// #pragma once
-// #include <stdbool.h>
-// void mqtt_start(void);
-// void mqtt_stop(void);
-// bool mqtt_is_connected(void);
-// int  mqtt_publish(const char* topic, const char* data, int qos, int retain);
-// */
+#include "cJSON.h"
 
-// ─────────────────────────────────────────────────────────────────────────────
 
-static const char* TAG = "mqtt";
+extern const uint8_t certs_broker_ca_pem_start[] asm("_binary_certs_broker_ca_pem_start");
+extern const uint8_t certs_broker_ca_pem_end[]   asm("_binary_certs_broker_ca_pem_end");
+
+static const char *TAG = "cloud_mqtt";
 
 static esp_mqtt_client_handle_t s_client = NULL;
-static bool s_started = false;
-static bool s_connected = false;
 
-// Hook deboli da poter sovrascrivere in altri file (weak symbols)
-__attribute__((weak)) void mqtt_on_connected(esp_mqtt_client_handle_t client) {
-    // Esempio: subscribe a topic
-    // esp_mqtt_client_subscribe(client, "allarme/cmd/#", 1);
-}
-__attribute__((weak)) void mqtt_on_disconnected(void) {}
-__attribute__((weak)) void mqtt_on_message(const esp_mqtt_event_handle_t e) {
-    // Esempio:
-    // ESP_LOGI(TAG, "MSG topic=%.*s data=%.*s", e->topic_len, e->topic, e->data_len, e->data);
-}
+static bool                     s_connected = false;
+static char                     s_device_id[64] = {0};
+static char                     s_topic_state[128];
+static char                     s_topic_zones[128];
+static char                     s_topic_avail[128];
+static char                     s_topic_scenes[128];
+static char                     s_topic_cmd_base[128];
+static char                     s_topic_cmd_sub[160];
+static size_t                   s_cmd_base_len = 0;
+static uint16_t                 s_last_zone_mask = 0xFFFFu;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Utility: ottieni handle netif ETH e verifica IP pronto
-
-static esp_netif_t* get_eth_netif(void) {
-    // La chiave di default per l'interfaccia Ethernet creata da esp_netif è "ETH_DEF".
-    return esp_netif_get_handle_from_ifkey("ETH_DEF");
-}
-
-static bool eth_has_ip(void) {
-    esp_netif_t* eth = get_eth_netif();
-    if (!eth) return false;
-    esp_netif_ip_info_t info;
-    if (esp_netif_get_ip_info(eth, &info) != ESP_OK) return false;
-    return info.ip.addr != 0;
-}
-
-static void log_ip_info(const char* prefix) {
-    esp_netif_t* eth = get_eth_netif();
-    if (!eth) {
-        ESP_LOGW(TAG, "%s: nessuna netif ETH", prefix);
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+static void build_device_id(void)
+{
+    const char *cfg = CONFIG_APP_CLOUD_DEVICE_ID;
+    if (cfg && cfg[0] != '\0') {
+        snprintf(s_device_id, sizeof(s_device_id), "%s", cfg);
         return;
     }
-    esp_netif_ip_info_t info;
-    if (esp_netif_get_ip_info(eth, &info) == ESP_OK) {
-        char ip[16], nm[16], gw[16];
-        esp_ip4addr_ntoa(&info.ip, ip, sizeof ip);
-        esp_ip4addr_ntoa(&info.netmask, nm, sizeof nm);
-        esp_ip4addr_ntoa(&info.gw, gw, sizeof gw);
-        ESP_LOGI(TAG, "%s: ip=%s mask=%s gw=%s", prefix, ip, nm, gw);
-    } else {
-        ESP_LOGW(TAG, "%s: nessun IP", prefix);
+
+    uint8_t mac[6] = {0};
+    ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_ETH));
+    snprintf(s_device_id, sizeof(s_device_id), "%s%02X%02X%02X%02X%02X%02X",
+             CONFIG_APP_CLOUD_CLIENT_ID_PREFIX,
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+static void build_topics(void)
+{
+    const char *root = CONFIG_APP_CLOUD_TOPIC_ROOT;
+    snprintf(s_topic_state, sizeof(s_topic_state), "%s/state/%s/status", root, s_device_id);
+    snprintf(s_topic_zones, sizeof(s_topic_zones), "%s/state/%s/zones", root, s_device_id);
+    snprintf(s_topic_avail, sizeof(s_topic_avail), "%s/state/%s/availability", root, s_device_id);
+    snprintf(s_topic_scenes, sizeof(s_topic_scenes), "%s/state/%s/scenes", root, s_device_id);
+    snprintf(s_topic_cmd_base, sizeof(s_topic_cmd_base), "%s/cmd/%s", root, s_device_id);
+    snprintf(s_topic_cmd_sub, sizeof(s_topic_cmd_sub), "%s/#", s_topic_cmd_base);
+    s_cmd_base_len = strlen(s_topic_cmd_base);
+}
+
+static inline const char* alarm_state_to_name(alarm_state_t st)
+{
+    switch (st) {
+    case ALARM_DISARMED:     return "DISARMED";
+    case ALARM_ARMED_HOME:   return "ARMED_HOME";
+    case ALARM_ARMED_AWAY:   return "ARMED_AWAY";
+    case ALARM_ARMED_NIGHT:  return "ARMED_NIGHT";
+    case ALARM_ARMED_CUSTOM: return "ARMED_CUSTOM";
+    case ALARM_ALARM:        return "ALARM";
+    case ALARM_MAINTENANCE:  return "MAINT";
+    default:                 return "UNKNOWN";
     }
+}
+
+static esp_err_t publish_raw(const char *topic, const char *payload, int qos, bool retain)
+{
+    if (!s_client) return ESP_ERR_INVALID_STATE;
+    if (!topic || !payload) return ESP_ERR_INVALID_ARG;
+    int msg_id = esp_mqtt_client_publish(s_client, topic, payload, 0, qos, retain);
+    if (msg_id < 0) {
+        ESP_LOGW(TAG, "Publish failed topic=%s", topic);
+        return ESP_FAIL;
+    }
+    ESP_LOGD(TAG, "Publish topic=%s qos=%d retain=%d", topic, qos, retain);
+    return ESP_OK;
+}
+
+static void publish_availability(const char *state)
+{
+    if (!state) return;
+    publish_raw(s_topic_avail, state, CONFIG_APP_CLOUD_QOS_STATE, true);
+}
+
+static void ensure_timestamp(cJSON *root)
+{
+    if (!root) return;
+    time_t now = time(NULL);
+    cJSON_AddNumberToObject(root, "timestamp", (double)now);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Event handler MQTT
+// Telemetry
+// ─────────────────────────────────────────────────────────────────────────────
+esp_err_t mqtt_publish_state(void)
+{
+    if (!s_client) return ESP_ERR_INVALID_STATE;
 
-static void mqtt_event_handler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data)
+    alarm_state_t st = alarm_get_state();
+    uint32_t exit_ms = 0, entry_ms = 0;
+    int entry_zone = -1;
+    bool exit_pending = alarm_exit_pending(&exit_ms);
+    bool entry_pending = alarm_entry_pending(&entry_zone, &entry_ms);
+
+    const char *state_name = alarm_state_to_name(st);
+    if (entry_pending) {
+        state_name = "PRE_DISARM";
+    } else if (exit_pending && (st == ALARM_ARMED_HOME || st == ALARM_ARMED_AWAY ||
+                                st == ALARM_ARMED_NIGHT || st == ALARM_ARMED_CUSTOM)) {
+        state_name = "PRE_ARM";
+    }
+
+    uint16_t outputs_mask = 0;
+    outputs_get_mask(&outputs_mask);
+    uint16_t bypass_mask = alarm_get_bypass_mask();
+
+    uint16_t gpioab = 0;
+    inputs_read_all(&gpioab);
+    bool tamper = inputs_tamper(gpioab);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_ERR_NO_MEM;
+
+    cJSON_AddStringToObject(root, "state", state_name);
+    cJSON_AddNumberToObject(root, "zones_count", INPUT_ZONES_COUNT);
+    cJSON_AddNumberToObject(root, "outputs_mask", (double)outputs_mask);
+    cJSON_AddNumberToObject(root, "bypass_mask", (double)bypass_mask);
+    cJSON_AddItemToObject(root, "tamper", cJSON_CreateBool(tamper));
+    cJSON_AddNumberToObject(root, "exit_pending_ms", (double)exit_ms);
+    cJSON_AddNumberToObject(root, "entry_pending_ms", (double)entry_ms);
+    cJSON_AddNumberToObject(root, "entry_zone", (double)entry_zone);
+    ensure_timestamp(root);
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!payload) return ESP_ERR_NO_MEM;
+
+    esp_err_t err = publish_raw(s_topic_state, payload, CONFIG_APP_CLOUD_QOS_STATE, true);
+    cJSON_free(payload);
+    return err;
+}
+
+static esp_err_t publish_zones_internal(uint16_t mask, bool force)
+{
+    if (!s_client) return ESP_ERR_INVALID_STATE;
+    if (!force && mask == s_last_zone_mask) return ESP_OK;
+
+    s_last_zone_mask = mask;
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_ERR_NO_MEM;
+
+    cJSON_AddNumberToObject(root, "mask", (double)mask);
+    ensure_timestamp(root);
+
+    cJSON *arr = cJSON_AddArrayToObject(root, "zones");
+    if (!arr) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    for (int i = 0; i < INPUT_ZONES_COUNT; ++i) {
+        bool active = (mask & (1u << i)) != 0;
+        cJSON_AddItemToArray(arr, cJSON_CreateBool(active));
+    }
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!payload) return ESP_ERR_NO_MEM;
+
+    esp_err_t err = publish_raw(s_topic_zones, payload, CONFIG_APP_CLOUD_QOS_STATE, false);
+    cJSON_free(payload);
+    return err;
+}
+
+esp_err_t mqtt_publish_zones(uint16_t mask)
+{
+    return publish_zones_internal(mask, false);
+}
+
+esp_err_t mqtt_publish_scenes(void)
+{
+    if (!s_client) return ESP_ERR_INVALID_STATE;
+
+    uint16_t mask_home = 0, mask_night = 0, mask_custom = 0;
+    scenes_get_mask(SCENE_HOME, &mask_home);
+    scenes_get_mask(SCENE_NIGHT, &mask_night);
+    scenes_get_mask(SCENE_CUSTOM, &mask_custom);
+
+    int ids[16];
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_ERR_NO_MEM;
+    cJSON_AddNumberToObject(root, "zones_count", INPUT_ZONES_COUNT);
+    ensure_timestamp(root);
+
+    cJSON *arr_home = cJSON_AddArrayToObject(root, "home");
+    cJSON *arr_night = cJSON_AddArrayToObject(root, "night");
+    cJSON *arr_custom = cJSON_AddArrayToObject(root, "custom");
+
+    if (!arr_home || !arr_night || !arr_custom) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+
+    int cnt = scenes_mask_to_ids(mask_home, ids, INPUT_ZONES_COUNT);
+    for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(arr_home, cJSON_CreateNumber(ids[i]));
+    cnt = scenes_mask_to_ids(mask_night, ids, INPUT_ZONES_COUNT);
+    for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(arr_night, cJSON_CreateNumber(ids[i]));
+    cnt = scenes_mask_to_ids(mask_custom, ids, INPUT_ZONES_COUNT);
+    for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(arr_custom, cJSON_CreateNumber(ids[i]));
+
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!payload) return ESP_ERR_NO_MEM;
+
+    esp_err_t err = publish_raw(s_topic_scenes, payload, CONFIG_APP_CLOUD_QOS_STATE, true);
+    cJSON_free(payload);
+    return err;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Command handling
+// ─────────────────────────────────────────────────────────────────────────────
+static void handle_arm_command(const char *payload)
+{
+    const char *mode = "away";
+    cJSON *root = NULL;
+    if (payload && payload[0]) {
+        root = cJSON_Parse(payload);
+    }
+    if (root) {
+        cJSON *m = cJSON_GetObjectItemCaseSensitive(root, "mode");
+        if (cJSON_IsString(m) && m->valuestring) {
+            mode = m->valuestring;
+        }
+        cJSON *bp = cJSON_GetObjectItemCaseSensitive(root, "bypass_mask");
+        if (cJSON_IsNumber(bp)) {
+            alarm_set_bypass_mask((uint16_t)bp->valuedouble);
+        }
+    }
+    uint16_t scene_mask = scenes_mask_all(INPUT_ZONES_COUNT);
+    alarm_state_t target = ALARM_ARMED_AWAY;
+    if (strcasecmp(mode, "home") == 0) {
+        target = ALARM_ARMED_HOME;
+        scenes_get_mask(SCENE_HOME, &scene_mask);
+    } else if (strcasecmp(mode, "night") == 0) {
+        target = ALARM_ARMED_NIGHT;
+        scenes_get_mask(SCENE_NIGHT, &scene_mask);
+    } else if (strcasecmp(mode, "custom") == 0) {
+        target = ALARM_ARMED_CUSTOM;
+        scenes_get_mask(SCENE_CUSTOM, &scene_mask);
+    }
+    scenes_set_active_mask(scene_mask);
+
+    switch (target) {
+    case ALARM_ARMED_HOME:   alarm_arm_home(); break;
+    case ALARM_ARMED_AWAY:   alarm_arm_away(); break;
+    case ALARM_ARMED_NIGHT:  alarm_arm_night(); break;
+    case ALARM_ARMED_CUSTOM: alarm_arm_custom(); break;
+    default: break;
+    }
+
+    if (root) cJSON_Delete(root);
+    mqtt_publish_state();
+}
+
+static void handle_disarm_command(void)
+{
+    alarm_disarm();
+    mqtt_publish_state();
+}
+
+static void handle_outputs_command(const char *payload)
+{
+    if (!payload || !payload[0]) return;
+    cJSON *root = cJSON_Parse(payload);
+    if (!root) return;
+
+    cJSON *relay = cJSON_GetObjectItemCaseSensitive(root, "relay");
+    cJSON *ls    = cJSON_GetObjectItemCaseSensitive(root, "ls");
+    cJSON *lm    = cJSON_GetObjectItemCaseSensitive(root, "lm");
+    if (cJSON_IsNumber(relay)) outputs_siren(relay->valuedouble > 0.5);
+    if (cJSON_IsNumber(ls))    outputs_led_state(ls->valuedouble > 0.5);
+    if (cJSON_IsNumber(lm))    outputs_led_maint(lm->valuedouble > 0.5);
+
+    cJSON_Delete(root);
+    mqtt_publish_state();
+}
+
+static void handle_scenes_set(const char *payload)
+{
+    if (!payload || !payload[0]) return;
+    cJSON *root = cJSON_Parse(payload);
+    if (!root) return;
+
+    cJSON *scene = cJSON_GetObjectItemCaseSensitive(root, "scene");
+    cJSON *zones = cJSON_GetObjectItemCaseSensitive(root, "zones");
+
+    if (cJSON_IsString(scene) && cJSON_IsArray(zones)) {
+        int ids[16];
+        int count = 0;
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, zones) {
+            if (cJSON_IsNumber(item) && count < 16) {
+                ids[count++] = (int)item->valuedouble;
+            }
+        }
+        uint16_t mask = scenes_ids_to_mask(ids, count);
+        scene_t sc = SCENE_CUSTOM;
+        if (strcasecmp(scene->valuestring, "home") == 0) sc = SCENE_HOME;
+        else if (strcasecmp(scene->valuestring, "night") == 0) sc = SCENE_NIGHT;
+        if (scenes_set_mask(sc, mask) == ESP_OK) {
+            mqtt_publish_scenes();
+        } else {
+            ESP_LOGW(TAG, "Scene set failed (%s)", scene->valuestring);
+        }
+    }
+
+    cJSON_Delete(root);
+}
+
+static void handle_bypass_set(const char *payload)
+{
+    if (!payload || !payload[0]) return;
+    cJSON *root = cJSON_Parse(payload);
+    if (!root) return;
+
+    cJSON *mask = cJSON_GetObjectItemCaseSensitive(root, "mask");
+    if (cJSON_IsNumber(mask)) {
+        alarm_set_bypass_mask((uint16_t)mask->valuedouble);
+        mqtt_publish_state();
+    }
+
+    cJSON_Delete(root);
+}
+
+static void handle_command(const char *topic, const char *payload)
+{
+    if (!topic) return;
+    if (strncmp(topic, s_topic_cmd_base, s_cmd_base_len) != 0) return;
+    const char *suffix = topic + s_cmd_base_len;
+    if (*suffix == '/') ++suffix;
+
+    ESP_LOGI(TAG, "CMD %s", suffix);
+
+    if (strcmp(suffix, "arm") == 0) {
+        handle_arm_command(payload);
+    } else if (strcmp(suffix, "disarm") == 0) {
+        handle_disarm_command();
+    } else if (strcmp(suffix, "outputs/set") == 0) {
+        handle_outputs_command(payload);
+    } else if (strcmp(suffix, "scenes/set") == 0) {
+        handle_scenes_set(payload);
+    } else if (strcmp(suffix, "scenes/get") == 0) {
+        mqtt_publish_scenes();
+    } else if (strcmp(suffix, "status/get") == 0) {
+        mqtt_publish_state();
+        publish_zones_internal(s_last_zone_mask, true);
+    } else if (strcmp(suffix, "bypass/set") == 0) {
+        handle_bypass_set(payload);
+    } else {
+        ESP_LOGW(TAG, "Unhandled command topic=%s", suffix);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MQTT event handler
+// ─────────────────────────────────────────────────────────────────────────────
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t e = (esp_mqtt_event_handle_t)event_data;
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         s_connected = true;
-        ESP_LOGI(TAG, "MQTT CONNECTED");
-        mqtt_on_connected(e->client);
+        ESP_LOGI(TAG, "MQTT connected");
+        publish_availability("online");
+        esp_mqtt_client_subscribe(s_client, s_topic_cmd_sub, CONFIG_APP_CLOUD_QOS_COMMANDS);
+        mqtt_publish_state();
+        publish_zones_internal(s_last_zone_mask, true);
+        mqtt_publish_scenes();
         break;
     case MQTT_EVENT_DISCONNECTED:
         s_connected = false;
-        ESP_LOGW(TAG, "MQTT DISCONNECTED");
-        mqtt_on_disconnected();
+        ESP_LOGW(TAG, "MQTT disconnected");
+    case MQTT_EVENT_DATA: {
+        if (!e->topic || !e->data) break;
+        char topic[160];
+        size_t tlen = (size_t)e->topic_len;
+        if (tlen >= sizeof(topic)) tlen = sizeof(topic) - 1;
+        memcpy(topic, e->topic, tlen);
+        topic[tlen] = '\0';
+
+        char data[256];
+        size_t dlen = (size_t)e->data_len;
+        if (dlen >= sizeof(data)) dlen = sizeof(data) - 1;
+        memcpy(data, e->data, dlen);
+        data[dlen] = '\0';
+
+        handle_command(topic, data);
         break;
-    case MQTT_EVENT_SUBSCRIBED:
-        ESP_LOGI(TAG, "SUBSCRIBED msg_id=%d", e->msg_id);
-        break;
-    case MQTT_EVENT_UNSUBSCRIBED:
-        ESP_LOGI(TAG, "UNSUBSCRIBED msg_id=%d", e->msg_id);
-        break;
-    case MQTT_EVENT_PUBLISHED:
-        ESP_LOGD(TAG, "PUBLISHED msg_id=%d", e->msg_id);
-        break;
-    case MQTT_EVENT_DATA:
-        mqtt_on_message(e);
-        break;
+    }
     case MQTT_EVENT_ERROR:
-        ESP_LOGE(TAG, "MQTT EVENT ERROR");
+        ESP_LOGE(TAG, "MQTT error");
         break;
     default:
-        ESP_LOGD(TAG, "MQTT event id=%" PRId32, event_id);
         break;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Creazione e avvio client
-
-static void mqtt_create_if_needed(void)
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
+esp_err_t mqtt_start(void)
 {
-    if (s_client) return;
+    if (s_client) return ESP_OK;
 
-    // Client ID = prefix + MAC
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_ETH);
-    char client_id[64];
-    snprintf(client_id, sizeof client_id, "%s%02X%02X%02X%02X%02X%02X",
-             CONFIG_MQTT_CLIENT_ID_PREFIX, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    build_device_id();
+    build_topics();
 
     esp_mqtt_client_config_t cfg = {
-        .broker.address.uri = CONFIG_MQTT_URI,
+        .broker.address.uri = CONFIG_APP_CLOUD_MQTT_URI,
+        .broker.verification.certificate = (const char *)certs_broker_ca_pem_start,
+        .broker.verification.certificate_len = (size_t)(certs_broker_ca_pem_end - certs_broker_ca_pem_start),
         .credentials = {
-            .username = CONFIG_MQTT_USERNAME,
-            .authentication = {
-                .password = CONFIG_MQTT_PASSWORD,
-            },
-            .client_id = client_id,
-        },
-        .network = {
-            .disable_auto_reconnect = CONFIG_MQTT_DISABLE_AUTO_RECONNECT,
+            .client_id = s_device_id,
+            .username = CONFIG_APP_CLOUD_USERNAME[0] ? CONFIG_APP_CLOUD_USERNAME : NULL,
+            .authentication.password = CONFIG_APP_CLOUD_PASSWORD[0] ? CONFIG_APP_CLOUD_PASSWORD : NULL,
         },
         .session = {
-            .keepalive = CONFIG_MQTT_KEEPALIVE,
+            .keepalive = CONFIG_APP_CLOUD_KEEPALIVE,
+            .last_will = {
+                .topic = s_topic_avail,
+                .msg = "offline",
+                .msg_len = 7,
+                .qos = CONFIG_APP_CLOUD_QOS_STATE,
+                .retain = true,
+            },
         },
-        // Se usi TLS, popola qui .broker.verification e .broker.certificate
-        // .broker.verification.certificate = (const char*) mqtt_root_ca_pem,
+        .network = {
+            .disable_auto_reconnect = false,
+        },
     };
 
     s_client = esp_mqtt_client_init(&cfg);
-    ESP_ERROR_CHECK(esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL));
-    ESP_LOGI(TAG, "MQTT client creato (uri=%s, client_id=%s)", CONFIG_MQTT_URI, client_id);
-}
+    ESP_RETURN_ON_FALSE(s_client != NULL, ESP_ERR_NO_MEM, TAG, "mqtt init");
 
-void mqtt_start(void)
-{
-    // Evita di partire se la rete non è pronta
-    if (!eth_has_ip()) {
-        ESP_LOGW(TAG, "Rete non pronta (no IP). Rimando start MQTT.");
-        return;
-    }
-    log_ip_info("Prima di MQTT");
+    ESP_RETURN_ON_ERROR(esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL),
+                        TAG, "register evt");
 
-    mqtt_create_if_needed();
+    ESP_RETURN_ON_ERROR(esp_mqtt_client_start(s_client), TAG, "start");
+    ESP_LOGI(TAG, "MQTT client started (device_id=%s)", s_device_id);
 
-    if (!s_started) {
-        ESP_ERROR_CHECK(esp_mqtt_client_start(s_client));
-        s_started = true;
-        ESP_LOGI(TAG, "MQTT started");
-    } else {
-        ESP_LOGD(TAG, "MQTT già avviato");
-    }
-}
-
-void mqtt_stop(void)
-{
-    if (s_client && s_started) {
-        ESP_ERROR_CHECK(esp_mqtt_client_stop(s_client));
-        s_started = false;
-        s_connected = false;
-        ESP_LOGI(TAG, "MQTT stopped");
-    }
-}
-
-bool mqtt_is_connected(void)
-{
-    return s_connected;
-}
-
-int mqtt_publish(const char* topic, const char* data, int qos, int retain)
-{
-    if (!s_client) {
-        ESP_LOGW(TAG, "Publish ignorato: client non inizializzato");
-        return -1;
-    }
-    int mid = esp_mqtt_client_publish(s_client, topic, data, 0, qos, retain);
-    if (mid < 0) {
-        ESP_LOGE(TAG, "Publish fallito su topic %s", topic);
-    }
-    return mid;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Event handlers di rete → autostart/stop
-
-static void on_eth_event(void* arg, esp_event_base_t base, int32_t id, void* data)
-{
-    switch (id) {
-    case ETHERNET_EVENT_CONNECTED:
-        ESP_LOGI(TAG, "ETH link UP");
-        break;
-    case ETHERNET_EVENT_DISCONNECTED:
-        ESP_LOGW(TAG, "ETH link DOWN → stop MQTT");
-        mqtt_stop();
-        break;
-    case ETHERNET_EVENT_START:
-        ESP_LOGI(TAG, "ETH START");
-        break;
-    case ETHERNET_EVENT_STOP:
-        ESP_LOGI(TAG, "ETH STOP");
-        mqtt_stop();
-        break;
-    default:
-        ESP_LOGD(TAG, "ETH event id=%" PRId32, id);
-        break;
-    }
-}
-
-static void on_ip_event(void* arg, esp_event_base_t base, int32_t id, void* data)
-{
-    if (id == IP_EVENT_ETH_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*)data;
-        char ip[16], nm[16], gw[16];
-        esp_ip4addr_ntoa(&event->ip_info.ip, ip, sizeof ip);
-        esp_ip4addr_ntoa(&event->ip_info.netmask, nm, sizeof nm);
-        esp_ip4addr_ntoa(&event->ip_info.gw, gw, sizeof gw);
-        ESP_LOGI(TAG, "ETH GOT IP | ip=%s mask=%s gw=%s → start MQTT", ip, nm, gw);
-        mqtt_start(); // parte solo se non già partito
-    }
-}
-
-// Call una volta all’avvio (ad es. da app_main, dopo eth_start())
-static bool s_net_handlers_registered = false;
-void mqtt_register_net_handlers_once(void)
-{
-    if (s_net_handlers_registered) return;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(ETH_EVENT, ESP_EVENT_ANY_ID, &on_eth_event, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &on_ip_event, NULL, NULL));
-    s_net_handlers_registered = true;
-    ESP_LOGI(TAG, "Registrati handlers ETH/IP per autostart MQTT");
+    // Initial availability is offline until we receive MQTT_EVENT_CONNECTED
+    publish_availability("offline");
+    return ESP_OK;
 }
