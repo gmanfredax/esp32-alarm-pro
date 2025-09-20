@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dashboard • Alarm Pro</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="appRoot" class="app hidden">
+    <header class="site-header">
+      <div class="container head-inner">
+        <div class="brand">
+          <svg xmlns="http://www.w3.org/2000/svg" class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <path d="M7 11a5 5 0 1 1 10 0v4H7v-4Z"/><path d="M5 19h14"/>
+            <path d="M21 11h1"/><path d="M2 11h1"/><path d="M18.5 5.5 19 5"/><path d="m4.5 5.5-.5-.5"/>
+          </svg>
+          <div class="brand-text">
+            <span class="brand-label">Alarm Pro</span>
+            <span class="brand-sub" id="systemLabel"></span>
+          </div>
+        </div>
+
+        <nav class="nav">
+          <div class="tabs toolbar">
+            <button class="tab-btn" data-tab="status">STATO</button>
+            <button class="tab-btn" data-tab="zones">ZONE</button>
+            <button class="tab-btn" data-tab="scenes">SCENARI</button>
+            <button class="tab-btn" data-tab="log">LOG</button>
+          </div>
+        </nav>
+
+        <div class="user user-menu">
+          <button id="userBtn" class="user-btn">
+            <svg xmlns="http://www.w3.org/2000/svg" class="ico s" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+              <circle cx="7.5" cy="7.5" r="3"/><path d="M10.2 10.2 21 21"/><path d="m18 15 3 3"/>
+            </svg>
+            <span id="userLabel"></span>
+          </button>
+          <div id="userDropdown" class="dropdown hidden">
+            <button data-act="settings">Impostazioni utente</button>
+            <div class="dropdown-divider admin-only"></div>
+            <button class="admin-only" data-act="sys_settings">Impostazioni sistema</button>
+            <div class="dropdown-divider"></div>
+            <button data-act="logout">Logout</button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main class="container main">
+      <section id="tab-status" class="tab active">
+        <div id="statusCards" class="kpi-grid"></div>
+
+        <div id="commandCards" class="kpi-grid">
+          <div class="card">
+            <div class="kpi">
+              <div class="kpi-title">Comandi</div>
+              <div class="kpi-value">
+                <div class="mode-grid">
+                  <button class="mode-btn away" data-arm="away">
+                    <div class="mode-icon">🏠↔️</div>
+                    <div class="mode-label">AWAY</div>
+                  </button>
+                  <button class="mode-btn home" data-arm="home">
+                    <div class="mode-icon">🏠</div>
+                    <div class="mode-label">HOME</div>
+                  </button>
+                  <button class="mode-btn night" data-arm="night">
+                    <div class="mode-icon">🌙</div>
+                    <div class="mode-label">NIGHT</div>
+                  </button>
+                  <button class="mode-btn custom" data-arm="custom">
+                    <div class="mode-icon">⚙️</div>
+                    <div class="mode-label">CUSTOM</div>
+                  </button>
+                </div>
+                <div class="row" style="margin-top:.75rem">
+                  <button class="btn danger wide" id="disarmBtn">DISARMA</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="appNotice" class="msg small hidden"></div>
+      </section>
+
+      <section id="tab-zones" class="tab">
+        <div class="row between" style="margin-bottom:.5rem">
+          <h3>Zone</h3>
+          <button id="btnZonesCfg" class="btn small admin-only">Configura zone</button>
+        </div>
+        <div id="zonesGrid" class="zones-grid"></div>
+      </section>
+
+      <section id="tab-scenes" class="tab">
+        <div id="scenesWrap" class="scenes-list"></div>
+      </section>
+
+      <section id="tab-log" class="tab">
+        <div class="row between" style="margin-bottom:.5rem">
+          <h3>Log eventi</h3>
+          <div class="row" style="gap:.5rem">
+            <button id="logsRefresh" class="btn small">Aggiorna</button>
+          </div>
+        </div>
+        <div id="logsList" class="log-list"></div>
+      </section>
+    </main>
+
+    <footer class="container foot">
+      <small>© <span id="year"></span> NeXtorSystem</small>
+    </footer>
+  </div>
+
+  <div id="modals-root"></div>
+
+  <script src="./js/qrcode.min.js" defer></script>
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
