@@ -37,6 +37,7 @@
 #include <time.h>
 
 #include "utils.h"
+#include "device_identity.h"
 
 static void sntp_start_and_wait(void){
     // API compatibile con IDF “classico” (LWIP SNTP)
@@ -86,6 +87,9 @@ static void nvs_erase_namespace_once(const char* ns){
 
 void app_main(void)
 {
+    char device_id[DEVICE_ID_MAX] = {0};
+    uint8_t device_secret[DEVICE_SECRET_LEN] = {0};
+
     // Stack di rete/eventi prima di tutto
     nvs_init_safe();                              // RIMUOVI se già fatto in storage_init()
     //nvs_erase_namespace_once("users");
@@ -97,6 +101,15 @@ void app_main(void)
     ESP_ERROR_CHECK(i2c_bus_init());
     ESP_LOGI(TAG, "Interrupts before ETH:");
     esp_intr_dump(stdout);  // diagnostica: verifica chi occupa cosa
+
+    // Crea/legge da NVS ID e secret
+    ensure_device_identity(device_id, device_secret);
+        // Stampa su seriale (NON stampare il secret in produzione)
+    ESP_LOGI(TAG, "Device ID: %s", device_id);
+    ESP_LOGI(TAG, "Device Secret (hex first 8): %02X%02X%02X%02X %02X%02X%02X%02X ...",
+             device_secret[0],device_secret[1],device_secret[2],device_secret[3],
+             device_secret[4],device_secret[5],device_secret[6],device_secret[7]);
+    
     esp_err_t eth_ret = eth_start();
     if (eth_ret != ESP_OK) ESP_LOGW(TAG, "Ethernet not available. Continuing without it...");
     ESP_ERROR_CHECK(auth_init());
