@@ -28,8 +28,8 @@
 #include "cJSON.h"
 
 
-extern const uint8_t certs_broker_ca_pem_start[] asm("_binary_certs_broker_ca_pem_start");
-extern const uint8_t certs_broker_ca_pem_end[]   asm("_binary_certs_broker_ca_pem_end");
+extern const uint8_t certs_broker_ca_pem_start[] asm("_binary_broker_ca_pem_start");
+extern const uint8_t certs_broker_ca_pem_end[]   asm("_binary_broker_ca_pem_end");
 
 static const char *TAG = "cloud_mqtt";
 
