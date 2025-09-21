@@ -17,14 +17,14 @@ config APP_CLOUD_DEVICE_ID
 
 config APP_CLOUD_CLIENT_ID_PREFIX
     string "Client ID prefix"
-    default "esp32-alarm-"
+    default "nsalarmpro-"
     help
         Prefix used to build the MQTT client identifier when APP_CLOUD_DEVICE_ID
         is empty. The final ID is prefix plus the Ethernet MAC address.
 
 config APP_CLOUD_TOPIC_ROOT
     string "MQTT topic root"
-    default "alarm"
+    default "alarmpro"
     help
         Root prefix for all MQTT topics used by the application. State topics are
         published under <root>/state/<deviceId>/... and command topics are

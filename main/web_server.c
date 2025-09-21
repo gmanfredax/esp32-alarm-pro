@@ -59,11 +59,13 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <time.h>
+#include <ctype.h>
 
-extern const unsigned char certs_server_cert_pem_start[] asm("_binary_certs_server_cert_pem_start");
-extern const unsigned char certs_server_cert_pem_end[]   asm("_binary_certs_server_cert_pem_end");
-extern const unsigned char certs_server_key_pem_start[]  asm("_binary_certs_server_key_pem_start");
-extern const unsigned char certs_server_key_pem_end[]    asm("_binary_certs_server_key_pem_end");
+
+extern const unsigned char certs_server_cert_pem_start[] asm("_binary_server_cert_pem_start");
+extern const unsigned char certs_server_cert_pem_end[]   asm("_binary_server_cert_pem_end");
+extern const unsigned char certs_server_key_pem_start[]  asm("_binary_server_key_pem_start");
+extern const unsigned char certs_server_key_pem_end[]    asm("_binary_server_key_pem_end");
 
 static void web_server_restart_async(void);
 
@@ -80,7 +82,7 @@ static const char *TAG_ADMIN __attribute__((unused)) = "admin_html";
 #define TOTP_STEP_SECONDS    30
 #define TOTP_WINDOW_STEPS    1
 
-static const char* ISSUER_NAME = "CentraleESP32";
+static const char* ISSUER_NAME = "Alarm Pro";
 #define GATE_COOKIE "gate"
 
 #define WEB_TLS_NS             "websec"
@@ -197,6 +199,10 @@ static web_tls_state_t s_web_tls_state = {
 
 static bool s_restart_pending = false;
 
+#define DEFAULT_CF_UI_URL "https://dash.cloudflare.com/"
+static bool s_provisioned = false;
+static char s_cloudflare_ui_url[128] = DEFAULT_CF_UI_URL;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Server handle & SPIFFS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,6 +213,17 @@ static esp_err_t json_reply(httpd_req_t* req, const char* json){
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, json);
 }
+
+static esp_err_t json_reply_cjson(httpd_req_t* req, cJSON* json){
+    if (!json) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    char* payload = cJSON_PrintUnformatted(json);
+    cJSON_Delete(json);
+    if (!payload) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    esp_err_t err = json_reply(req, payload);
+    free(payload);
+    return err;
+}
+
 static bool check_bearer(httpd_req_t* req){
     return auth_check_bearer(req, NULL);
 }
@@ -680,7 +697,131 @@ static void nvs_get_str_def(nvs_handle_t h, const char* key, char* out, size_t c
 static uint32_t nvs_get_u32_def(nvs_handle_t h, const char* key, uint32_t def){
     uint32_t v=def; nvs_get_u32(h, key, &v); return v;
 }
+
+static void trim_inplace(char* s){
+    if (!s) return;
+    char* start = s;
+    while (*start && isspace((unsigned char)*start)) start++;
+    char* end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) --end;
+    *end = '\0';
+    if (start != s) memmove(s, start, (size_t)(end - start + 1));
+}
+
+static void provisioning_set_ui_url(const char* url){
+    if (!url || !url[0]){
+        strlcpy(s_cloudflare_ui_url, DEFAULT_CF_UI_URL, sizeof(s_cloudflare_ui_url));
+        return;
+    }
+    strlcpy(s_cloudflare_ui_url, url, sizeof(s_cloudflare_ui_url));
+    trim_inplace(s_cloudflare_ui_url);
+    if (!s_cloudflare_ui_url[0]){
+        strlcpy(s_cloudflare_ui_url, DEFAULT_CF_UI_URL, sizeof(s_cloudflare_ui_url));
+    }
+}
+
+static void provisioning_load_state(void){
+    s_provisioned = false;
+    provisioning_set_ui_url(DEFAULT_CF_UI_URL);
+    nvs_handle_t nvs;
+    if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
+        uint8_t flag = 0;
+        if (nvs_get_u8(nvs, "provisioned", &flag) == ESP_OK){
+            s_provisioned = flag != 0;
+        }
+        char url_buf[sizeof(s_cloudflare_ui_url)];
+        nvs_get_str_def(nvs, "cf_ui", url_buf, sizeof(url_buf), DEFAULT_CF_UI_URL);
+        provisioning_set_ui_url(url_buf);
+        nvs_close(nvs);
+    }
+}
+
+static esp_err_t provisioning_set_flag(bool value){
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("sys", NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(nvs, "provisioned", value ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err == ESP_OK) s_provisioned = value;
+    return err;
+}
+
+typedef struct {
+    char hostname[64];
+    bool dhcp;
+    char ip[16];
+    char gw[16];
+    char mask[16];
+    char dns[16];
+} provisioning_net_config_t;
+
+typedef struct {
+    char uri[96];
+    char cid[64];
+    char user[64];
+    char pass[64];
+    uint32_t keepalive;
+} provisioning_mqtt_config_t;
+
+typedef struct {
+    char account_id[96];
+    char tunnel_id[96];
+    char auth_token[256];
+    char ui_url[128];
+} provisioning_cloudflare_config_t;
+
+static void provisioning_load_net(provisioning_net_config_t* cfg){
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    strlcpy(cfg->hostname, "centrale-esp32", sizeof(cfg->hostname));
+    cfg->dhcp = true;
+    nvs_handle_t nvs;
+    if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
+        nvs_get_str_def(nvs, "host", cfg->hostname, sizeof(cfg->hostname), "centrale-esp32");
+        nvs_get_str_def(nvs, "ip",   cfg->ip,   sizeof(cfg->ip),   "");
+        nvs_get_str_def(nvs, "gw",   cfg->gw,   sizeof(cfg->gw),   "");
+        nvs_get_str_def(nvs, "mask", cfg->mask, sizeof(cfg->mask), "");
+        nvs_get_str_def(nvs, "dns",  cfg->dns,  sizeof(cfg->dns),  "");
+        cfg->dhcp = nvs_get_u32_def(nvs, "dhcp", 1) != 0;
+        nvs_close(nvs);
+    }
+}
+
+static void provisioning_load_mqtt(provisioning_mqtt_config_t* cfg){
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->keepalive = 60;
+    nvs_handle_t nvs;
+    if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
+        nvs_get_str_def(nvs, "mq_uri",  cfg->uri,  sizeof(cfg->uri),  "");
+        nvs_get_str_def(nvs, "mq_cid",  cfg->cid,  sizeof(cfg->cid),  "");
+        nvs_get_str_def(nvs, "mq_user", cfg->user, sizeof(cfg->user), "");
+        nvs_get_str_def(nvs, "mq_pass", cfg->pass, sizeof(cfg->pass), "");
+        cfg->keepalive = nvs_get_u32_def(nvs, "mq_keep", 60);
+        nvs_close(nvs);
+    }
+}
+
+static void provisioning_load_cloudflare(provisioning_cloudflare_config_t* cfg){
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    strlcpy(cfg->ui_url, s_cloudflare_ui_url, sizeof(cfg->ui_url));
+    nvs_handle_t nvs;
+    if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
+        nvs_get_str_def(nvs, "cf_account", cfg->account_id, sizeof(cfg->account_id), "");
+        nvs_get_str_def(nvs, "cf_tunnel",  cfg->tunnel_id,  sizeof(cfg->tunnel_id),  "");
+        nvs_get_str_def(nvs, "cf_token",   cfg->auth_token, sizeof(cfg->auth_token), "");
+        char url_buf[sizeof(cfg->ui_url)];
+        nvs_get_str_def(nvs, "cf_ui", url_buf, sizeof(url_buf), s_cloudflare_ui_url);
+        provisioning_set_ui_url(url_buf);
+        strlcpy(cfg->ui_url, s_cloudflare_ui_url, sizeof(cfg->ui_url));
+        nvs_close(nvs);
+    }
+}
+
 static esp_err_t only_admin(httpd_req_t* req){
+    if (!s_provisioned) return ESP_OK;
     user_info_t u;
     if (!auth_check_bearer(req,&u) || u.role != ROLE_ADMIN){
         return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
@@ -691,22 +832,16 @@ static esp_err_t only_admin(httpd_req_t* req){
 // ---- /api/sys/net GET/POST ----
 static esp_err_t sys_net_get(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
-    nvs_handle_t nvs; if (nvs_open("sys", NVS_READONLY, &nvs)!=ESP_OK) {
-        return json_reply(req, "{\"hostname\":\"centrale-esp32\",\"dhcp\":true,\"ip\":\"\",\"gw\":\"\",\"mask\":\"\",\"dns\":\"\"}");
-    }
-    char host[64], ip[16], gw[16], mask[16], dns[16];
-    nvs_get_str_def(nvs,"host", host,sizeof(host),"centrale-esp32");
-    nvs_get_str_def(nvs,"ip",   ip,  sizeof(ip),  "");
-    nvs_get_str_def(nvs,"gw",   gw,  sizeof(gw),  "");
-    nvs_get_str_def(nvs,"mask", mask,sizeof(mask),"");
-    nvs_get_str_def(nvs,"dns",  dns, sizeof(dns), "");
-    bool dhcp = nvs_get_u32_def(nvs,"dhcp",1)!=0;
-    nvs_close(nvs);
-    char buf[256];
-    snprintf(buf,sizeof(buf),
-      "{\"hostname\":\"%s\",\"dhcp\":%s,\"ip\":\"%s\",\"gw\":\"%s\",\"mask\":\"%s\",\"dns\":\"%s\"}",
-      host, dhcp?"true":"false", ip, gw, mask, dns);
-    return json_reply(req, buf);
+    provisioning_net_config_t cfg; provisioning_load_net(&cfg);
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    cJSON_AddStringToObject(root, "hostname", cfg.hostname);
+    cJSON_AddBoolToObject(root, "dhcp", cfg.dhcp);
+    cJSON_AddStringToObject(root, "ip", cfg.ip);
+    cJSON_AddStringToObject(root, "gw", cfg.gw);
+    cJSON_AddStringToObject(root, "mask", cfg.mask);
+    cJSON_AddStringToObject(root, "dns", cfg.dns);
+    return json_reply_cjson(req, root);
 }
 
 static esp_err_t sys_net_post(httpd_req_t* req){
@@ -735,26 +870,15 @@ static esp_err_t sys_net_post(httpd_req_t* req){
 // ---- /api/sys/mqtt GET/POST ----
 static esp_err_t sys_mqtt_get(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
-    nvs_handle_t nvs; 
-    if (nvs_open("sys", NVS_READONLY, &nvs)!=ESP_OK) {
-        return json_reply(req, "{\"uri\":\"\",\"cid\":\"\",\"user\":\"\",\"pass\":\"\",\"keepalive\":60}");
-    }
-    char uri[96], cid[64], user[64], pass[64];
-    nvs_get_str_def(nvs,"mq_uri", uri,sizeof(uri),"");
-    nvs_get_str_def(nvs,"mq_cid", cid,sizeof(cid),"");
-    nvs_get_str_def(nvs,"mq_user",user,sizeof(user),"");
-    nvs_get_str_def(nvs,"mq_pass",pass,sizeof(pass),"");
-    uint32_t ka = nvs_get_u32_def(nvs,"mq_keep",60);
-    nvs_close(nvs);
-
-    char buf[512]; // <-- più ampio
-    int n = snprintf(buf,sizeof(buf),
-      "{\"uri\":\"%s\",\"cid\":\"%s\",\"user\":\"%s\",\"pass\":\"%s\",\"keepalive\":%u}",
-      uri,cid,user,pass,(unsigned)ka);
-    if (n < 0 || n >= (int)sizeof(buf)) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "resp");
-    }
-    return json_reply(req, buf);
+    provisioning_mqtt_config_t cfg; provisioning_load_mqtt(&cfg);
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    cJSON_AddStringToObject(root, "uri", cfg.uri);
+    cJSON_AddStringToObject(root, "cid", cfg.cid);
+    cJSON_AddStringToObject(root, "user", cfg.user);
+    cJSON_AddStringToObject(root, "pass", cfg.pass);
+    cJSON_AddNumberToObject(root, "keepalive", cfg.keepalive);
+    return json_reply_cjson(req, root);
 }
 
 static esp_err_t sys_mqtt_post(httpd_req_t* req){
@@ -776,6 +900,127 @@ static esp_err_t sys_mqtt_post(httpd_req_t* req){
     if (cJSON_IsNumber(jka))  nvs_set_u32(nvs,"mq_keep",(uint32_t)jka->valuedouble);
     nvs_commit(nvs); nvs_close(nvs); cJSON_Delete(j);
     return json_reply(req, "{\"ok\":true}");
+}
+
+static esp_err_t sys_cloudflare_get(httpd_req_t* req){
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    provisioning_cloudflare_config_t cfg; provisioning_load_cloudflare(&cfg);
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    cJSON_AddStringToObject(root, "account_id", cfg.account_id);
+    cJSON_AddStringToObject(root, "tunnel_id", cfg.tunnel_id);
+    cJSON_AddStringToObject(root, "auth_token", cfg.auth_token);
+    cJSON_AddStringToObject(root, "ui_url", cfg.ui_url);
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t sys_cloudflare_post(httpd_req_t* req){
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char body[768]; size_t bl=0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
+    cJSON* j = cJSON_ParseWithLength(body, bl);
+    if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
+    const cJSON* jacc = cJSON_GetObjectItemCaseSensitive(j, "account_id");
+    const cJSON* jtun = cJSON_GetObjectItemCaseSensitive(j, "tunnel_id");
+    const cJSON* jtok = cJSON_GetObjectItemCaseSensitive(j, "auth_token");
+    const cJSON* jurl = cJSON_GetObjectItemCaseSensitive(j, "ui_url");
+
+    nvs_handle_t nvs;
+    if (nvs_open("sys", NVS_READWRITE, &nvs) != ESP_OK){
+        cJSON_Delete(j);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs"), ESP_FAIL;
+    }
+
+    if (cJSON_IsString(jacc) && jacc->valuestring) nvs_set_str(nvs, "cf_account", jacc->valuestring);
+    if (cJSON_IsString(jtun) && jtun->valuestring) nvs_set_str(nvs, "cf_tunnel", jtun->valuestring);
+    if (cJSON_IsString(jtok) && jtok->valuestring) nvs_set_str(nvs, "cf_token", jtok->valuestring);
+    char url_buf[sizeof(s_cloudflare_ui_url)];
+    bool url_updated = false;
+    if (cJSON_IsString(jurl) && jurl->valuestring){
+        strlcpy(url_buf, jurl->valuestring, sizeof(url_buf));
+        trim_inplace(url_buf);
+        nvs_set_str(nvs, "cf_ui", url_buf);
+        provisioning_set_ui_url(url_buf);
+        url_updated = true;
+    }
+    esp_err_t err = nvs_commit(nvs);
+    nvs_close(nvs);
+    cJSON_Delete(j);
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "commit"), ESP_FAIL;
+    if (!url_updated){
+        provisioning_cloudflare_config_t cfg; provisioning_load_cloudflare(&cfg);
+        (void)cfg;
+    }
+    return json_reply(req, "{\"ok\":true}");
+}
+
+static esp_err_t provision_status_get(httpd_req_t* req){
+    provisioning_net_config_t net; provisioning_mqtt_config_t mqtt; provisioning_cloudflare_config_t cf;
+    provisioning_load_net(&net);
+    provisioning_load_mqtt(&mqtt);
+    provisioning_load_cloudflare(&cf);
+
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    cJSON_AddBoolToObject(root, "provisioned", s_provisioned);
+
+    cJSON* jnet = cJSON_AddObjectToObject(root, "network");
+    if (jnet){
+        cJSON_AddStringToObject(jnet, "hostname", net.hostname);
+        cJSON_AddBoolToObject(jnet, "dhcp", net.dhcp);
+        cJSON_AddStringToObject(jnet, "ip", net.ip);
+        cJSON_AddStringToObject(jnet, "gw", net.gw);
+        cJSON_AddStringToObject(jnet, "mask", net.mask);
+        cJSON_AddStringToObject(jnet, "dns", net.dns);
+    }
+
+    cJSON* jmq = cJSON_AddObjectToObject(root, "mqtt");
+    if (jmq){
+        cJSON_AddStringToObject(jmq, "uri", mqtt.uri);
+        cJSON_AddStringToObject(jmq, "cid", mqtt.cid);
+        cJSON_AddStringToObject(jmq, "user", mqtt.user);
+        cJSON_AddStringToObject(jmq, "pass", mqtt.pass);
+        cJSON_AddNumberToObject(jmq, "keepalive", mqtt.keepalive);
+    }
+
+    cJSON* jcf = cJSON_AddObjectToObject(root, "cloudflare");
+    if (jcf){
+        cJSON_AddStringToObject(jcf, "account_id", cf.account_id);
+        cJSON_AddStringToObject(jcf, "tunnel_id", cf.tunnel_id);
+        cJSON_AddStringToObject(jcf, "auth_token", cf.auth_token);
+        cJSON_AddStringToObject(jcf, "ui_url", cf.ui_url);
+    }
+
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t provision_finish_post(httpd_req_t* req){
+    esp_err_t err = provisioning_set_flag(true);
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs"), ESP_FAIL;
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddStringToObject(root, "redirect", s_cloudflare_ui_url);
+    return json_reply_cjson(req, root);
+}
+
+static bool req_has_hard_reset_header(httpd_req_t* req){
+    char hdr[16] = {0};
+    if (httpd_req_get_hdr_value_str(req, "X-Hard-Reset", hdr, sizeof(hdr)) == ESP_OK){
+        trim_inplace(hdr);
+        if (!hdr[0]) return false;
+        if (!strcasecmp(hdr, "1") || !strcasecmp(hdr, "true") || !strcasecmp(hdr, "yes")) return true;
+    }
+    return false;
+}
+
+static esp_err_t provision_reset_post(httpd_req_t* req){
+    bool allow = !s_provisioned;
+    if (!allow && req_has_hard_reset_header(req)) allow = true;
+    if (!allow && only_admin(req)!=ESP_OK) return ESP_FAIL;
+    esp_err_t err = provisioning_set_flag(false);
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs"), ESP_FAIL;
+    return json_reply(req, "{\"ok\":true,\"provisioned\":false}");
 }
 
 static esp_err_t sys_websec_get(httpd_req_t* req){
@@ -1569,16 +1814,13 @@ static esp_err_t send_file(httpd_req_t* req, const char* fname){
 }
 
 static esp_err_t root_get(httpd_req_t* req){
-    // If logged -> /index.html else /login.html
-    user_info_t u;
-    if (auth_check_cookie(req,&u)){
-        httpd_resp_set_status(req,"302 Found");
-        httpd_resp_set_hdr(req,"Location","/index.html");
-    } else {
-        httpd_resp_set_status(req,"302 Found");
-        httpd_resp_set_hdr(req,"Location","/login.html");
+    if (!s_provisioned){
+        auth_set_security_headers(req);
+        return send_file(req, "index.html");
     }
     auth_set_security_headers(req);
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", s_cloudflare_ui_url);
     return httpd_resp_send(req, NULL, 0);
 }
 
@@ -1595,8 +1837,14 @@ static esp_err_t login_html_get(httpd_req_t* req){
 }
 
 static esp_err_t index_html_get(httpd_req_t* req){
-    if (!auth_gate_html(req, ROLE_USER)) return ESP_OK;
-    return send_file(req,"index.html");
+    if (!s_provisioned){
+        auth_set_security_headers(req);
+        return send_file(req, "index.html");
+    }
+    auth_set_security_headers(req);
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", s_cloudflare_ui_url);
+    return httpd_resp_send(req, NULL, 0);
 }
 static esp_err_t admin_html_get(httpd_req_t* req){
     if (!auth_gate_html(req, ROLE_ADMIN)) return ESP_OK;
@@ -1698,6 +1946,10 @@ static esp_err_t start_web(void){
     httpd_uri_t u_api_me     = {.uri="/api/me",           .method=HTTP_GET,  .handler=api_me_get,         .user_ctx=NULL};
     httpd_uri_t u_api_admin  = {.uri="/api/admin/secret", .method=HTTP_GET,  .handler=api_admin_only_get, .user_ctx=NULL};
 
+    httpd_uri_t api_prov_status = {.uri="/api/provision/status", .method=HTTP_GET,  .handler=provision_status_get, .user_ctx=NULL};
+    httpd_uri_t api_prov_finish = {.uri="/api/provision/finish", .method=HTTP_POST, .handler=provision_finish_post, .user_ctx=NULL};
+    httpd_uri_t api_prov_reset  = {.uri="/api/provision/reset",  .method=HTTP_POST, .handler=provision_reset_post,  .user_ctx=NULL};
+
     httpd_register_uri_handler(srv,&ui_root);
     httpd_register_uri_handler(srv,&ui_login_h);
     httpd_register_uri_handler(srv,&ui_index_h);
@@ -1718,6 +1970,10 @@ static esp_err_t start_web(void){
     httpd_register_uri_handler(srv,&u_api_logout);
     httpd_register_uri_handler(srv,&u_api_me);
     httpd_register_uri_handler(srv,&u_api_admin);
+
+    httpd_register_uri_handler(srv,&api_prov_status);
+    httpd_register_uri_handler(srv,&api_prov_finish);
+    httpd_register_uri_handler(srv,&api_prov_reset);
 
     // API protette
     httpd_uri_t api_status     = {.uri="/api/status",             .method=HTTP_GET,  .handler=status_get,           .user_ctx=NULL };
@@ -1745,6 +2001,10 @@ static esp_err_t start_web(void){
     httpd_uri_t api_sys_net_p  = {.uri="/api/sys/net",  .method=HTTP_POST, .handler=sys_net_post, .user_ctx=NULL};
     httpd_uri_t api_sys_mqtt_g = {.uri="/api/sys/mqtt", .method=HTTP_GET,  .handler=sys_mqtt_get, .user_ctx=NULL};
     httpd_uri_t api_sys_mqtt_p = {.uri="/api/sys/mqtt", .method=HTTP_POST, .handler=sys_mqtt_post,.user_ctx=NULL};
+
+    httpd_uri_t api_sys_cf_g   = {.uri="/api/sys/cloudflare", .method=HTTP_GET,  .handler=sys_cloudflare_get, .user_ctx=NULL};
+    httpd_uri_t api_sys_cf_p   = {.uri="/api/sys/cloudflare", .method=HTTP_POST, .handler=sys_cloudflare_post,.user_ctx=NULL};
+
     httpd_uri_t api_sys_websec_g = {.uri="/api/sys/websec", .method=HTTP_GET,  .handler=sys_websec_get, .user_ctx=NULL};
     httpd_uri_t api_sys_websec_p = {.uri="/api/sys/websec", .method=HTTP_POST, .handler=sys_websec_post,.user_ctx=NULL};
 
@@ -1773,6 +2033,10 @@ static esp_err_t start_web(void){
     httpd_register_uri_handler(srv, &api_sys_net_p);
     httpd_register_uri_handler(srv, &api_sys_mqtt_g);
     httpd_register_uri_handler(srv, &api_sys_mqtt_p);
+
+    httpd_register_uri_handler(srv, &api_sys_cf_g);
+    httpd_register_uri_handler(srv, &api_sys_cf_p);
+
     httpd_register_uri_handler(srv, &api_sys_websec_g);
     httpd_register_uri_handler(srv, &api_sys_websec_p);
 
@@ -1787,6 +2051,8 @@ esp_err_t web_server_start(void){
     ESP_ERROR_CHECK(spiffs_init());
     ESP_ERROR_CHECK(audit_init(128));
     ESP_ERROR_CHECK(auth_init());
+
+    provisioning_load_state();
     
     ESP_ERROR_CHECK(start_web());
 
