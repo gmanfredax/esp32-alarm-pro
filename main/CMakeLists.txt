@@ -44,6 +44,7 @@ idf_component_register(
         spiffs
     PRIV_REQUIRES
         esp_https_server   # <— trascina da solo esp-tls e mbedtls
+        driver
     EMBED_TXTFILES
         ${MAIN_EMBED_TXTFILES}
 #        "certs/server_cert.pem"

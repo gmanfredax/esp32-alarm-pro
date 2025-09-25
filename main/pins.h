@@ -125,6 +125,17 @@ _Static_assert(MCPB_TAMPER_BIT     >= 0 && MCPB_TAMPER_BIT     <= 7, "MCPB_TAMPE
 // #ifndef PIN_LED_MAINT
 //   #define PIN_LED_MAINT         GPIO_NUM_15
 // #endif
+
+// #ifndef PIN_HW_RESET_BTN_A
+//   #define PIN_HW_RESET_BTN_A     GPIO_NUM_4
+// #endif
+// #ifndef PIN_HW_RESET_BTN_B
+//   #define PIN_HW_RESET_BTN_B     GPIO_NUM_5
+// #endif
+
+// _ASSERT_NOT_RMII(PIN_HW_RESET_BTN_A);
+// _ASSERT_NOT_RMII(PIN_HW_RESET_BTN_B);
+// _Static_assert(PIN_HW_RESET_BTN_A != PIN_HW_RESET_BTN_B, "I pulsanti di reset devono usare GPIO distinti");
 // … aggiungi qui eventuali altre definizioni relative a GPIO ESP32 …
 
 

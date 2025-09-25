@@ -21,12 +21,15 @@
 #include "mqtt_client.h"
 
 #include "alarm_core.h"
+#include "device_identity.h"
 #include "gpio_inputs.h"
 #include "outputs.h"
 #include "scenes.h"
 
 #include "cJSON.h"
 
+static uint8_t s_device_secret[DEVICE_SECRET_LEN];
+static char    s_password_hex[DEVICE_SECRET_LEN*2 + 1];
 
 extern const uint8_t certs_broker_ca_pem_start[] asm("_binary_broker_ca_pem_start");
 extern const uint8_t certs_broker_ca_pem_end[]   asm("_binary_broker_ca_pem_end");
@@ -59,9 +62,9 @@ static void build_device_id(void)
 
     uint8_t mac[6] = {0};
     ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_ETH));
-    snprintf(s_device_id, sizeof(s_device_id), "%s%02X%02X%02X%02X%02X%02X",
+    snprintf(s_device_id, sizeof(s_device_id), "%s%02X%02X%02X%02X",
              CONFIG_APP_CLOUD_CLIENT_ID_PREFIX,
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+             mac[2], mac[3], mac[4], mac[5]);
 }
 
 static void build_topics(void)

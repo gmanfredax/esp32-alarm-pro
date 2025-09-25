@@ -2,7 +2,7 @@ menu "ESP32 Alarm Cloud Connectivity"
 
 config APP_CLOUD_MQTT_URI
     string "MQTT broker URI (use mqtts:// or wss://)"
-    default "mqtts://broker.example.com:8883"
+    default "mqtts://mqtt.nsalarm.pro:8883"
     help
         URI of the managed MQTT broker reachable from the ESP32. Use the mqtts://
         scheme to enforce TLS. If you are using a WebSocket proxy for outbound

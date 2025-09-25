@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Provisioning Alarm Pro - NeXtorSystem</title>
+  <link rel="stylesheet" href="/css/style.css" />
+  <style>
+    .wizard-header {
+      padding: 32px 0;
+    }
+    .wizard-header-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+    .wizard-title {
+      font-size: 1.4rem;
+      margin: 0;
+      font-weight: 600;
+    }
+    .wizard-subtitle {
+      margin: .35rem 0 0;
+      color: var(--muted);
+      font-size: .95rem;
+    }
+    .wizard-card {
+      margin: 0 auto;
+      padding: 32px 28px;
+      display: grid;
+      gap: 1.5rem;
+    }
+    .wizard-head h1 {
+      margin: 0 0 .4rem;
+      font-size: 1.65rem;
+    }
+    .wizard-head p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .wizard-steps {
+      list-style: none;
+      display: flex;
+      gap: .75rem;
+      padding: 0;
+      margin: 0;
+      flex-wrap: wrap;
+    }
+    .wizard-steps li {
+      flex: 1;
+      min-width: 160px;
+      display: grid;
+      grid-auto-flow: column;
+      align-items: center;
+      gap: .6rem;
+      justify-content: center;
+      padding: .65rem .75rem;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(10,18,36,.85);
+      color: var(--muted);
+      font-size: .88rem;
+      letter-spacing: .3px;
+      transition: border-color .2s ease, color .2s ease, box-shadow .2s ease;
+    }
+    .wizard-steps li .step-index {
+      width: 26px;
+      height: 26px;
+      display: grid;
+      place-items: center;
+      border-radius: 999px;
+      background: rgba(255,255,255,.06);
+      color: #d1d5db;
+      font-size: .8rem;
+      font-weight: 600;
+    }
+    .wizard-steps li.active {
+      border-color: var(--accent);
+      color: #e0f2fe;
+      box-shadow: 0 8px 22px rgba(4, 104, 165, .25);
+    }
+    .wizard-steps li.active .step-index {
+      background: rgba(34,211,238,.18);
+      color: var(--accent);
+    }
+    .wizard-steps li.done {
+      border-color: rgba(16,185,129,.5);
+      color: #bbf7d0;
+    }
+    .wizard-steps li.done .step-index {
+      background: rgba(16,185,129,.18);
+      color: var(--accent-2);
+    }
+    .wizard-message {
+      border-radius: 14px;
+      padding: .85rem 1rem;
+      font-size: .92rem;
+      line-height: 1.45;
+      border: 1px solid rgba(34,211,238,.25);
+      background: rgba(34,211,238,.12);
+      color: #e0f2fe;
+    }
+    .wizard-message.error {
+      border-color: rgba(239,68,68,.35);
+      background: rgba(239,68,68,.16);
+      color: #fee2e2;
+    }
+    .wizard-message.success {
+      border-color: rgba(16,185,129,.35);
+      background: rgba(16,185,129,.16);
+      color: #d1fae5;
+    }
+    .wizard-step {
+      display: none;
+      gap: 1.2rem;
+    }
+    .wizard-step.active {
+      display: grid;
+    }
+    .wizard-form {
+      display: grid;
+      gap: 1rem;
+    }
+    .wizard-form .field {
+      display: grid;
+      gap: .35rem;
+    }
+    .wizard-form label {
+      font-size: .88rem;
+      letter-spacing: .2px;
+      color: var(--muted);
+    }
+    .wizard-form input, .wizard-form select, .wizard-form textarea {
+      border: 1px solid rgba(148,163,184,.35);
+      background: rgba(10,18,36,.65);
+      border-radius: 12px;
+      padding: .55rem .75rem;
+      color: var(--text);
+      font-size: .95rem;
+    }
+    .wizard-form input:focus, .wizard-form select:focus, .wizard-form textarea:focus {
+      outline: 2px solid rgba(34,211,238,.35);
+      border-color: rgba(34,211,238,.55);
+    }
+    .wizard-actions {
+      display: flex;
+      gap: .75rem;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+    #netStaticFields.hidden {
+      display: none;
+    }
+    .summary-grid {
+      display: grid;
+      gap: .75rem;
+    }
+    .summary-item {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: .8rem 1rem;
+      background: rgba(9,16,31,.7);
+      display: grid;
+      gap: .4rem;
+    }
+    .summary-item h3 {
+      margin: 0;
+      font-size: 1rem;
+      display: flex;
+      align-items: center;
+      gap: .4rem;
+    }
+    .summary-item.ok {
+      border-color: rgba(16,185,129,.45);
+    }
+    .summary-item .tag {
+      font-size: .7rem;
+      padding: .2rem .5rem;
+      border-radius: 999px;
+      background: rgba(15,118,110,.2);
+      border: 1px solid rgba(45,212,191,.45);
+      color: #ccfbf1;
+      letter-spacing: .3px;
+    }
+    .summary-item ul {
+      margin: .1rem 0 0;
+      padding-left: 1.2rem;
+      color: var(--muted);
+      font-size: .9rem;
+      line-height: 1.4;
+    }
+    .summary-footer {
+      margin-top: .5rem;
+      color: var(--muted);
+      font-size: .85rem;
+      line-height: 1.4;
+    }
+    .wizard-footer {
+      margin: 40px 0 60px;
+      text-align: center;
+      color: rgba(226,232,240,.7);
+      font-size: .85rem;
+    }
+    @media (max-width: 720px) {
+      .wizard-card { padding: 24px 18px; }
+      .wizard-steps li { min-width: 140px; font-size: .82rem; }
+      .wizard-actions { justify-content: stretch; }
+      .wizard-actions .btn { flex: 1 1 auto; text-align: center; }
+      .wizard-header-inner { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+  <header class="wizard-header">
+    <div class="container wizard-header-inner">
+      <div>
+        <p class="wizard-title">Alarm Pro – Provisioning iniziale</p>
+        <p class="wizard-subtitle">Completa i passaggi per mettere online la centrale.</p>
+      </div>
+    </div>
+  </header>
+  </header>
+
+  <main class="container wizard-container">
+    <div class="card wizard-card">
+      <div class="wizard-head">
+        <h1>Configurazione guidata</h1>
+        <p>La procedura richiede pochi minuti: prepara i parametri di rete locale, le credenziali MQTT del broker e l'url della dashboard.</p>
+      </div>
+
+      <ol class="wizard-steps" id="wizardSteps">
+        <li data-step-label="general" class="active"><span class="step-index">1</span><span class="step-label">Generale</span></li>
+        <li data-step-label="network"><span class="step-index">2</span><span class="step-label">Rete</span></li>
+        <li data-step-label="mqtt"><span class="step-index">3</span><span class="step-label">MQTT</span></li>
+        <li data-step-label="cloudflare"><span class="step-index">4</span><span class="step-label">Cloudflare</span></li>
+        <li data-step-label="summary"><span class="step-index">5</span><span class="step-label">Riepilogo</span></li>
+      </ol>
+
+      <div id="wizardMessage" class="wizard-message hidden" role="alert"></div>
+
+      <section class="wizard-step active" data-step="general" aria-labelledby="step-general">
+        <form id="generalForm" class="wizard-form" autocomplete="off">
+          <div class="field">
+            <label for="general_name">Nome Centrale</label>
+            <input id="general_name" name="central_name" type="text" placeholder="Centrale principale" required />
+          </div>
+          <p class="summary-footer">Il nome viene mostrato nelle interfacce utente e identifica in modo univoco la centrale.</p>
+          <div class="wizard-actions">
+            <button id="generalNext" type="submit" class="btn primary">Salva e continua</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="wizard-step" data-step="network" aria-labelledby="step-network">
+        <form id="networkForm" class="wizard-form" autocomplete="off">
+          <p class="summary-footer" style="margin:0">
+            Configura la connessione della centrale alla rete locale. Se necessario disattiva il DHCP e inserisci
+            manualmente i parametri statici. Il nome della centrale è gestito dalla sezione Generale.
+          </p>
+          <div class="field">
+            <label class="checkbox" for="net_dhcp">
+              <input id="net_dhcp" name="dhcp" type="checkbox" checked />
+              Usa DHCP (consigliato sulle reti aziendali)
+            </label>
+          </div>
+          <div id="netStaticFields" class="hidden">
+            <div class="field">
+              <label for="net_ip">Indirizzo IP</label>
+              <input id="net_ip" name="ip" type="text" />
+            </div>
+            <div class="field">
+              <label for="net_mask">Subnet mask</label>
+              <input id="net_mask" name="mask" type="text" />
+            </div>
+            <div class="field">
+              <label for="net_gw">Gateway</label>
+              <input id="net_gw" name="gw" type="text" />
+            </div>
+            <div class="field">
+              <label for="net_dns">DNS (opzionale)</label>
+              <input id="net_dns" name="dns" type="text" data-optional="true" />
+            </div>
+          </div>
+          <p class="summary-footer">I parametri sono salvati subito nella NVS di sistema.</p>
+          <div class="wizard-actions">
+            <button id="networkNext" type="submit" class="btn primary">Salva e continua</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="wizard-step" data-step="mqtt" aria-labelledby="step-mqtt">
+        <form id="mqttForm" class="wizard-form" autocomplete="off">
+          <div class="field">
+            <label for="mqtt_uri">URI broker MQTT</label>
+            <input id="mqtt_uri" name="uri" type="text" required />
+          </div>
+          <div class="field">
+            <label for="mqtt_device_id">Device ID</label>
+            <input id="mqtt_device_id" type="text" readonly />
+          </div>
+          <div class="field">
+            <label for="mqtt_cid">Client ID</label>
+            <input id="mqtt_cid" name="cid" type="text" readonly/>
+          </div>
+          <div class="field">
+            <label for="mqtt_user">Username</label>
+            <input id="mqtt_user" name="user" type="text" readonly/>
+          </div>
+          <div class="field">
+            <label for="mqtt_pass">Password</label>
+            <input id="mqtt_pass" name="pass" type="password" autocomplete="new-password" />
+          </div>
+          <div class="field">
+            <label for="mqtt_keep">Keep alive (secondi)</label>
+            <input id="mqtt_keep" name="keepalive" type="number" min="10" max="600" step="5" />
+          </div>
+          <p class="summary-footer">Assicurati che il broker accetti connessioni dalla rete della centrale.</p>
+          <div class="wizard-actions">
+            <button type="button" class="btn outline" data-prev="network">Indietro</button>
+            <button id="mqttTestBtn" type="button" class="btn">Test connessione</button>
+            <button id="mqttNext" type="submit" class="btn primary" disabled>Salva e continua</button>
+          </div>
+          <div id="mqttTestStatus" class="wizard-message hidden" role="status" aria-live="polite"></div>
+        </form>
+      </section>
+
+      <section class="wizard-step" data-step="cloudflare" aria-labelledby="step-cloudflare">
+        <form id="cloudflareForm" class="wizard-form" autocomplete="off">
+          <div class="field">
+            <label for="cf_ui">URL UI Dashboard da usare per il redirect finale</label>
+            <input id="cf_ui" name="ui_url" type="url" required />
+          </div>
+          <p class="summary-footer">Non modificare l'url se non espressamente indicato nel manuale utente.</p>
+          <div class="wizard-actions">
+            <button type="button" class="btn outline" data-prev="mqtt">Indietro</button>
+            <button id="cloudflareNext" type="submit" class="btn primary">Salva e continua</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="wizard-step" data-step="summary" aria-labelledby="step-summary">
+        <div>
+          <p class="summary-footer">Controlla le configurazioni salvate. Al termine il dispositivo si reindirizzerà automaticamente alla UI Dashboard.</p>
+        </div>
+        <div id="summaryStatus" class="summary-grid"></div>
+        <div class="wizard-actions">
+          <button type="button" class="btn outline" data-prev="cloudflare">Indietro</button>
+          <button id="finishBtn" type="button" class="btn primary">Completa provisioning</button>
+          <a id="cloudflareLink" class="btn outline hidden" href="#" target="_blank" rel="noopener">Apri Cloudflare UI</a>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="wizard-footer">
+    <p>Se devi ripetere l’installazione esegui il comando di hard reset dedicato: il flag di provisioning verrà azzerato e il wizard tornerà disponibile.</p>
+  </footer>
+
+  <script src="/js/script.js" defer></script>
+</body>
+</html>

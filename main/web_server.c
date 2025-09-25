@@ -5,6 +5,8 @@
 // - Sessioni in RAM (token→username) con TTL assoluto 7g e inattività 30m (sliding)
 // - Login con password (+ TOTP opzionale se abilitato per l’utente)
 
+#include "sdkconfig.h"
+
 #include "esp_timer.h"
 #include "esp_check.h"
 #include "esp_random.h"
@@ -18,6 +20,8 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -38,6 +42,7 @@
 
 #include "alarm_core.h"
 #include "auth.h"
+#include "device_identity.h"
 #include "spiffs_utils.h"
 #include "totp.h"
 #include "audit_log.h"
@@ -47,6 +52,9 @@
 #include "outputs.h"
 #include "utils.h"
 #include "scenes.h"
+#include "roster.h"
+#include "pdo.h"
+#include "mqtt_client.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -60,12 +68,14 @@
 #include <inttypes.h>
 #include <time.h>
 #include <ctype.h>
-
+#include <errno.h>
 
 extern const unsigned char certs_server_cert_pem_start[] asm("_binary_server_cert_pem_start");
 extern const unsigned char certs_server_cert_pem_end[]   asm("_binary_server_cert_pem_end");
 extern const unsigned char certs_server_key_pem_start[]  asm("_binary_server_key_pem_start");
 extern const unsigned char certs_server_key_pem_end[]    asm("_binary_server_key_pem_end");
+
+extern esp_err_t can_master_request_scan(bool *started);
 
 static void web_server_restart_async(void);
 
@@ -158,30 +168,106 @@ static bool s_restart_pending = false;
 static bool s_provisioned = false;
 static char s_cloudflare_ui_url[128] = DEFAULT_CF_UI_URL;
 
+typedef struct ws_client {
+    int fd;
+    struct ws_client *next;
+} ws_client_t;
+
+static ws_client_t *s_ws_clients = NULL;
+static SemaphoreHandle_t s_ws_lock = NULL;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Server handle & SPIFFS
 // ─────────────────────────────────────────────────────────────────────────────
-static httpd_handle_t s_server = NULL;
+//static httpd_handle_t s_server = NULL;
+static httpd_handle_t s_https_server = NULL;
+static httpd_handle_t s_http_redirect_server = NULL;
 static bool s_spiffs_mounted __attribute__((unused)) = false;
 
-static esp_err_t json_reply(httpd_req_t* req, const char* json){
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_sendstr(req, json);
+static void set_https_security_headers(httpd_req_t* req){
+    if (!req) return;
+    auth_set_security_headers(req);
 }
 
-static esp_err_t json_reply_cjson(httpd_req_t* req, cJSON* json){
-    if (!json) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
-    char* payload = cJSON_PrintUnformatted(json);
-    cJSON_Delete(json);
-    if (!payload) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
-    esp_err_t err = json_reply(req, payload);
-    free(payload);
-    return err;
+static void build_https_location(httpd_req_t* req, const char* target, char* out, size_t outlen){
+    if (!out || !outlen) return;
+    const char* dest = target && target[0] ? target : "/";
+    if (!strncasecmp(dest, "https://", 8)){ strlcpy(out, dest, outlen); return; }
+    if (!strncasecmp(dest, "http://", 7)){
+        snprintf(out, outlen, "https://%s", dest + 7);
+        return;
+    }
+    char host[96] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) == ESP_OK && host[0]){
+        if (dest[0] == '/') snprintf(out, outlen, "https://%s%s", host, dest);
+        else snprintf(out, outlen, "https://%s/%s", host, dest);
+        return;
+    }
+    if (dest[0] == '/') dest++;
+    snprintf(out, outlen, "https://%s", dest);
+}
+
+static esp_err_t send_https_redirect(httpd_req_t* req, const char* target, const char* status){
+    char location[192];
+    build_https_location(req, target, location, sizeof(location));
+    set_https_security_headers(req);
+    httpd_resp_set_status(req, status ? status : "302 Found");
+    httpd_resp_set_hdr(req, "Location", location);
+    return httpd_resp_send(req, NULL, 0);
 }
 
 static bool check_bearer(httpd_req_t* req){
     return auth_check_bearer(req, NULL);
 }
+
+static bool cors_origin_allowed(const char *origin, const char *host)
+{
+    if (!origin || !origin[0]) {
+        return false;
+    }
+    if (strcasecmp(origin, "https://ui.nsalarm.pro") == 0) {
+        return true;
+    }
+    if (host && host[0]) {
+        char buf[192];
+        snprintf(buf, sizeof(buf), "https://%s", host);
+        if (strcasecmp(origin, buf) == 0) {
+            return true;
+        }
+        snprintf(buf, sizeof(buf), "http://%s", host);
+        if (strcasecmp(origin, buf) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cors_apply(httpd_req_t *req)
+{
+    char origin[160];
+    if (httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin)) != ESP_OK) {
+        return false;
+    }
+    char host[128] = {0};
+    httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host));
+    if (!cors_origin_allowed(origin, host)) {
+        return false;
+    }
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", origin);
+    httpd_resp_set_hdr(req, "Vary", "Origin");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type, Authorization");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Credentials", "true");
+    return true;
+}
+
+static esp_err_t cors_handle_options(httpd_req_t *req)
+{
+    cors_apply(req);
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 static bool current_user_from_req(httpd_req_t* req, char* out, size_t cap){
     user_info_t u;
     if(!auth_check_bearer(req, &u)) return false;
@@ -202,6 +288,357 @@ static esp_err_t read_body_to_buf(httpd_req_t* req, char* buf, size_t cap, size_
     if (out_len) *out_len = rd;
     return ESP_OK;
 }
+
+static esp_err_t json_reply(httpd_req_t* req, const char* json){
+    set_https_security_headers(req);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, json);
+}
+
+static esp_err_t json_reply_cjson(httpd_req_t* req, cJSON* json){
+    if (!json) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    char* payload = cJSON_PrintUnformatted(json);
+    cJSON_Delete(json);
+    if (!payload) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    esp_err_t err = json_reply(req, payload);
+    free(payload);
+    return err;
+}
+
+// ----- START CANBUS -----------------------------------
+static SemaphoreHandle_t ws_lock_get(void)
+{
+    if (!s_ws_lock) {
+        s_ws_lock = xSemaphoreCreateMutex();
+    }
+    return s_ws_lock;
+}
+
+static void ws_clients_reset(void)
+{
+    SemaphoreHandle_t lock = ws_lock_get();
+    if (!lock) {
+        return;
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+    ws_client_t *cur = s_ws_clients;
+    while (cur) {
+        ws_client_t *next = cur->next;
+        free(cur);
+        cur = next;
+    }
+    s_ws_clients = NULL;
+    xSemaphoreGive(lock);
+}
+
+static void ws_client_add(int fd)
+{
+    SemaphoreHandle_t lock = ws_lock_get();
+    if (!lock) {
+        return;
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+    for (ws_client_t *it = s_ws_clients; it; it = it->next) {
+        if (it->fd == fd) {
+            xSemaphoreGive(lock);
+            return;
+        }
+    }
+    ws_client_t *item = calloc(1, sizeof(ws_client_t));
+    if (!item) {
+        xSemaphoreGive(lock);
+        return;
+    }
+    item->fd = fd;
+    item->next = s_ws_clients;
+    s_ws_clients = item;
+    xSemaphoreGive(lock);
+}
+
+static void ws_client_remove(int fd)
+{
+    SemaphoreHandle_t lock = ws_lock_get();
+    if (!lock) {
+        return;
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+    ws_client_t **it = &s_ws_clients;
+    while (*it) {
+        if ((*it)->fd == fd) {
+            ws_client_t *old = *it;
+            *it = old->next;
+            free(old);
+            break;
+        }
+        it = &(*it)->next;
+    }
+    xSemaphoreGive(lock);
+}
+
+static esp_err_t ws_broadcast_payload(const char *payload, size_t len)
+{
+    if (!payload || len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_https_server) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    SemaphoreHandle_t lock = ws_lock_get();
+    if (!lock) {
+        return ESP_ERR_NO_MEM;
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+    ws_client_t **it = &s_ws_clients;
+    while (*it) {
+        ws_client_t *client = *it;
+        httpd_ws_frame_t frame = {
+            .type = HTTPD_WS_TYPE_TEXT,
+            .payload = (uint8_t *)payload,
+            .len = len,
+        };
+        esp_err_t err = httpd_ws_send_frame_async(s_https_server, client->fd, &frame);
+        if (err != ESP_OK) {
+            ws_client_t *old = client;
+            *it = client->next;
+            free(old);
+            continue;
+        }
+        it = &client->next;
+    }
+    xSemaphoreGive(lock);
+    return ESP_OK;
+}
+
+esp_err_t web_server_ws_broadcast_event(const char *event, cJSON *fields)
+{
+    if (!event) {
+        if (fields) {
+            cJSON_Delete(fields);
+        }
+        return ESP_ERR_INVALID_ARG;
+    }
+    cJSON *root = fields ? fields : cJSON_CreateObject();
+    if (!root) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (!cJSON_AddStringToObject(root, "event", event)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        return ESP_ERR_NO_MEM;
+    }
+    size_t len = strlen(json);
+    char *payload = malloc(len + 2);
+    if (!payload) {
+        free(json);
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(payload, json, len);
+    payload[len] = '\n';
+    payload[len + 1] = '\0';
+    free(json);
+    esp_err_t err = ws_broadcast_payload(payload, len + 1);
+    free(payload);
+    return err;
+}
+
+static esp_err_t ws_handler(httpd_req_t *req)
+{
+    if (!check_bearer(req)) {
+        httpd_resp_send_err(req, 401, "token");
+        return ESP_FAIL;
+    }
+    if (req->method == HTTP_GET) {
+        int fd = httpd_req_to_sockfd(req);
+        ws_client_add(fd);
+        return ESP_OK;
+    }
+    httpd_ws_frame_t frame = {
+        .type = HTTPD_WS_TYPE_TEXT,
+    };
+    esp_err_t err = httpd_ws_recv_frame(req, &frame, 0);
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (frame.len) {
+        frame.payload = calloc(1, frame.len + 1);
+        if (!frame.payload) {
+            return ESP_ERR_NO_MEM;
+        }
+        err = httpd_ws_recv_frame(req, &frame, frame.len);
+        if (err != ESP_OK) {
+            free(frame.payload);
+            return err;
+        }
+    }
+    int fd = httpd_req_to_sockfd(req);
+    if (frame.type == HTTPD_WS_TYPE_CLOSE) {
+        ws_client_remove(fd);
+    } else if (frame.type == HTTPD_WS_TYPE_PING) {
+        httpd_ws_frame_t pong = {
+            .type = HTTPD_WS_TYPE_PONG,
+            .payload = frame.payload,
+            .len = frame.len,
+        };
+        httpd_ws_send_frame(req, &pong);
+    }
+    if (frame.payload) {
+        free(frame.payload);
+    }
+    return ESP_OK;
+}
+
+static bool parse_can_node_id(const char *uri, uint8_t *out_node)
+{
+    const char *prefix = "/api/can/node/";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(uri, prefix, prefix_len) != 0) {
+        return false;
+    }
+    const char *p = uri + prefix_len;
+    if (!isdigit((unsigned char)*p)) {
+        return false;
+    }
+    char *end = NULL;
+    long node = strtol(p, &end, 10);
+    if (end == p || node < 0 || node > 255) {
+        return false;
+    }
+    if (strcmp(end, "/identify") != 0) {
+        return false;
+    }
+    if (out_node) {
+        *out_node = (uint8_t)node;
+    }
+    return true;
+}
+
+static esp_err_t api_can_nodes_get(httpd_req_t *req)
+{
+    if (!check_bearer(req)) {
+        httpd_resp_send_err(req, 401, "token");
+        return ESP_FAIL;
+    }
+    cors_apply(req);
+    cJSON *array = cJSON_CreateArray();
+    if (!array) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+        return ESP_FAIL;
+    }
+    roster_to_json(array);
+    return json_reply_cjson(req, array);
+}
+
+static esp_err_t api_can_nodes_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+
+static esp_err_t api_can_scan_post(httpd_req_t *req)
+{
+    if (!check_bearer(req)) {
+        httpd_resp_send_err(req, 401, "token");
+        return ESP_FAIL;
+    }
+    cors_apply(req);
+    bool started = false;
+    esp_err_t err = can_master_request_scan(&started);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "scan");
+        return ESP_FAIL;
+    }
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_status(req, "202 Accepted");
+    cJSON_AddBoolToObject(resp, "started", started);
+    return json_reply_cjson(req, resp);
+}
+
+static esp_err_t api_can_scan_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+
+static esp_err_t api_can_node_identify_post(httpd_req_t *req)
+{
+    if (!check_bearer(req)) {
+        httpd_resp_send_err(req, 401, "token");
+        return ESP_FAIL;
+    }
+    uint8_t node_id = 0;
+    if (!parse_can_node_id(req->uri, &node_id) || node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
+        return ESP_FAIL;
+    }
+    if (!roster_node_exists(node_id)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
+        return ESP_FAIL;
+    }
+    cors_apply(req);
+    char body[128];
+    size_t body_len = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &body_len) != ESP_OK) {
+        httpd_resp_send_err(req, 400, "body");
+        return ESP_FAIL;
+    }
+    cJSON *json = cJSON_ParseWithLength(body, body_len);
+    if (!json) {
+        httpd_resp_send_err(req, 400, "json");
+        return ESP_FAIL;
+    }
+    cJSON *jen = cJSON_GetObjectItemCaseSensitive(json, "enable");
+    if (!cJSON_IsBool(jen)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, 400, "enable");
+        return ESP_FAIL;
+    }
+    bool enable = cJSON_IsTrue(jen);
+    cJSON_Delete(json);
+    bool changed = false;
+    esp_err_t err = pdo_send_led_identify_toggle(node_id, enable, &changed);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
+        return ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "pdo");
+        return ESP_FAIL;
+    }
+    bool final_state = false;
+    roster_get_identify(node_id, &final_state);
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+        return ESP_FAIL;
+    }
+    cJSON_AddNumberToObject(resp, "node_id", node_id);
+    cJSON_AddBoolToObject(resp, "identify_active", final_state);
+
+    esp_err_t send_err = json_reply_cjson(req, resp);
+
+    cJSON *evt = cJSON_CreateObject();
+    if (evt) {
+        cJSON_AddNumberToObject(evt, "node_id", node_id);
+        cJSON_AddBoolToObject(evt, "identify_active", final_state);
+        web_server_ws_broadcast_event("identify_state", evt);
+    }
+
+    (void)changed;
+    return send_err;
+}
+
+static esp_err_t api_can_node_identify_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+// ----- END CANBUS -------------------------------------
 
 static void web_tls_state_reset_custom(void){
     s_web_tls_state.custom_available = false;
@@ -703,7 +1140,10 @@ static esp_err_t provisioning_set_flag(bool value){
 }
 
 typedef struct {
-    char hostname[64];
+    char central_name[64];
+} provisioning_general_config_t;
+
+typedef struct {
     bool dhcp;
     char ip[16];
     char gw[16];
@@ -726,14 +1166,44 @@ typedef struct {
     char ui_url[128];
 } provisioning_cloudflare_config_t;
 
+static void provisioning_load_general(provisioning_general_config_t* cfg){
+    if (!cfg) return;
+    memset(cfg, 0, sizeof(*cfg));
+    nvs_handle_t nvs;
+    if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
+        nvs_get_str_def(nvs, "central_name", cfg->central_name, sizeof(cfg->central_name), "");
+        nvs_close(nvs);
+    }
+}
+
+static const char MQTT_PASSWORD_POLICY_ERROR[] = "Password MQTT non valida: usa 12-63 caratteri con lettere maiuscole, minuscole, numeri e simboli. Lascia il campo vuoto se il broker non richiede autenticazione.";
+
+static bool mqtt_password_is_valid(const char* pass){
+    if (!pass) return false;
+    size_t len = strlen(pass);
+    if (len == 0) return true;
+    if (len < 12 || len > 63) return false;
+    bool has_upper = false;
+    bool has_lower = false;
+    bool has_digit = false;
+    bool has_special = false;
+    for (size_t i = 0; i < len; ++i){
+        unsigned char ch = (unsigned char)pass[i];
+        if (ch < 0x20 || ch == 0x7f) return false;
+        if (islower(ch)) has_lower = true;
+        else if (isupper(ch)) has_upper = true;
+        else if (isdigit(ch)) has_digit = true;
+        else has_special = true;
+    }
+    return has_lower && has_upper && has_digit && has_special;
+}
+
 static void provisioning_load_net(provisioning_net_config_t* cfg){
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
-    strlcpy(cfg->hostname, "centrale-esp32", sizeof(cfg->hostname));
     cfg->dhcp = true;
     nvs_handle_t nvs;
     if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
-        nvs_get_str_def(nvs, "host", cfg->hostname, sizeof(cfg->hostname), "centrale-esp32");
         nvs_get_str_def(nvs, "ip",   cfg->ip,   sizeof(cfg->ip),   "");
         nvs_get_str_def(nvs, "gw",   cfg->gw,   sizeof(cfg->gw),   "");
         nvs_get_str_def(nvs, "mask", cfg->mask, sizeof(cfg->mask), "");
@@ -746,16 +1216,19 @@ static void provisioning_load_net(provisioning_net_config_t* cfg){
 static void provisioning_load_mqtt(provisioning_mqtt_config_t* cfg){
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
-    cfg->keepalive = 60;
+    strlcpy(cfg->uri, CONFIG_APP_CLOUD_MQTT_URI, sizeof(cfg->uri));
+    cfg->keepalive = CONFIG_APP_CLOUD_KEEPALIVE;
     nvs_handle_t nvs;
     if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
-        nvs_get_str_def(nvs, "mq_uri",  cfg->uri,  sizeof(cfg->uri),  "");
-        nvs_get_str_def(nvs, "mq_cid",  cfg->cid,  sizeof(cfg->cid),  "");
-        nvs_get_str_def(nvs, "mq_user", cfg->user, sizeof(cfg->user), "");
+        nvs_get_str_def(nvs, "mq_uri",  cfg->uri,  sizeof(cfg->uri),  CONFIG_APP_CLOUD_MQTT_URI);
         nvs_get_str_def(nvs, "mq_pass", cfg->pass, sizeof(cfg->pass), "");
-        cfg->keepalive = nvs_get_u32_def(nvs, "mq_keep", 60);
+        cfg->keepalive = nvs_get_u32_def(nvs, "mq_keep", CONFIG_APP_CLOUD_KEEPALIVE);
         nvs_close(nvs);
     }
+    char device_id[DEVICE_ID_MAX] = {0};
+    make_device_id(device_id);
+    strlcpy(cfg->cid, device_id, sizeof(cfg->cid));
+    strlcpy(cfg->user, device_id, sizeof(cfg->user));
 }
 
 static void provisioning_load_cloudflare(provisioning_cloudflare_config_t* cfg){
@@ -764,9 +1237,6 @@ static void provisioning_load_cloudflare(provisioning_cloudflare_config_t* cfg){
     strlcpy(cfg->ui_url, s_cloudflare_ui_url, sizeof(cfg->ui_url));
     nvs_handle_t nvs;
     if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
-        nvs_get_str_def(nvs, "cf_account", cfg->account_id, sizeof(cfg->account_id), "");
-        nvs_get_str_def(nvs, "cf_tunnel",  cfg->tunnel_id,  sizeof(cfg->tunnel_id),  "");
-        nvs_get_str_def(nvs, "cf_token",   cfg->auth_token, sizeof(cfg->auth_token), "");
         char url_buf[sizeof(cfg->ui_url)];
         nvs_get_str_def(nvs, "cf_ui", url_buf, sizeof(url_buf), s_cloudflare_ui_url);
         provisioning_set_ui_url(url_buf);
@@ -790,7 +1260,6 @@ static esp_err_t sys_net_get(httpd_req_t* req){
     provisioning_net_config_t cfg; provisioning_load_net(&cfg);
     cJSON* root = cJSON_CreateObject();
     if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
-    cJSON_AddStringToObject(root, "hostname", cfg.hostname);
     cJSON_AddBoolToObject(root, "dhcp", cfg.dhcp);
     cJSON_AddStringToObject(root, "ip", cfg.ip);
     cJSON_AddStringToObject(root, "gw", cfg.gw);
@@ -805,14 +1274,12 @@ static esp_err_t sys_net_post(httpd_req_t* req){
     if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
     cJSON* j = cJSON_ParseWithLength(body, bl);
     if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
-    const cJSON* hn = cJSON_GetObjectItemCaseSensitive(j,"hostname");
     const cJSON* jd = cJSON_GetObjectItemCaseSensitive(j,"dhcp");
     const cJSON* jip= cJSON_GetObjectItemCaseSensitive(j,"ip");
     const cJSON* jgw= cJSON_GetObjectItemCaseSensitive(j,"gw");
     const cJSON* jmk= cJSON_GetObjectItemCaseSensitive(j,"mask");
     const cJSON* jdn= cJSON_GetObjectItemCaseSensitive(j,"dns");
     nvs_handle_t nvs; if (nvs_open("sys", NVS_READWRITE, &nvs)!=ESP_OK){ cJSON_Delete(j); return httpd_resp_send_err(req,500,"nvs"), ESP_FAIL; }
-    if (cJSON_IsString(hn)) nvs_set_str(nvs,"host", hn->valuestring);
     if (cJSON_IsBool(jd))   nvs_set_u32(nvs,"dhcp", cJSON_IsTrue(jd)?1:0);
     if (cJSON_IsString(jip))nvs_set_str(nvs,"ip",   jip->valuestring);
     if (cJSON_IsString(jgw))nvs_set_str(nvs,"gw",   jgw->valuestring);
@@ -833,6 +1300,9 @@ static esp_err_t sys_mqtt_get(httpd_req_t* req){
     cJSON_AddStringToObject(root, "user", cfg.user);
     cJSON_AddStringToObject(root, "pass", cfg.pass);
     cJSON_AddNumberToObject(root, "keepalive", cfg.keepalive);
+    cJSON_AddStringToObject(root, "device_id", cfg.cid);
+    cJSON_AddStringToObject(root, "default_uri", CONFIG_APP_CLOUD_MQTT_URI);
+    cJSON_AddNumberToObject(root, "default_keepalive", CONFIG_APP_CLOUD_KEEPALIVE);
     return json_reply_cjson(req, root);
 }
 
@@ -843,18 +1313,227 @@ static esp_err_t sys_mqtt_post(httpd_req_t* req){
     cJSON* j = cJSON_ParseWithLength(body, bl);
     if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
     const cJSON* juri=cJSON_GetObjectItemCaseSensitive(j,"uri");
-    const cJSON* jcid=cJSON_GetObjectItemCaseSensitive(j,"cid");
-    const cJSON* jus =cJSON_GetObjectItemCaseSensitive(j,"user");
     const cJSON* jpw =cJSON_GetObjectItemCaseSensitive(j,"pass");
     const cJSON* jka =cJSON_GetObjectItemCaseSensitive(j,"keepalive");
+    const char* pass = NULL;
+    if (cJSON_IsString(jpw) && jpw->valuestring) pass = jpw->valuestring;
+    if (pass && !mqtt_password_is_valid(pass)){
+        cJSON_Delete(j);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, MQTT_PASSWORD_POLICY_ERROR), ESP_FAIL;
+    }
+    char device_id[DEVICE_ID_MAX] = {0};
+    make_device_id(device_id);
     nvs_handle_t nvs; if (nvs_open("sys", NVS_READWRITE, &nvs)!=ESP_OK){ cJSON_Delete(j); return httpd_resp_send_err(req,500,"nvs"), ESP_FAIL; }
     if (cJSON_IsString(juri)) nvs_set_str(nvs,"mq_uri", juri->valuestring);
-    if (cJSON_IsString(jcid)) nvs_set_str(nvs,"mq_cid", jcid->valuestring);
-    if (cJSON_IsString(jus))  nvs_set_str(nvs,"mq_user",jus->valuestring);
-    if (cJSON_IsString(jpw))  nvs_set_str(nvs,"mq_pass",jpw->valuestring);
-    if (cJSON_IsNumber(jka))  nvs_set_u32(nvs,"mq_keep",(uint32_t)jka->valuedouble);
+    nvs_set_str(nvs,"mq_cid", device_id);
+    nvs_set_str(nvs,"mq_user", device_id);
+    if (pass) nvs_set_str(nvs,"mq_pass",pass);
+    if (cJSON_IsNumber(jka)) nvs_set_u32(nvs,"mq_keep",(uint32_t)jka->valuedouble);
     nvs_commit(nvs); nvs_close(nvs); cJSON_Delete(j);
     return json_reply(req, "{\"ok\":true}");
+}
+
+#define MQTT_TEST_TIMEOUT_MS   5000
+#define MQTT_TEST_BIT_OK       BIT0
+#define MQTT_TEST_BIT_FAIL     BIT1
+
+typedef struct {
+    EventGroupHandle_t events;
+    esp_err_t last_err;
+    int tls_stack_err;
+    int transport_errno;
+} mqtt_test_ctx_t;
+
+static void mqtt_test_event_handler(void* handler_args, esp_event_base_t base, int32_t event_id, void* event_data)
+{
+    (void)base;
+    mqtt_test_ctx_t* ctx = (mqtt_test_ctx_t*)handler_args;
+    if (!ctx) return;
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+    case MQTT_EVENT_CONNECTED:
+        if (ctx->events) xEventGroupSetBits(ctx->events, MQTT_TEST_BIT_OK);
+        break;
+    case MQTT_EVENT_ERROR:
+        if (event && event->error_handle){
+            ctx->last_err = event->error_handle->esp_tls_last_esp_err;
+            ctx->tls_stack_err = event->error_handle->esp_tls_stack_err;
+            ctx->transport_errno = event->error_handle->esp_transport_sock_errno;
+        }
+        if (ctx->events) xEventGroupSetBits(ctx->events, MQTT_TEST_BIT_FAIL);
+        break;
+    case MQTT_EVENT_DISCONNECTED:
+        if (ctx->events) xEventGroupSetBits(ctx->events, MQTT_TEST_BIT_FAIL);
+        break;
+    default:
+        break;
+    }
+}
+
+static void mqtt_test_format_error(char* buf, size_t len, bool timeout, esp_err_t start_err, const mqtt_test_ctx_t* ctx)
+{
+    if (!buf || len == 0) return;
+    if (timeout){
+        strlcpy(buf, "Timeout di connessione.", len);
+        return;
+    }
+    if (start_err != ESP_OK){
+        const char* name = esp_err_to_name(start_err);
+        if (name) strlcpy(buf, name, len);
+        else snprintf(buf, len, "Errore 0x%x", (unsigned)start_err);
+        return;
+    }
+    if (!ctx){
+        strlcpy(buf, "Connessione non riuscita.", len);
+        return;
+    }
+    if (ctx->last_err != ESP_OK && ctx->last_err != 0){
+        const char* name = esp_err_to_name(ctx->last_err);
+        if (name) strlcpy(buf, name, len);
+        else snprintf(buf, len, "Errore 0x%x", (unsigned)ctx->last_err);
+        return;
+    }
+    if (ctx->tls_stack_err){
+        snprintf(buf, len, "TLS err 0x%x", (unsigned)ctx->tls_stack_err);
+        return;
+    }
+    if (ctx->transport_errno){
+        const char* err = strerror(ctx->transport_errno);
+        if (err && *err) snprintf(buf, len, "Errore di rete (%d: %s)", ctx->transport_errno, err);
+        else snprintf(buf, len, "Errore di rete (%d)", ctx->transport_errno);
+        return;
+    }
+    strlcpy(buf, "Connessione rifiutata o credenziali errate.", len);
+}
+
+static esp_err_t sys_mqtt_test_post(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char body[256]; size_t bl = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
+    cJSON* j = cJSON_ParseWithLength(body, bl);
+    if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
+
+    const cJSON* juri  = cJSON_GetObjectItemCaseSensitive(j, "uri");
+    const cJSON* jcid  = cJSON_GetObjectItemCaseSensitive(j, "cid");
+    const cJSON* juser = cJSON_GetObjectItemCaseSensitive(j, "user");
+    const cJSON* jpass = cJSON_GetObjectItemCaseSensitive(j, "pass");
+    const cJSON* jka   = cJSON_GetObjectItemCaseSensitive(j, "keepalive");
+
+    char uri[128] = {0};
+    char cid[80] = {0};
+    char user[80] = {0};
+    char pass[96] = {0};
+
+    if (cJSON_IsString(juri) && juri->valuestring){
+        strlcpy(uri, juri->valuestring, sizeof(uri));
+    }
+    trim_inplace(uri);
+    if (!uri[0]){
+        cJSON_Delete(j);
+        return httpd_resp_send_err(req,400,"uri"), ESP_FAIL;
+    }
+    if (cJSON_IsString(jcid) && jcid->valuestring){
+        strlcpy(cid, jcid->valuestring, sizeof(cid));
+        trim_inplace(cid);
+    }
+    if (cJSON_IsString(juser) && juser->valuestring){
+        strlcpy(user, juser->valuestring, sizeof(user));
+        trim_inplace(user);
+    }
+    if (cJSON_IsString(jpass) && jpass->valuestring){
+        strlcpy(pass, jpass->valuestring, sizeof(pass));
+        trim_inplace(pass);
+    }
+
+    uint32_t keepalive = 60;
+    if (cJSON_IsNumber(jka)){
+        double v = jka->valuedouble;
+        if (v < 10) v = 10;
+        if (v > 600) v = 600;
+        keepalive = (uint32_t)v;
+    } else if (cJSON_IsString(jka) && jka->valuestring){
+        long v = strtol(jka->valuestring, NULL, 10);
+        if (v > 0){
+            if (v < 10) v = 10;
+            if (v > 600) v = 600;
+            keepalive = (uint32_t)v;
+        }
+    }
+
+    cJSON_Delete(j);
+
+    EventGroupHandle_t events = xEventGroupCreate();
+    if (!events){
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "events"), ESP_FAIL;
+    }
+
+    mqtt_test_ctx_t ctx = {
+        .events = events,
+        .last_err = ESP_OK,
+        .tls_stack_err = 0,
+        .transport_errno = 0,
+    };
+
+    esp_mqtt_client_config_t cfg = {
+        .broker.address.uri = uri,
+        .session.keepalive = keepalive,
+    };
+    cfg.network.disable_auto_reconnect = true;
+    cfg.credentials.client_id = cid[0] ? cid : NULL;
+    cfg.credentials.username = user[0] ? user : NULL;
+    cfg.credentials.authentication.password = pass[0] ? pass : NULL;
+
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&cfg);
+    if (!client){
+        vEventGroupDelete(events);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mqtt"), ESP_FAIL;
+    }
+
+    esp_err_t reg_err = esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_test_event_handler, &ctx);
+    if (reg_err != ESP_OK){
+        esp_mqtt_client_destroy(client);
+        vEventGroupDelete(events);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mqtt"), ESP_FAIL;
+    }
+
+    esp_err_t start_err = esp_mqtt_client_start(client);
+    EventBits_t bits = 0;
+    bool timed_out = false;
+    if (start_err == ESP_OK){
+        bits = xEventGroupWaitBits(events, MQTT_TEST_BIT_OK | MQTT_TEST_BIT_FAIL, pdTRUE, pdFALSE,
+                                   pdMS_TO_TICKS(MQTT_TEST_TIMEOUT_MS));
+        if (bits == 0) timed_out = true;
+    }
+
+    ctx.events = NULL;
+    if (start_err == ESP_OK){
+        esp_mqtt_client_stop(client);
+    }
+    esp_mqtt_client_destroy(client);
+    vEventGroupDelete(events);
+
+    if (start_err != ESP_OK){
+        char msg[128];
+        mqtt_test_format_error(msg, sizeof(msg), false, start_err, &ctx);
+        cJSON* root = cJSON_CreateObject();
+        if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+        cJSON_AddBoolToObject(root, "success", false);
+        cJSON_AddStringToObject(root, "error", msg);
+        return json_reply_cjson(req, root);
+    }
+
+    if (bits & MQTT_TEST_BIT_OK){
+        return json_reply(req, "{\"success\":true}");
+    }
+
+    char msg[128];
+    mqtt_test_format_error(msg, sizeof(msg), timed_out, ESP_OK, &ctx);
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    cJSON_AddBoolToObject(root, "success", false);
+    cJSON_AddStringToObject(root, "error", msg);
+    return json_reply_cjson(req, root);
 }
 
 static esp_err_t sys_cloudflare_get(httpd_req_t* req){
@@ -862,9 +1541,6 @@ static esp_err_t sys_cloudflare_get(httpd_req_t* req){
     provisioning_cloudflare_config_t cfg; provisioning_load_cloudflare(&cfg);
     cJSON* root = cJSON_CreateObject();
     if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
-    cJSON_AddStringToObject(root, "account_id", cfg.account_id);
-    cJSON_AddStringToObject(root, "tunnel_id", cfg.tunnel_id);
-    cJSON_AddStringToObject(root, "auth_token", cfg.auth_token);
     cJSON_AddStringToObject(root, "ui_url", cfg.ui_url);
     return json_reply_cjson(req, root);
 }
@@ -875,9 +1551,6 @@ static esp_err_t sys_cloudflare_post(httpd_req_t* req){
     if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
     cJSON* j = cJSON_ParseWithLength(body, bl);
     if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
-    const cJSON* jacc = cJSON_GetObjectItemCaseSensitive(j, "account_id");
-    const cJSON* jtun = cJSON_GetObjectItemCaseSensitive(j, "tunnel_id");
-    const cJSON* jtok = cJSON_GetObjectItemCaseSensitive(j, "auth_token");
     const cJSON* jurl = cJSON_GetObjectItemCaseSensitive(j, "ui_url");
 
     nvs_handle_t nvs;
@@ -886,9 +1559,6 @@ static esp_err_t sys_cloudflare_post(httpd_req_t* req){
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs"), ESP_FAIL;
     }
 
-    if (cJSON_IsString(jacc) && jacc->valuestring) nvs_set_str(nvs, "cf_account", jacc->valuestring);
-    if (cJSON_IsString(jtun) && jtun->valuestring) nvs_set_str(nvs, "cf_tunnel", jtun->valuestring);
-    if (cJSON_IsString(jtok) && jtok->valuestring) nvs_set_str(nvs, "cf_token", jtok->valuestring);
     char url_buf[sizeof(s_cloudflare_ui_url)];
     bool url_updated = false;
     if (cJSON_IsString(jurl) && jurl->valuestring){
@@ -910,7 +1580,8 @@ static esp_err_t sys_cloudflare_post(httpd_req_t* req){
 }
 
 static esp_err_t provision_status_get(httpd_req_t* req){
-    provisioning_net_config_t net; provisioning_mqtt_config_t mqtt; provisioning_cloudflare_config_t cf;
+    provisioning_general_config_t general; provisioning_net_config_t net; provisioning_mqtt_config_t mqtt; provisioning_cloudflare_config_t cf;
+    provisioning_load_general(&general);
     provisioning_load_net(&net);
     provisioning_load_mqtt(&mqtt);
     provisioning_load_cloudflare(&cf);
@@ -918,10 +1589,14 @@ static esp_err_t provision_status_get(httpd_req_t* req){
     cJSON* root = cJSON_CreateObject();
     if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
     cJSON_AddBoolToObject(root, "provisioned", s_provisioned);
+    cJSON* jgeneral = cJSON_AddObjectToObject(root, "general");
+    if (jgeneral){
+        cJSON_AddStringToObject(jgeneral, "central_name", general.central_name);
+    }
+    cJSON_AddStringToObject(root, "device_id", mqtt.cid);
 
     cJSON* jnet = cJSON_AddObjectToObject(root, "network");
     if (jnet){
-        cJSON_AddStringToObject(jnet, "hostname", net.hostname);
         cJSON_AddBoolToObject(jnet, "dhcp", net.dhcp);
         cJSON_AddStringToObject(jnet, "ip", net.ip);
         cJSON_AddStringToObject(jnet, "gw", net.gw);
@@ -936,27 +1611,61 @@ static esp_err_t provision_status_get(httpd_req_t* req){
         cJSON_AddStringToObject(jmq, "user", mqtt.user);
         cJSON_AddStringToObject(jmq, "pass", mqtt.pass);
         cJSON_AddNumberToObject(jmq, "keepalive", mqtt.keepalive);
+        cJSON_AddStringToObject(jmq, "device_id", mqtt.cid);
+        cJSON_AddStringToObject(jmq, "default_uri", CONFIG_APP_CLOUD_MQTT_URI);
+        cJSON_AddNumberToObject(jmq, "default_keepalive", CONFIG_APP_CLOUD_KEEPALIVE);
     }
 
     cJSON* jcf = cJSON_AddObjectToObject(root, "cloudflare");
     if (jcf){
-        cJSON_AddStringToObject(jcf, "account_id", cf.account_id);
-        cJSON_AddStringToObject(jcf, "tunnel_id", cf.tunnel_id);
-        cJSON_AddStringToObject(jcf, "auth_token", cf.auth_token);
         cJSON_AddStringToObject(jcf, "ui_url", cf.ui_url);
     }
 
     return json_reply_cjson(req, root);
 }
 
+static esp_err_t provision_general_post(httpd_req_t* req){
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char body[160]; size_t bl = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body"), ESP_FAIL;
+    cJSON* root = cJSON_ParseWithLength(body, bl);
+    if (!root) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json"), ESP_FAIL;
+    const cJSON* jname = cJSON_GetObjectItemCaseSensitive(root, "central_name");
+    char name_buf[sizeof(((provisioning_general_config_t*)0)->central_name)];
+    memset(name_buf, 0, sizeof(name_buf));
+    if (cJSON_IsString(jname) && jname->valuestring){
+        strlcpy(name_buf, jname->valuestring, sizeof(name_buf));
+        trim_inplace(name_buf);
+    }
+    if (!name_buf[0]){
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "name"), ESP_FAIL;
+    }
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("sys", NVS_READWRITE, &nvs);
+    if (err != ESP_OK){
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs"), ESP_FAIL;
+    }
+
+    err = nvs_set_str(nvs, "central_name", name_buf);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    cJSON_Delete(root);
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "commit"), ESP_FAIL;
+    return json_reply(req, "{\"ok\":true}");
+}
+
 static esp_err_t provision_finish_post(httpd_req_t* req){
     esp_err_t err = provisioning_set_flag(true);
     if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs"), ESP_FAIL;
-    cJSON* root = cJSON_CreateObject();
-    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
-    cJSON_AddBoolToObject(root, "ok", true);
-    cJSON_AddStringToObject(root, "redirect", s_cloudflare_ui_url);
-    return json_reply_cjson(req, root);
+    // cJSON* root = cJSON_CreateObject();
+    // if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    // cJSON_AddBoolToObject(root, "ok", true);
+    // cJSON_AddStringToObject(root, "redirect", s_cloudflare_ui_url);
+    // return json_reply_cjson(req, root);
+    return send_https_redirect(req, "/login.html", "302 Found");
 }
 
 static bool req_has_hard_reset_header(httpd_req_t* req){
@@ -976,6 +1685,62 @@ static esp_err_t provision_reset_post(httpd_req_t* req){
     esp_err_t err = provisioning_set_flag(false);
     if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs"), ESP_FAIL;
     return json_reply(req, "{\"ok\":true,\"provisioned\":false}");
+}
+
+static esp_err_t erase_namespace(const char* ns){
+    if (!ns || !ns[0]) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t h = 0;
+    esp_err_t err = nvs_open(ns, NVS_READWRITE, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_erase_all(h);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+esp_err_t provisioning_reset_all(void){
+    static const char* TAG_RST = "prov_reset";
+    const char* namespaces[] = {"sys", "app", "zones", "scenes", "usrdb", WEB_TLS_NS};
+    esp_err_t first_err = ESP_OK;
+
+    for (size_t i = 0; i < (sizeof(namespaces) / sizeof(namespaces[0])); ++i) {
+        const char* ns = namespaces[i];
+        esp_err_t err = erase_namespace(ns);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG_RST, "Impossibile cancellare namespace '%s': %s", ns, esp_err_to_name(err));
+            if (first_err == ESP_OK) first_err = err;
+        } else {
+            ESP_LOGW(TAG_RST, "Namespace NVS '%s' cancellato", ns);
+        }
+    }
+
+    esp_err_t err = provisioning_set_flag(false);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_RST, "provisioning_set_flag(false) fallita: %s", esp_err_to_name(err));
+        if (first_err == ESP_OK) first_err = err;
+    } else {
+        ESP_LOGI(TAG_RST, "Flag di provisioning azzerato");
+    }
+
+    provisioning_load_state();
+
+    esp_err_t final_err = (first_err != ESP_OK) ? first_err : err;
+    if (final_err == ESP_OK) {
+        log_add("Reset hardware completato");
+        audit_append("hw_reset", "system", 0, "Factory reset da pulsanti HW");
+    } else {
+        log_add("Reset hardware fallito: %s", esp_err_to_name(final_err));
+        audit_append("hw_reset", "system", -1, "Factory reset incompleto");
+    }
+
+    return final_err;
 }
 
 static esp_err_t sys_websec_get(httpd_req_t* req){
@@ -1755,9 +2520,11 @@ static esp_err_t send_file(httpd_req_t* req, const char* fname){
         else if (!strcmp(ext,".css")) ct = "text/css";
         else if (!strcmp(ext,".js")) ct = "application/javascript";
         else if (!strcmp(ext,".svg")) ct = "image/svg+xml";
+        else if (!strcmp(ext,".ico")) ct = "image/x-icon";
     }
     httpd_resp_set_type(req, ct);
-    auth_set_security_headers(req);
+    // auth_set_security_headers(req);
+    set_https_security_headers(req);
     char buf[1024];
     size_t r;
     while((r=fread(buf,1,sizeof(buf),f))>0){
@@ -1768,38 +2535,118 @@ static esp_err_t send_file(httpd_req_t* req, const char* fname){
     return ESP_OK;
 }
 
+static esp_err_t redirect_http_handler(httpd_req_t* req){
+    const char* uri = "/";
+    if (req->uri[0] != '\0'){
+        uri = req->uri;
+    }
+    char path[192];
+    strlcpy(path, uri, sizeof(path));
+    size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen > 0){
+        char* query = malloc(qlen + 1);
+        if (query){
+            if (httpd_req_get_url_query_str(req, query, qlen + 1) == ESP_OK){
+                if (strlen(path) + 1 < sizeof(path)){
+                    strlcat(path, "?", sizeof(path));
+                    strlcat(path, query, sizeof(path));
+                }
+            }
+            free(query);
+        }
+    }
+    char location[192];
+    build_https_location(req, path, location, sizeof(location));
+    httpd_resp_set_status(req, "301 Moved Permanently");
+    httpd_resp_set_hdr(req, "Location", location);
+    httpd_resp_set_hdr(req, "Connection", "close");
+    return httpd_resp_send(req, NULL, 0);
+}
+
+static esp_err_t start_http_redirect_server(void){
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.server_port = 80;
+    cfg.uri_match_fn = httpd_uri_match_wildcard;
+    cfg.lru_purge_enable = true;
+    httpd_handle_t srv = NULL;
+    esp_err_t err = httpd_start(&srv, &cfg);
+    if (err != ESP_OK){
+        ESP_LOGE(TAG, "Start HTTP redirect server failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    s_http_redirect_server = srv;
+    static httpd_uri_t redirect_get    = {.uri="/*", .method=HTTP_GET,    .handler=redirect_http_handler, .user_ctx=NULL};
+    static httpd_uri_t redirect_post   = {.uri="/*", .method=HTTP_POST,   .handler=redirect_http_handler, .user_ctx=NULL};
+    static httpd_uri_t redirect_put    = {.uri="/*", .method=HTTP_PUT,    .handler=redirect_http_handler, .user_ctx=NULL};
+    static httpd_uri_t redirect_delete = {.uri="/*", .method=HTTP_DELETE, .handler=redirect_http_handler, .user_ctx=NULL};
+#ifdef HTTP_HEAD
+    static httpd_uri_t redirect_head   = {.uri="/*", .method=HTTP_HEAD,   .handler=redirect_http_handler, .user_ctx=NULL};
+#endif
+#ifdef HTTP_OPTIONS
+    static httpd_uri_t redirect_options = {.uri="/*", .method=HTTP_OPTIONS, .handler=redirect_http_handler, .user_ctx=NULL};
+#endif
+    httpd_register_uri_handler(srv, &redirect_get);
+    httpd_register_uri_handler(srv, &redirect_post);
+    httpd_register_uri_handler(srv, &redirect_put);
+    httpd_register_uri_handler(srv, &redirect_delete);
+#ifdef HTTP_HEAD
+    httpd_register_uri_handler(srv, &redirect_head);
+#endif
+#ifdef HTTP_OPTIONS
+    httpd_register_uri_handler(srv, &redirect_options);
+#endif
+    ESP_LOGI(TAG, "Server HTTP redirect attivo sulla porta %d", cfg.server_port);
+    return ESP_OK;
+}
+
 static esp_err_t root_get(httpd_req_t* req){
     if (!s_provisioned){
-        auth_set_security_headers(req);
-        return send_file(req, "index.html");
+        // auth_set_security_headers(req);
+        // return send_file(req, "index.html");
+        return send_file(req, "wizard.html");
     }
-    auth_set_security_headers(req);
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", s_cloudflare_ui_url);
-    return httpd_resp_send(req, NULL, 0);
+    // auth_set_security_headers(req);
+    // httpd_resp_set_status(req, "302 Found");
+    // httpd_resp_set_hdr(req, "Location", s_cloudflare_ui_url);
+    // return httpd_resp_send(req, NULL, 0);
+    user_info_t user;
+    if (!auth_check_cookie(req, &user)){
+        return send_file(req, "login.html");
+    }
+    return send_file(req, "index.html");
 }
 
 static esp_err_t login_html_get(httpd_req_t* req){
     // If already logged, go to index
     user_info_t u;
     if (auth_check_cookie(req,&u)){
-        httpd_resp_set_status(req,"302 Found");
-        httpd_resp_set_hdr(req,"Location","/");
-        auth_set_security_headers(req);
-        return httpd_resp_send(req,NULL,0);
+        // httpd_resp_set_status(req,"302 Found");
+        // httpd_resp_set_hdr(req,"Location","/");
+        // auth_set_security_headers(req);
+        // return httpd_resp_send(req,NULL,0);
+        return send_https_redirect(req, "/", "302 Found");
     }
     return send_file(req,"login.html");
 }
 
 static esp_err_t index_html_get(httpd_req_t* req){
     if (!s_provisioned){
-        auth_set_security_headers(req);
-        return send_file(req, "index.html");
+        // auth_set_security_headers(req);
+        // return send_file(req, "index.html");
+        return send_file(req, "wizard.html");
     }
-    auth_set_security_headers(req);
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", s_cloudflare_ui_url);
-    return httpd_resp_send(req, NULL, 0);
+    // auth_set_security_headers(req);
+    // httpd_resp_set_status(req, "302 Found");
+    // httpd_resp_set_hdr(req, "Location", s_cloudflare_ui_url);
+    // return httpd_resp_send(req, NULL, 0);
+    user_info_t u;
+    if (!auth_check_cookie(req,&u)){
+        return send_https_redirect(req, "/login.html", "302 Found");
+    }
+    return send_file(req, "index.html");
+}
+static esp_err_t wizard_html_get(httpd_req_t* req){
+    return send_file(req, "wizard.html");
 }
 static esp_err_t admin_html_get(httpd_req_t* req){
     if (!auth_gate_html(req, ROLE_ADMIN)) return ESP_OK;
@@ -1819,8 +2666,11 @@ static esp_err_t js_get(httpd_req_t* req){
     if (strstr(uri,"qrcode.min.js")) return send_file(req,"js/qrcode.min.js");
     if (strstr(uri,"bootstrap.bundle.min.js")) return send_file(req,"js/bootstrap.bundle.min.js");
     if (strstr(uri,"bootstrap.bundle.min.js.map")) return send_file(req,"js/bootstrap.bundle.min.js.map");
-    if (strstr(uri,"login.js")) return send_file(req,"js/login.js");
-    if (strstr(uri,"app.js"))   return send_file(req,"js/app.js");
+    // if (strstr(uri,"login.js")) return send_file(req,"js/login.js");
+    // if (strstr(uri,"app.js"))   return send_file(req,"js/app.js");
+    if (strstr(uri,"/js/api.js")) return send_file(req,"js/api.js");
+    if (strstr(uri,"/js/login.js")) return send_file(req,"js/login.js");
+    if (strstr(uri,"/js/app.js"))   return send_file(req,"js/app.js");
     return httpd_resp_send_err(req,HTTPD_404_NOT_FOUND,"nope");
 }
 static esp_err_t css_get(httpd_req_t* req){
@@ -1867,7 +2717,7 @@ static esp_err_t users_admin_list_get(httpd_req_t* req);
 static esp_err_t start_web(void){
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 12288;
-    cfg.max_uri_handlers = 50;
+    cfg.max_uri_handlers = 60;
     cfg.lru_purge_enable = true;
     cfg.server_port = 443;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
@@ -1877,17 +2727,27 @@ static esp_err_t start_web(void){
     if (err != ESP_OK){
         return err;
     }
-    s_server = srv;
+    // s_server = srv;
+    s_https_server = srv;
+
+    esp_err_t redir_err = start_http_redirect_server();
+    if (redir_err != ESP_OK){
+        ESP_LOGW(TAG, "HTTP redirect server non disponibile: %s", esp_err_to_name(redir_err));
+    }
+    ws_clients_reset();
 
     // static files
     httpd_uri_t ui_root      = {.uri="/",                 .method=HTTP_GET,  .handler=root_get,           .user_ctx=NULL};
     httpd_uri_t ui_login_h   = {.uri="/login.html",       .method=HTTP_GET,  .handler=login_html_get,     .user_ctx=NULL};
     httpd_uri_t ui_index_h   = {.uri="/index.html",       .method=HTTP_GET,  .handler=index_html_get,     .user_ctx=NULL};
+    httpd_uri_t ui_wizard_h  = {.uri="/wizard.html",      .method=HTTP_GET,  .handler=wizard_html_get,    .user_ctx=NULL};
     httpd_uri_t ui_admin_h   = {.uri="/admin.html",       .method=HTTP_GET,  .handler=admin_html_get,     .user_ctx=NULL};
     httpd_uri_t ui_403_h     = {.uri="/403.html",         .method=HTTP_GET,  .handler=four03_html_get,    .user_ctx=NULL};
 
     httpd_uri_t ui_app_js    = {.uri="/js/app.js",        .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
+    httpd_uri_t ui_api_js    = {.uri="/js/api.js",        .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
     httpd_uri_t ui_admin_js  = {.uri="/js/admin.js",      .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
+    httpd_uri_t ui_script_js = {.uri="/js/script.js",     .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
     httpd_uri_t ui_login_js  = {.uri="/js/login.js",      .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
     httpd_uri_t ui_qrcode_js = {.uri="/js/qrcode.min.js", .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
     httpd_uri_t ui_bs_js     = {.uri="/js/bootstrap.bundle.min.js",     .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
@@ -1904,19 +2764,23 @@ static esp_err_t start_web(void){
     httpd_uri_t api_prov_status = {.uri="/api/provision/status", .method=HTTP_GET,  .handler=provision_status_get, .user_ctx=NULL};
     httpd_uri_t api_prov_finish = {.uri="/api/provision/finish", .method=HTTP_POST, .handler=provision_finish_post, .user_ctx=NULL};
     httpd_uri_t api_prov_reset  = {.uri="/api/provision/reset",  .method=HTTP_POST, .handler=provision_reset_post,  .user_ctx=NULL};
+    httpd_uri_t api_prov_general = {.uri="/api/provision/general", .method=HTTP_POST, .handler=provision_general_post, .user_ctx=NULL};
 
     httpd_register_uri_handler(srv,&ui_root);
     httpd_register_uri_handler(srv,&ui_login_h);
     httpd_register_uri_handler(srv,&ui_index_h);
+    httpd_register_uri_handler(srv,&ui_wizard_h);
     httpd_register_uri_handler(srv,&ui_admin_h);
     httpd_register_uri_handler(srv,&ui_403_h);
 
     httpd_register_uri_handler(srv,&ui_app_js);
     httpd_register_uri_handler(srv,&ui_admin_js);
+    httpd_register_uri_handler(srv,&ui_script_js);
     httpd_register_uri_handler(srv,&ui_qrcode_js);
     httpd_register_uri_handler(srv,&ui_bs_js);
     httpd_register_uri_handler(srv,&ui_bs_js_map);
     httpd_register_uri_handler(srv,&ui_login_js);
+    httpd_register_uri_handler(srv,&ui_api_js);
     httpd_register_uri_handler(srv,&ui_css);
     httpd_register_uri_handler(srv,&ui_bs_css);
     httpd_register_uri_handler(srv,&ui_bs_css_map);
@@ -1929,8 +2793,16 @@ static esp_err_t start_web(void){
     httpd_register_uri_handler(srv,&api_prov_status);
     httpd_register_uri_handler(srv,&api_prov_finish);
     httpd_register_uri_handler(srv,&api_prov_reset);
+    httpd_register_uri_handler(srv,&api_prov_general);
 
     // API protette
+    httpd_uri_t api_can_nodes_g  = {.uri="/api/can/nodes",           .method=HTTP_GET,     .handler=api_can_nodes_get,          .user_ctx=NULL};
+    httpd_uri_t api_can_nodes_o  = {.uri="/api/can/nodes",           .method=HTTP_OPTIONS, .handler=api_can_nodes_options,      .user_ctx=NULL};
+    httpd_uri_t api_can_scan_p   = {.uri="/api/can/scan",            .method=HTTP_POST,    .handler=api_can_scan_post,          .user_ctx=NULL};
+    httpd_uri_t api_can_scan_o   = {.uri="/api/can/scan",            .method=HTTP_OPTIONS, .handler=api_can_scan_options,       .user_ctx=NULL};
+    httpd_uri_t api_can_ident_p  = {.uri="/api/can/node/*/identify", .method=HTTP_POST,    .handler=api_can_node_identify_post, .user_ctx=NULL};
+    httpd_uri_t api_can_ident_o  = {.uri="/api/can/node/*/identify", .method=HTTP_OPTIONS, .handler=api_can_node_identify_options,.user_ctx=NULL};
+
     httpd_uri_t api_status     = {.uri="/api/status",             .method=HTTP_GET,  .handler=status_get,           .user_ctx=NULL };
     httpd_uri_t api_zones      = {.uri="/api/zones",              .method=HTTP_GET,  .handler=zones_get,            .user_ctx=NULL };
     httpd_uri_t api_zone_cfg_g = {.uri="/api/zones/config",       .method=HTTP_GET,  .handler=zones_config_get,     .user_ctx=NULL};
@@ -1956,12 +2828,15 @@ static esp_err_t start_web(void){
     httpd_uri_t api_sys_net_p  = {.uri="/api/sys/net",  .method=HTTP_POST, .handler=sys_net_post, .user_ctx=NULL};
     httpd_uri_t api_sys_mqtt_g = {.uri="/api/sys/mqtt", .method=HTTP_GET,  .handler=sys_mqtt_get, .user_ctx=NULL};
     httpd_uri_t api_sys_mqtt_p = {.uri="/api/sys/mqtt", .method=HTTP_POST, .handler=sys_mqtt_post,.user_ctx=NULL};
+    httpd_uri_t api_sys_mqtt_t = {.uri="/api/sys/mqtt/test", .method=HTTP_POST, .handler=sys_mqtt_test_post, .user_ctx=NULL};
 
     httpd_uri_t api_sys_cf_g   = {.uri="/api/sys/cloudflare", .method=HTTP_GET,  .handler=sys_cloudflare_get, .user_ctx=NULL};
     httpd_uri_t api_sys_cf_p   = {.uri="/api/sys/cloudflare", .method=HTTP_POST, .handler=sys_cloudflare_post,.user_ctx=NULL};
 
     httpd_uri_t api_sys_websec_g = {.uri="/api/sys/websec", .method=HTTP_GET,  .handler=sys_websec_get, .user_ctx=NULL};
     httpd_uri_t api_sys_websec_p = {.uri="/api/sys/websec", .method=HTTP_POST, .handler=sys_websec_post,.user_ctx=NULL};
+
+    httpd_uri_t ws_uri           = {.uri="/ws",             .method=HTTP_GET,  .handler=ws_handler,     .user_ctx=NULL, .is_websocket=true};
 
     httpd_register_uri_handler(srv, &api_status);
     httpd_register_uri_handler(srv, &api_zones);
@@ -1988,12 +2863,22 @@ static esp_err_t start_web(void){
     httpd_register_uri_handler(srv, &api_sys_net_p);
     httpd_register_uri_handler(srv, &api_sys_mqtt_g);
     httpd_register_uri_handler(srv, &api_sys_mqtt_p);
+    httpd_register_uri_handler(srv, &api_sys_mqtt_t);
 
     httpd_register_uri_handler(srv, &api_sys_cf_g);
     httpd_register_uri_handler(srv, &api_sys_cf_p);
 
     httpd_register_uri_handler(srv, &api_sys_websec_g);
     httpd_register_uri_handler(srv, &api_sys_websec_p);
+
+    httpd_register_uri_handler(srv, &api_can_nodes_o);
+    httpd_register_uri_handler(srv, &api_can_nodes_g);
+    httpd_register_uri_handler(srv, &api_can_scan_o);
+    httpd_register_uri_handler(srv, &api_can_scan_p);
+    httpd_register_uri_handler(srv, &api_can_ident_o);
+    httpd_register_uri_handler(srv, &api_can_ident_p);
+
+    httpd_register_uri_handler(srv, &ws_uri);
 
     ESP_LOGI(TAG, "Server HTTPS avviato su porta %d (%s)",
              cfg.server_port, s_web_tls_state.using_builtin ? "certificato builtin" : "certificato personalizzato");
@@ -2018,14 +2903,36 @@ esp_err_t web_server_start(void){
 }
 
 esp_err_t web_server_stop(void){
-    if (!s_server) return ESP_OK;
-    httpd_handle_t handle = s_server;
-    s_server = NULL;
-    esp_err_t err = httpd_ssl_stop(handle);
-    if (err != ESP_OK){
-        ESP_LOGE(TAG, "httpd_ssl_stop failed: %s", esp_err_to_name(err));
+    // if (!s_server) return ESP_OK;
+    // httpd_handle_t handle = s_server;
+    // s_server = NULL;
+    // ws_clients_reset();
+    // esp_err_t err = httpd_ssl_stop(handle);
+    // if (err != ESP_OK){
+    //     ESP_LOGE(TAG, "httpd_ssl_stop failed: %s", esp_err_to_name(err));
+    esp_err_t first_err = ESP_OK;
+    if (s_https_server){
+        httpd_handle_t handle = s_https_server;
+        s_https_server = NULL;
+        ws_clients_reset();
+        esp_err_t err = httpd_ssl_stop(handle);
+        if (err != ESP_OK){
+            ESP_LOGE(TAG, "httpd_ssl_stop failed: %s", esp_err_to_name(err));
+            if (first_err == ESP_OK) first_err = err;
+        }
     }
-    return err;
+    // return err;
+    if (s_http_redirect_server){
+        httpd_handle_t handle = s_http_redirect_server;
+        s_http_redirect_server = NULL;
+        ws_clients_reset();
+        esp_err_t err = httpd_stop(handle);
+        if (err != ESP_OK){
+            ESP_LOGE(TAG, "httpd_stop (redirect) failed: %s", esp_err_to_name(err));
+            if (first_err == ESP_OK) first_err = err;
+        }
+    }
+    return first_err;
 }
 
 static void web_restart_task(void* arg){

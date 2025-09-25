@@ -6,24 +6,57 @@
   <title>Login • Alarm Pro - NeXtorSystem</title>
   <link rel="stylesheet" href="/css/style.css" />
 </head>
-<body>
-  <main class="container" style="max-width:420px; padding-top:10vh">
-    <div class="card">
-      <h2 class="title" style="text-align:center">Login</h2>
-      <form id="login_form" class="form" autocomplete="on">
-        <label class="field"><span>Username</span><input id="lg_user" autocomplete="username" /></label>
-        <label class="field"><span>Password</span><input id="lg_pass" type="password" autocomplete="current-password" /></label>
-        <div id="otp_block" class="hidden">
-          <label class="field"><span>OTP</span><input id="lg_otp" inputmode="numeric" maxlength="6" autocomplete="one-time-code" /></label>
-        </div>
-        <div class="row" style="justify-content:center; margin-top:.75rem">
-          <button type="submit" class="btn primary">Entra</button>
-        </div>
-        <div id="lg_msg" class="msg small hidden" style="text-align:center"></div>
-      </form>
+<body class="auth-body">
+  <header class="site-header minimal">
+    <div class="container head-inner">
+      <div class="brand">
+        <svg xmlns="http://www.w3.org/2000/svg" class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+          <path d="M7 11a5 5 0 1 1 10 0v4H7v-4Z"/><path d="M5 19h14"/>
+          <path d="M21 11h1"/><path d="M2 11h1"/><path d="M18.5 5.5 19 5"/><path d="m4.5 5.5-.5-.5"/>
+        </svg>
+        <span class="brand-name">Alarm Pro</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container auth-main">
+    <div class="login-panel">
+      <div class="card login-card">
+        <h1 class="title">Accedi al sistema</h1>
+        <p class="muted">Inserisci il suffisso ID (dopo <strong>nsalarmpro-</strong>) e le tue credenziali.</p>
+        <form id="loginForm" class="form" autocomplete="on">
+          <label class="field">
+            <span>ID sistema</span>
+            <div class="prefix-input">
+              <span class="prefix">nsalarmpro-</span>
+              <input id="systemId" name="systemSuffix" autocomplete="off" spellcheck="false" placeholder="example" required />
+            </div>
+          </label>
+          <label class="field">
+            <span>Username</span>
+            <input id="username" name="username" autocomplete="username" required />
+          </label>
+          <label class="field">
+            <span>Password</span>
+            <input id="password" name="password" type="password" autocomplete="current-password" required />
+          </label>
+          <label id="otpField" class="field hidden">
+            <span>Codice OTP</span>
+            <input id="otp" name="otp" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" />
+          </label>
+          <div id="loginMessage" class="msg small hidden"></div>
+          <div class="row actions">
+            <button type="submit" class="btn primary" id="loginSubmit">Accedi</button>
+          </div>
+        </form>
+      </div>
     </div>
   </main>
 
-  <script defer src="/js/login.js"></script>
+  <footer class="container foot">
+    <small>© <span id="footYear"></span> NeXtorSystem</small>
+  </footer>
+
+  <script type="module" src="/js/login.js"></script>
 </body>
 </html>

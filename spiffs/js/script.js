@@ -1,11 +1,14 @@
-const DEFAULT_CLOUDFLARE_UI = 'https://dash.cloudflare.com/';
-const stepsOrder = ['network', 'mqtt', 'cloudflare', 'summary'];
+const DEFAULT_CLOUDFLARE_UI = 'https://ui.nsalarm.pro';
+const stepsOrder = ['general', 'network', 'mqtt', 'cloudflare', 'summary'];
 let currentStep = 0;
 
 const state = {
   provisioned: false,
+  general: {
+    centralName: '',
+  },
+  deviceId: '',
   network: {
-    hostname: 'nsalarmpro',
     dhcp: true,
     ip: '',
     gw: '',
@@ -17,15 +20,42 @@ const state = {
     cid: '',
     user: '',
     pass: '',
-    keepalive: 60,
+    keepalive: null,
+    default_uri: '',
+    default_keepalive: null,
+    testedOk: false,
+    testStatus: 'info',
+    testMessage: 'Esegui il test connessione per continuare.',
   },
   cloudflare: {
-    account_id: '',
-    tunnel_id: '',
-    auth_token: '',
-    ui_url: DEFAULT_CLOUDFLARE_UI,
+    ui_url: '',
   },
 };
+
+const MQTT_PASSWORD_POLICY_MESSAGE = 'Password MQTT non valida: usa 12-63 caratteri con lettere maiuscole, minuscole, numeri e simboli. Lascia il campo vuoto se il broker non richiede autenticazione.';
+
+function isMqttPasswordValid(pass){
+  if (!pass) return true;
+  if (pass.length < 12 || pass.length > 63) return false;
+  let hasUpper = false;
+  let hasLower = false;
+  let hasDigit = false;
+  let hasSpecial = false;
+  for (let i = 0; i < pass.length; i += 1){
+    const code = pass.charCodeAt(i);
+    if (code < 0x20 || code === 0x7f) return false;
+    if (code >= 0x41 && code <= 0x5a){
+      hasUpper = true;
+    } else if (code >= 0x61 && code <= 0x7a){
+      hasLower = true;
+    } else if (code >= 0x30 && code <= 0x39){
+      hasDigit = true;
+    } else {
+      hasSpecial = true;
+    }
+  }
+  return hasUpper && hasLower && hasDigit && hasSpecial;
+}
 
 function $(sel){ return document.querySelector(sel); }
 function $all(sel){ return Array.from(document.querySelectorAll(sel)); }
@@ -100,6 +130,49 @@ function toggleNetStatic(dhcpEnabled){
   });
 }
 
+function renderMqttTestFeedback(){
+  const box = $('#mqttTestStatus');
+  if (!box) return;
+  box.classList.remove('success', 'error');
+  const message = state.mqtt.testMessage || '';
+  if (!message){
+    box.textContent = '';
+    box.classList.add('hidden');
+    return;
+  }
+  box.textContent = message;
+  box.classList.remove('hidden');
+  if (state.mqtt.testStatus === 'success') box.classList.add('success');
+  else if (state.mqtt.testStatus === 'error') box.classList.add('error');
+}
+
+function refreshMqttControls(){
+  const saveBtn = $('#mqttNext');
+  if (saveBtn){
+    const allowSave = state.mqtt.testedOk && state.mqtt.testStatus !== 'testing';
+    saveBtn.disabled = !allowSave;
+  }
+  const testBtn = $('#mqttTestBtn');
+  if (testBtn){
+    testBtn.disabled = state.mqtt.testStatus === 'testing';
+  }
+  renderMqttTestFeedback();
+}
+
+function invalidateMqttTest(silent = false){
+  const hadSuccess = state.mqtt.testedOk;
+  state.mqtt.testedOk = false;
+  state.mqtt.testStatus = 'info';
+  if (!silent){
+    state.mqtt.testMessage = hadSuccess ? 'Modifiche rilevate: rieseguire il test connessione.' : 'Esegui il test connessione per continuare.';
+  } else if (!state.mqtt.testMessage){
+    state.mqtt.testMessage = 'Esegui il test connessione per continuare.';
+  }
+  refreshMqttControls();
+  updateSummary();
+  updateProgress();
+}
+
 function setStep(index){
   if (index < 0 || index >= stepsOrder.length) return;
   currentStep = index;
@@ -110,10 +183,19 @@ function setStep(index){
   });
   updateProgress();
   updateSummary();
+  refreshMqttControls();
+}
+
+function goToStep(stepName){
+  const idx = stepsOrder.indexOf(stepName);
+  if (idx >= 0){
+    setStep(idx);
+  }
 }
 
 function updateProgress(){
   const completion = {
+    general: isGeneralComplete(),
     network: isNetworkComplete(),
     mqtt: isMqttComplete(),
     cloudflare: isCloudflareComplete(),
@@ -131,8 +213,15 @@ function updateSummary(){
   const box = $('#summaryStatus');
   if (!box) return;
   const rows = [];
+  const generalDetails = [];
+  generalDetails.push(`Nome centrale: ${state.general.centralName || '-'}`);
+  rows.push({
+    id: 'general',
+    title: 'Generale',
+    ok: isGeneralComplete(),
+    details: generalDetails,
+  });
   const networkDetails = [];
-  networkDetails.push(`Hostname: ${state.network.hostname || '-'}`);
   networkDetails.push(`DHCP: ${state.network.dhcp ? 'sì' : 'no'}`);
   if (!state.network.dhcp){
     networkDetails.push(`IP: ${state.network.ip || '-'}`);
@@ -148,10 +237,25 @@ function updateSummary(){
   });
 
   const mqttDetails = [];
-  mqttDetails.push(`Broker: ${state.mqtt.uri || '-'}`);
-  mqttDetails.push(`Client ID: ${state.mqtt.cid || '-'}`);
-  mqttDetails.push(`Username: ${state.mqtt.user || '-'}`);
-  mqttDetails.push(`Keep alive: ${state.mqtt.keepalive || 60}s`);
+  const deviceId = state.deviceId || state.mqtt.cid || state.mqtt.user || '';
+  const mqttUri = state.mqtt.uri || state.mqtt.default_uri || '-';
+  mqttDetails.push(`Broker: ${mqttUri}`);
+  mqttDetails.push(`Device ID: ${deviceId || '-'}`);
+  mqttDetails.push(`Client ID: ${state.mqtt.cid || deviceId || '-'}`);
+  mqttDetails.push(`Username: ${state.mqtt.user || deviceId || '-'}`);
+  const keepaliveValue = state.mqtt.keepalive ?? state.mqtt.default_keepalive;
+  mqttDetails.push(`Keep alive: ${keepaliveValue != null ? `${keepaliveValue}s` : '-'}`);
+  let testDetail = 'Test connessione: non ancora eseguito.';
+  if (state.mqtt.testStatus === 'success' || state.mqtt.testedOk){
+    testDetail = 'Test connessione: riuscito.';
+  } else if (state.mqtt.testStatus === 'error' && state.mqtt.testMessage){
+    testDetail = state.mqtt.testMessage;
+  } else if (state.mqtt.testStatus === 'testing'){
+    testDetail = 'Test connessione in corso...';
+  } else if (state.mqtt.testStatus === 'info' && state.mqtt.testMessage){
+    testDetail = state.mqtt.testMessage;
+  }
+  mqttDetails.push(testDetail);
   rows.push({
     id: 'mqtt',
     title: 'MQTT',
@@ -160,9 +264,6 @@ function updateSummary(){
   });
 
   const cfDetails = [];
-  cfDetails.push(`Account ID: ${state.cloudflare.account_id || '-'}`);
-  cfDetails.push(`Tunnel ID: ${state.cloudflare.tunnel_id || '-'}`);
-  cfDetails.push(`Token: ${state.cloudflare.auth_token ? 'presente' : 'non impostato'}`);
   cfDetails.push(`UI Cloudflare: ${state.cloudflare.ui_url || DEFAULT_CLOUDFLARE_UI}`);
   rows.push({
     id: 'cloudflare',
@@ -175,7 +276,8 @@ function updateSummary(){
     id: 'provisioning',
     title: 'Provisioning',
     ok: state.provisioned,
-    details: [state.provisioned ? 'Completato: il dispositivo reindirizzerà alla UI Cloudflare.' : 'In attesa di completamento.'],
+    // details: [state.provisioned ? 'Completato: il dispositivo reindirizzerà alla Dashboard.' : 'In attesa di completamento.'],
+    details: [state.provisioned ? 'Completato: reindirizzamento alla schermata di login.' : 'In attesa di completamento.'],
   });
   
   box.innerHTML = rows.map((row)=>{
@@ -187,7 +289,7 @@ function updateSummary(){
 
   const finish = $('#finishBtn');
   if (finish){
-    finish.disabled = !(isNetworkComplete() && isMqttComplete() && isCloudflareComplete()) || state.provisioned;
+    finish.disabled = !(isGeneralComplete() && isNetworkComplete() && isMqttComplete() && isCloudflareComplete()) || state.provisioned;
   }
   const link = $('#cloudflareLink');
   if (link){
@@ -195,31 +297,41 @@ function updateSummary(){
     link.href = url;
     link.classList.toggle('hidden', !state.provisioned);
   }
-}
+
+function readGeneralForm(){
+  const centralName = ($('#general_name')?.value || '').trim();
+  return { centralName };
+}}
 
 function readNetworkForm(){
-  const hostname = ($('#net_hostname')?.value || '').trim();
   const dhcp = !!$('#net_dhcp')?.checked;
   const ip = ($('#net_ip')?.value || '').trim();
   const gw = ($('#net_gw')?.value || '').trim();
   const mask = ($('#net_mask')?.value || '').trim();
   const dns = ($('#net_dns')?.value || '').trim();
-  return { hostname, dhcp, ip, gw, mask, dns };
+  return { dhcp, ip, gw, mask, dns };
 }
 
 function readMqttForm(){
   const uri = ($('#mqtt_uri')?.value || '').trim();
-  const cid = ($('#mqtt_cid')?.value || '').trim();
-  const user = ($('#mqtt_user')?.value || '').trim();
+  const storedId = (state.deviceId || '').trim();
+  const domId = ($('#mqtt_device_id')?.value || '').trim();
+  const cidInput = ($('#mqtt_cid')?.value || '').trim();
+  const userInput = ($('#mqtt_user')?.value || '').trim();
+  const deviceId = storedId || domId || cidInput || userInput;
+  const cid = deviceId;
+  const user = deviceId;
   const pass = ($('#mqtt_pass')?.value || '').trim();
-  const keepalive = parseInt((($('#mqtt_keep')?.value || '').trim()) || '60', 10) || 60;
+  const rawKeepalive = ($('#mqtt_keep')?.value ?? '').trim();
+  let keepalive = Number.parseInt(rawKeepalive, 10);
+  if (Number.isNaN(keepalive)){
+    const fallback = state.mqtt.keepalive ?? state.mqtt.default_keepalive ?? 60;
+    keepalive = fallback;
+  }
   return { uri, cid, user, pass, keepalive };
 }
 
 function readCloudflareForm(){
-  const account_id = ($('#cf_account')?.value || '').trim();
-  const tunnel_id = ($('#cf_tunnel')?.value || '').trim();
-  const auth_token = ($('#cf_token')?.value || '').trim();
   let ui_url = ($('#cf_ui')?.value || '').trim();
   if (!ui_url) ui_url = DEFAULT_CLOUDFLARE_UI;
   return { account_id, tunnel_id, auth_token, ui_url };
@@ -227,18 +339,39 @@ function readCloudflareForm(){
 
 function isNetworkComplete(){
   const cfg = state.network;
-  if (!cfg.hostname) return false;
   if (cfg.dhcp) return true;
   return !!(cfg.ip && cfg.gw && cfg.mask);
 }
 
+function isGeneralComplete(){
+  return !!state.general.centralName;
+}
+
 function isMqttComplete(){
-  return !!state.mqtt.uri;
+  return !!((state.mqtt.uri || state.mqtt.default_uri) && state.mqtt.testedOk);
 }
 
 function isCloudflareComplete(){
   const cf = state.cloudflare;
   return !!(cf.account_id && cf.tunnel_id && cf.ui_url);
+}
+
+async function submitGeneral(event){
+  event?.preventDefault();
+  const btn = $('#generalNext');
+  if (btn) btn.disabled = true;
+  try {
+    const payload = readGeneralForm();
+    if (!payload.centralName){ throw new Error('Specifica un nome per la centrale.'); }
+    await apiPost('/api/provision/general', { central_name: payload.centralName });
+    state.general = { ...state.general, ...payload };
+    showMessage('Dati generali salvati.', 'success');
+    goToStep('network');
+  } catch (err) {
+    showMessage(err.message || 'Salvataggio dati generali fallito.', 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function submitNetwork(event){
@@ -247,12 +380,10 @@ async function submitNetwork(event){
   if (btn) btn.disabled = true;
   try {
     const payload = readNetworkForm();
-    if (!payload.hostname){ throw new Error('Indica un hostname valido.'); }
     if (!payload.dhcp && (!payload.ip || !payload.gw || !payload.mask)){
       throw new Error('Compila IP, gateway e subnet per configurazione statica.');
     }
     await apiPost('/api/sys/net', {
-      hostname: payload.hostname,
       dhcp: payload.dhcp,
       ip: payload.ip,
       gw: payload.gw,
@@ -262,7 +393,7 @@ async function submitNetwork(event){
     state.network = { ...state.network, ...payload };
     toggleNetStatic(payload.dhcp);
     showMessage('Configurazione di rete salvata.', 'success');
-    setStep(1);
+    goToStep('mqtt');
   } catch (err) {
     showMessage(err.message || 'Salvataggio rete fallito.', 'error');
   } finally {
@@ -270,21 +401,80 @@ async function submitNetwork(event){
   }
 }
 
+async function testMqttConnection(event){
+  event?.preventDefault();
+  const payload = readMqttForm();
+  if (!payload.uri){
+    state.mqtt.testedOk = false;
+    state.mqtt.testStatus = 'error';
+    state.mqtt.testMessage = 'Specifica l\'URI del broker MQTT.';
+    refreshMqttControls();
+    updateSummary();
+    updateProgress();
+    return;
+  }
+  state.mqtt = { ...state.mqtt, ...payload };
+  state.mqtt.testedOk = false;
+  state.mqtt.testStatus = 'testing';
+  state.mqtt.testMessage = 'Test connessione in corso...';
+  refreshMqttControls();
+  updateSummary();
+  updateProgress();
+  try {
+    const response = await apiPost('/api/sys/mqtt/test', payload);
+    const detail = response && response.error != null ? String(response.error).trim() : '';
+    if (response?.success){
+      state.mqtt.testedOk = true;
+      state.mqtt.testStatus = 'success';
+      state.mqtt.testMessage = 'Connessione riuscita.';
+    } else {
+      state.mqtt.testedOk = false;
+      state.mqtt.testStatus = 'error';
+      state.mqtt.testMessage = detail ? `Connessione non riuscita: ${detail}` : 'Connessione non riuscita.';
+    }
+  } catch (err) {
+    const msg = err?.message ? String(err.message).trim() : '';
+    state.mqtt.testedOk = false;
+    state.mqtt.testStatus = 'error';
+    state.mqtt.testMessage = msg ? `Connessione non riuscita: ${msg}` : 'Connessione non riuscita.';
+  }
+  refreshMqttControls();
+  updateSummary();
+  updateProgress();
+}
+
 async function submitMqtt(event){
   event?.preventDefault();
+  if (!state.mqtt.testedOk){
+    showMessage('Esegui prima il test di connessione MQTT.', 'error');
+    refreshMqttControls();
+    return;
+  }
   const btn = $('#mqttNext');
   if (btn) btn.disabled = true;
   try {
     const payload = readMqttForm();
     if (!payload.uri){ throw new Error('Specifica l\'URI del broker MQTT.'); }
+    if (!isMqttPasswordValid(payload.pass)){
+      showMessage(MQTT_PASSWORD_POLICY_MESSAGE, 'error');
+      return;
+    }
+    const deviceId = payload.cid || state.deviceId || '';
+    payload.cid = deviceId;
+    payload.user = deviceId;
     await apiPost('/api/sys/mqtt', payload);
-    state.mqtt = { ...state.mqtt, ...payload };
+    if (deviceId) state.deviceId = deviceId;
+    state.mqtt = { ...state.mqtt, ...payload, cid: deviceId, user: deviceId };
     showMessage('Parametri MQTT aggiornati.', 'success');
-    setStep(2);
+    goToStep('cloudflare');
   } catch (err) {
-    showMessage(err.message || 'Salvataggio MQTT fallito.', 'error');
+    let message = err?.message || '';
+    const httpMatch = message.match(/^[0-9]{3} [^:]+: (.+)$/);
+    if (httpMatch && httpMatch[1]) message = httpMatch[1].trim();
+    if (message && /password mqtt/i.test(message)) message = MQTT_PASSWORD_POLICY_MESSAGE;
+    showMessage(message || 'Salvataggio MQTT fallito.', 'error');
   } finally {
-    if (btn) btn.disabled = false;
+    refreshMqttControls();
   }
 }
 
@@ -294,13 +484,10 @@ async function submitCloudflare(event){
   if (btn) btn.disabled = true;
   try {
     const payload = readCloudflareForm();
-    if (!payload.account_id || !payload.tunnel_id){
-      throw new Error('Completa account e tunnel ID di Cloudflare.');
-    }
     await apiPost('/api/sys/cloudflare', payload);
     state.cloudflare = { ...state.cloudflare, ...payload };
     showMessage('Dati Cloudflare salvati.', 'success');
-    setStep(3);
+    goToStep('summary');
   } catch (err) {
     showMessage(err.message || 'Salvataggio Cloudflare fallito.', 'error');
   } finally {
@@ -312,17 +499,22 @@ async function finishProvisioning(){
   const btn = $('#finishBtn');
   if (btn) btn.disabled = true;
   try {
-    const response = await apiPost('/api/provision/finish', {});
+    // const response = await apiPost('/api/provision/finish', {});
+    await apiPost('/api/provision/finish', {});
     state.provisioned = true;
-    const redirect = response?.redirect || state.cloudflare.ui_url || DEFAULT_CLOUDFLARE_UI;
+    // const redirect = response?.redirect || state.cloudflare.ui_url || DEFAULT_CLOUDFLARE_UI;
     updateSummary();
-    showMessage('Provisioning completato! Reindirizzamento automatico tra pochi secondi...', 'success');
+    // showMessage('Provisioning completato! Reindirizzamento automatico tra pochi secondi...', 'success');
+    showMessage('Provisioning completato! Reindirizzamento alla schermata di login…', 'success');
     const link = $('#cloudflareLink');
     if (link){
-      link.href = redirect;
+      // link.href = redirect;
+      link.href = '/login.html';
+      link.textContent = 'Apri login';
       link.classList.remove('hidden');
     }
-    setTimeout(()=>{ window.location.href = redirect; }, 5000);
+    // setTimeout(()=>{ window.location.href = redirect; }, 5000);
+    setTimeout(()=>{ window.location.href = '/login.html'; }, 1500);
   } catch (err) {
     showMessage(err.message || 'Impossibile completare il provisioning.', 'error');
     if (btn) btn.disabled = false;
@@ -340,25 +532,51 @@ function bindPrevButtons(){
 }
 
 function hydrateForms(){
-  $('#net_hostname') && ($('#net_hostname').value = state.network.hostname || '');
+  $('#general_name') && ($('#general_name').value = state.general.centralName || '');
   const dhcp = state.network.dhcp !== false;
   if ($('#net_dhcp')) $('#net_dhcp').checked = dhcp;
-  $('#net_ip') && ($('#net_ip').value = state.network.ip || '');
-  $('#net_gw') && ($('#net_gw').value = state.network.gw || '');
-  $('#net_mask') && ($('#net_mask').value = state.network.mask || '');
-  $('#net_dns') && ($('#net_dns').value = state.network.dns || '');
+  const ipInput = $('#net_ip');
+  if (ipInput) ipInput.value = state.network.ip || '';
+  const gwInput = $('#net_gw');
+  if (gwInput) gwInput.value = state.network.gw || '';
+  const maskInput = $('#net_mask');
+  if (maskInput) maskInput.value = state.network.mask || '';
+  const dnsInput = $('#net_dns');
+  if (dnsInput) dnsInput.value = state.network.dns || '';
   toggleNetStatic(dhcp);
 
-  $('#mqtt_uri') && ($('#mqtt_uri').value = state.mqtt.uri || '');
-  $('#mqtt_cid') && ($('#mqtt_cid').value = state.mqtt.cid || '');
-  $('#mqtt_user') && ($('#mqtt_user').value = state.mqtt.user || '');
-  $('#mqtt_pass') && ($('#mqtt_pass').value = state.mqtt.pass || '');
-  $('#mqtt_keep') && ($('#mqtt_keep').value = state.mqtt.keepalive || 60);
+  const mqttUriInput = $('#mqtt_uri');
+  if (mqttUriInput){
+    const uriValue = state.mqtt.uri || state.mqtt.default_uri || '';
+    mqttUriInput.value = uriValue;
+    mqttUriInput.placeholder = state.mqtt.default_uri || '';
+  }
 
-  $('#cf_account') && ($('#cf_account').value = state.cloudflare.account_id || '');
-  $('#cf_tunnel') && ($('#cf_tunnel').value = state.cloudflare.tunnel_id || '');
-  $('#cf_token') && ($('#cf_token').value = state.cloudflare.auth_token || '');
-  $('#cf_ui') && ($('#cf_ui').value = state.cloudflare.ui_url || DEFAULT_CLOUDFLARE_UI);
+  const deviceId = (state.deviceId || state.mqtt.cid || state.mqtt.user || '').trim();
+  if (deviceId) {
+    state.deviceId = deviceId;
+    state.mqtt.cid = deviceId;
+    state.mqtt.user = deviceId;
+  }
+  $('#mqtt_device_id') && ($('#mqtt_device_id').value = deviceId || '');
+  $('#mqtt_cid') && ($('#mqtt_cid').value = deviceId || '');
+  $('#mqtt_user') && ($('#mqtt_user').value = deviceId || '');
+
+  // const mqttCidInput = $('#mqtt_cid');
+  // if (mqttCidInput) mqttCidInput.value = state.mqtt.cid || '';
+  // const mqttUserInput = $('#mqtt_user');
+  // if (mqttUserInput) mqttUserInput.value = state.mqtt.user || '';
+  const mqttPassInput = $('#mqtt_pass');
+  if (mqttPassInput) mqttPassInput.value = state.mqtt.pass || '';
+  const mqttKeepInput = $('#mqtt_keep');
+  if (mqttKeepInput){
+    const keepaliveVal = state.mqtt.keepalive ?? state.mqtt.default_keepalive;
+    mqttKeepInput.value = keepaliveVal != null ? keepaliveVal : '';
+    mqttKeepInput.placeholder = state.mqtt.default_keepalive != null ? `${state.mqtt.default_keepalive}` : '';
+  }
+
+  const cfUiInput = $('#cf_ui');
+  if (cfUiInput) cfUiInput.value = state.cloudflare.ui_url || '';
 }
 
 async function loadInitialStatus(){
@@ -366,14 +584,47 @@ async function loadInitialStatus(){
     const data = await apiGet('/api/provision/status');
     if (data){
       state.provisioned = !!data.provisioned;
+      if (data.general){
+        const centralName = data.general.central_name ?? data.general.centralName;
+        if (typeof centralName === 'string'){
+          state.general.centralName = centralName;
+        }
+      }
+      const rootDeviceId = typeof data.device_id === 'string' ? data.device_id.trim() : '';
+      if (rootDeviceId) state.deviceId = rootDeviceId;
       if (data.network) state.network = { ...state.network, ...data.network };
-      if (data.mqtt) state.mqtt = { ...state.mqtt, ...data.mqtt };
+      if (data.mqtt){
+        const { default_uri, default_keepalive, ...mqttCfg } = data.mqtt;
+        state.mqtt = { ...state.mqtt, ...mqttCfg };
+        if (default_uri !== undefined) state.mqtt.default_uri = default_uri;
+        if (default_keepalive !== undefined) state.mqtt.default_keepalive = default_keepalive;
+      }
       if (data.cloudflare) state.cloudflare = { ...state.cloudflare, ...data.cloudflare };
+      if (state.provisioned && state.mqtt.uri){
+        state.mqtt.testedOk = true;
+        state.mqtt.testStatus = 'success';
+        state.mqtt.testMessage = 'Connessione già verificata.';
+      } else {
+        state.mqtt.testedOk = false;
+        state.mqtt.testStatus = 'info';
+        if (!state.mqtt.testMessage){
+          state.mqtt.testMessage = 'Esegui il test connessione per continuare.';
+        }
+      }
+      if (!state.deviceId){
+        const fallback = (state.mqtt.cid || state.mqtt.user || '').trim();
+        if (fallback) state.deviceId = fallback;
+      }
+      if (state.deviceId){
+        state.mqtt.cid = state.deviceId;
+        state.mqtt.user = state.deviceId;
+      }
     }
   } catch (err) {
     showMessage('Impossibile leggere lo stato iniziale: ' + (err.message || ''), 'error');
   }
   hydrateForms();
+  refreshMqttControls();
   updateSummary();
   updateProgress();
 }
@@ -382,17 +633,26 @@ function initWizard(){
   $('#net_dhcp')?.addEventListener('change', (ev)=>{
     toggleNetStatic(ev.target.checked);
   });
+  $('#generalForm')?.addEventListener('submit', submitGeneral);
   $('#networkForm')?.addEventListener('submit', submitNetwork);
   $('#mqttForm')?.addEventListener('submit', submitMqtt);
+  $('#mqttTestBtn')?.addEventListener('click', testMqttConnection);
   $('#cloudflareForm')?.addEventListener('submit', submitCloudflare);
   $('#finishBtn')?.addEventListener('click', finishProvisioning);
+  ['#mqtt_uri', '#mqtt_cid', '#mqtt_user', '#mqtt_pass', '#mqtt_keep'].forEach((sel)=>{
+    const input = document.querySelector(sel);
+    if (!input) return;
+    input.addEventListener('input', ()=>invalidateMqttTest());
+  });
   bindPrevButtons();
+  refreshMqttControls();
   loadInitialStatus().then(()=>{
     if (state.provisioned){
-      currentStep = 3;
+      const summaryIdx = stepsOrder.indexOf('summary');
+      currentStep = summaryIdx >= 0 ? summaryIdx : stepsOrder.length - 1;
       updateProgress();
       updateSummary();
-      setStep(3);
+      setStep(currentStep);
       showMessage('Il dispositivo risulta già provisionato. Puoi aprire direttamente la UI Cloudflare.', 'success');
       const link = $('#cloudflareLink');
       if (link){
