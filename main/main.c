@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "sdkconfig.h"
 
 #include "esp_mac.h"
 
@@ -69,6 +70,15 @@ static void sntp_start_and_wait(void){
 
 static const char *TAG = "app";
 
+#define SYSTEM_MAIN_TASK_STACK_BYTES      (16384)
+#define SYSTEM_MAIN_TASK_PRIORITY         (tskIDLE_PRIORITY + 5)
+#define WEB_SERVER_START_TASK_STACK_BYTES (16384)
+#define WEB_SERVER_START_TASK_PRIORITY    (SYSTEM_MAIN_TASK_PRIORITY)
+
+_Static_assert((SYSTEM_MAIN_TASK_STACK_BYTES % sizeof(StackType_t)) == 0,
+               "SYSTEM_MAIN_TASK_STACK_BYTES must align to StackType_t size");
+
+
 // ---- START CANBUS -------------------------------------------
 
 #define CAN_SCAN_WINDOW_US (2000000ULL)
@@ -78,6 +88,61 @@ static SemaphoreHandle_t s_scan_mutex = NULL;
 static esp_timer_handle_t s_scan_timer = NULL;
 static bool s_scan_in_progress = false;
 static size_t s_scan_new_nodes = 0;
+
+typedef struct {
+    SemaphoreHandle_t done;
+    esp_err_t result;
+} web_server_start_ctx_t;
+
+static void web_server_start_task(void *arg)
+{
+    web_server_start_ctx_t *ctx = (web_server_start_ctx_t *)arg;
+    if (ctx) {
+        ctx->result = web_server_start();
+        if (ctx->done) {
+            xSemaphoreGive(ctx->done);
+        }
+    }
+    vTaskDelete(NULL);
+}
+
+static esp_err_t web_server_start_with_stack(void)
+{
+    web_server_start_ctx_t ctx = {
+        .done = xSemaphoreCreateBinary(),
+        .result = ESP_FAIL,
+    };
+    if (!ctx.done) {
+        ESP_LOGW(TAG, "Unable to allocate semaphore for web server start task");
+        return web_server_start();
+    }
+
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        web_server_start_task,
+        "web_start",
+        WEB_SERVER_START_TASK_STACK_BYTES / sizeof(StackType_t),
+        &ctx,
+        WEB_SERVER_START_TASK_PRIORITY,
+        NULL,
+        tskNO_AFFINITY);
+
+    if (created != pdPASS) {
+        ESP_LOGW(TAG, "Unable to create web server start task (%ld), running inline", (long)created);
+        vSemaphoreDelete(ctx.done);
+        return web_server_start();
+    }
+
+    esp_err_t err = ESP_OK;
+    if (xSemaphoreTake(ctx.done, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Web server start task failed to signal completion");
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        err = ctx.result;
+    }
+
+    vSemaphoreDelete(ctx.done);
+    return err;
+}
 
 static SemaphoreHandle_t ensure_scan_mutex(void)
 {
@@ -281,8 +346,11 @@ static void nvs_erase_namespace_once(const char* ns){
 //     return (a == 0) && (b == 0);
 // }
 
-void app_main(void)
+//void app_main(void)
+static void system_main_task(void *arg)
 {
+    (void)arg;
+
     char device_id[DEVICE_ID_MAX] = {0};
     uint8_t device_secret[DEVICE_SECRET_LEN] = {0};
 
@@ -320,7 +388,7 @@ void app_main(void)
 
     ensure_scan_mutex();
     roster_init(INPUT_ZONES_COUNT, MASTER_OUTPUTS_COUNT, 0);
-    
+
     // reset_buttons_init();
     // ESP_LOGI(TAG, "Pulsanti HW reset su GPIO %d e %d", PIN_HW_RESET_BTN_A, PIN_HW_RESET_BTN_B);
     sntp_start_and_wait();
@@ -353,8 +421,13 @@ void app_main(void)
     // esp_log_level_set("esp-tls",      ESP_LOG_WARN);
 
 
-
-    ESP_LOGI(TAG, "System ready.");
+    UBaseType_t watermark_words = uxTaskGetStackHighWaterMark(NULL);
+    size_t watermark_bytes = watermark_words * sizeof(StackType_t);
+    ESP_LOGI(TAG,
+             "System ready. sys_main stack high watermark: %u bytes (stack size %u bytes, default main stack %u bytes)",
+             (unsigned)watermark_bytes,
+             (unsigned)SYSTEM_MAIN_TASK_STACK_BYTES,
+             (unsigned)CONFIG_ESP_MAIN_TASK_STACK_SIZE);
 
     // Main loop: leggi ingressi e alimenta la logica d’allarme
     uint16_t last_mask = 0xFFFFu;
@@ -414,5 +487,23 @@ void app_main(void)
         // }
 
         // vTaskDelay(loop_delay);
+    }
+}
+
+void app_main(void)
+{
+    const uint32_t stack_words = SYSTEM_MAIN_TASK_STACK_BYTES / sizeof(StackType_t);
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        system_main_task,
+        "sys_main",
+        stack_words,
+        NULL,
+        SYSTEM_MAIN_TASK_PRIORITY,
+        NULL,
+        tskNO_AFFINITY);
+
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Unable to create system main task (%ld)", (long)created);
+        system_main_task(NULL);
     }
 }

@@ -2566,6 +2566,7 @@ static esp_err_t redirect_http_handler(httpd_req_t* req){
 static esp_err_t start_http_redirect_server(void){
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
+    cfg.ctrl_port += 1;  // avoid clashing with the HTTPS server control socket
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.lru_purge_enable = true;
     httpd_handle_t srv = NULL;
@@ -2714,6 +2715,81 @@ static esp_err_t users_admin_list_get(httpd_req_t* req);
 // ─────────────────────────────────────────────────────────────────────────────
 // START/STOP server + registrazione URI
 // ─────────────────────────────────────────────────────────────────────────────
+static const httpd_uri_t s_http_routes[] = {
+    { .uri = "/",                 .method = HTTP_GET,     .handler = root_get },
+    { .uri = "/login.html",       .method = HTTP_GET,     .handler = login_html_get },
+    { .uri = "/index.html",       .method = HTTP_GET,     .handler = index_html_get },
+    { .uri = "/wizard.html",      .method = HTTP_GET,     .handler = wizard_html_get },
+    { .uri = "/admin.html",       .method = HTTP_GET,     .handler = admin_html_get },
+    { .uri = "/403.html",         .method = HTTP_GET,     .handler = four03_html_get },
+    { .uri = "/js/app.js",        .method = HTTP_GET,     .handler = js_get },
+    { .uri = "/js/api.js",        .method = HTTP_GET,     .handler = js_get },
+    { .uri = "/js/admin.js",      .method = HTTP_GET,     .handler = js_get },
+    { .uri = "/js/script.js",     .method = HTTP_GET,     .handler = js_get },
+    { .uri = "/js/login.js",      .method = HTTP_GET,     .handler = js_get },
+    { .uri = "/js/qrcode.min.js", .method = HTTP_GET,     .handler = js_get },
+    { .uri = "/js/bootstrap.bundle.min.js",     .method = HTTP_GET, .handler = js_get },
+    { .uri = "/js/bootstrap.bundle.min.js.map", .method = HTTP_GET, .handler = js_get },
+    { .uri = "/css/bootstrap.min.css",          .method = HTTP_GET, .handler = css_get },
+    { .uri = "/css/bootstrap.min.css.map",      .method = HTTP_GET, .handler = css_get },
+    { .uri = "/css/style.css",    .method = HTTP_GET,     .handler = css_get },
+    { .uri = "/api/login",        .method = HTTP_POST,    .handler = api_login_post },
+    { .uri = "/api/logout",       .method = HTTP_POST,    .handler = api_logout_post },
+    { .uri = "/api/me",           .method = HTTP_GET,     .handler = api_me_get },
+    { .uri = "/api/admin/secret", .method = HTTP_GET,     .handler = api_admin_only_get },
+    { .uri = "/api/provision/status",  .method = HTTP_GET,  .handler = provision_status_get },
+    { .uri = "/api/provision/finish",  .method = HTTP_POST, .handler = provision_finish_post },
+    { .uri = "/api/provision/reset",   .method = HTTP_POST, .handler = provision_reset_post },
+    { .uri = "/api/provision/general", .method = HTTP_POST, .handler = provision_general_post },
+    { .uri = "/api/can/nodes",           .method = HTTP_GET,     .handler = api_can_nodes_get },
+    { .uri = "/api/can/nodes",           .method = HTTP_OPTIONS, .handler = api_can_nodes_options },
+    { .uri = "/api/can/scan",            .method = HTTP_POST,    .handler = api_can_scan_post },
+    { .uri = "/api/can/scan",            .method = HTTP_OPTIONS, .handler = api_can_scan_options },
+    { .uri = "/api/can/node/*/identify", .method = HTTP_POST,    .handler = api_can_node_identify_post },
+    { .uri = "/api/can/node/*/identify", .method = HTTP_OPTIONS, .handler = api_can_node_identify_options },
+    { .uri = "/api/status",             .method = HTTP_GET,  .handler = status_get },
+    { .uri = "/api/zones",              .method = HTTP_GET,  .handler = zones_get },
+    { .uri = "/api/zones/config",       .method = HTTP_GET,  .handler = zones_config_get },
+    { .uri = "/api/zones/config",       .method = HTTP_POST, .handler = zones_config_post },
+    { .uri = "/api/scenes",             .method = HTTP_GET,  .handler = scenes_get },
+    { .uri = "/api/scenes",             .method = HTTP_POST, .handler = scenes_post },
+    { .uri = "/api/user/password",      .method = HTTP_POST, .handler = user_post_password },
+    { .uri = "/api/user/totp",          .method = HTTP_GET,  .handler = user_get_totp },
+    { .uri = "/api/arm",                .method = HTTP_POST, .handler = arm_post },
+    { .uri = "/api/disarm",             .method = HTTP_POST, .handler = disarm_post },
+    { .uri = "/api/user/pin",           .method = HTTP_POST, .handler = user_post_pin },
+    { .uri = "/api/users",              .method = HTTP_GET,  .handler = users_list_get },
+    { .uri = "/api/users/password",     .method = HTTP_POST, .handler = users_password_post },
+    { .uri = "/api/users/create",       .method = HTTP_POST, .handler = users_create_post },
+    { .uri = "/api/users/pin",          .method = HTTP_POST, .handler = users_pin_admin_post },
+    { .uri = "/api/users/rfid/learn",   .method = HTTP_POST, .handler = users_rfid_learn_post },
+    { .uri = "/api/users/rfid/clear",   .method = HTTP_POST, .handler = users_rfid_clear_post },
+    { .uri = "/api/admin/users",        .method = HTTP_GET,  .handler = users_admin_list_get },
+    { .uri = "/api/sys/net",            .method = HTTP_GET,  .handler = sys_net_get },
+    { .uri = "/api/sys/net",            .method = HTTP_POST, .handler = sys_net_post },
+    { .uri = "/api/sys/mqtt",           .method = HTTP_GET,  .handler = sys_mqtt_get },
+    { .uri = "/api/sys/mqtt",           .method = HTTP_POST, .handler = sys_mqtt_post },
+    { .uri = "/api/sys/mqtt/test",      .method = HTTP_POST, .handler = sys_mqtt_test_post },
+    { .uri = "/api/sys/cloudflare",     .method = HTTP_GET,  .handler = sys_cloudflare_get },
+    { .uri = "/api/sys/cloudflare",     .method = HTTP_POST, .handler = sys_cloudflare_post },
+    { .uri = "/api/sys/websec",         .method = HTTP_GET,  .handler = sys_websec_get },
+    { .uri = "/api/sys/websec",         .method = HTTP_POST, .handler = sys_websec_post },
+    { .uri = "/ws",                     .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true },
+};
+
+static void register_uri_set(httpd_handle_t srv, const httpd_uri_t *routes, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        const httpd_uri_t *uri = &routes[i];
+        esp_err_t reg_err = httpd_register_uri_handler(srv, uri);
+        if (reg_err != ESP_OK) {
+            ESP_LOGW(TAG, "httpd_register_uri_handler failed for %s (%s)",
+                     uri->uri, esp_err_to_name(reg_err));
+        }
+    }
+}
+
+
 static esp_err_t start_web(void){
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 12288;
@@ -2736,149 +2812,8 @@ static esp_err_t start_web(void){
     }
     ws_clients_reset();
 
-    // static files
-    httpd_uri_t ui_root      = {.uri="/",                 .method=HTTP_GET,  .handler=root_get,           .user_ctx=NULL};
-    httpd_uri_t ui_login_h   = {.uri="/login.html",       .method=HTTP_GET,  .handler=login_html_get,     .user_ctx=NULL};
-    httpd_uri_t ui_index_h   = {.uri="/index.html",       .method=HTTP_GET,  .handler=index_html_get,     .user_ctx=NULL};
-    httpd_uri_t ui_wizard_h  = {.uri="/wizard.html",      .method=HTTP_GET,  .handler=wizard_html_get,    .user_ctx=NULL};
-    httpd_uri_t ui_admin_h   = {.uri="/admin.html",       .method=HTTP_GET,  .handler=admin_html_get,     .user_ctx=NULL};
-    httpd_uri_t ui_403_h     = {.uri="/403.html",         .method=HTTP_GET,  .handler=four03_html_get,    .user_ctx=NULL};
+    register_uri_set(srv, s_http_routes, sizeof(s_http_routes) / sizeof(s_http_routes[0]));
 
-    httpd_uri_t ui_app_js    = {.uri="/js/app.js",        .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
-    httpd_uri_t ui_api_js    = {.uri="/js/api.js",        .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
-    httpd_uri_t ui_admin_js  = {.uri="/js/admin.js",      .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
-    httpd_uri_t ui_script_js = {.uri="/js/script.js",     .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
-    httpd_uri_t ui_login_js  = {.uri="/js/login.js",      .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
-    httpd_uri_t ui_qrcode_js = {.uri="/js/qrcode.min.js", .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
-    httpd_uri_t ui_bs_js     = {.uri="/js/bootstrap.bundle.min.js",     .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
-    httpd_uri_t ui_bs_js_map = {.uri="/js/bootstrap.bundle.min.js.map", .method=HTTP_GET,  .handler=js_get,             .user_ctx=NULL};
-    httpd_uri_t ui_bs_css    = {.uri="/css/bootstrap.min.css",          .method=HTTP_GET,  .handler=css_get,            .user_ctx=NULL};
-    httpd_uri_t ui_bs_css_map= {.uri="/css/bootstrap.min.css.map",      .method=HTTP_GET,  .handler=css_get,            .user_ctx=NULL};
-    httpd_uri_t ui_css       = {.uri="/css/style.css",    .method=HTTP_GET,  .handler=css_get,            .user_ctx=NULL};
-
-    httpd_uri_t u_api_login  = {.uri="/api/login",        .method=HTTP_POST, .handler=api_login_post,     .user_ctx=NULL};
-    httpd_uri_t u_api_logout = {.uri="/api/logout",       .method=HTTP_POST, .handler=api_logout_post,    .user_ctx=NULL};
-    httpd_uri_t u_api_me     = {.uri="/api/me",           .method=HTTP_GET,  .handler=api_me_get,         .user_ctx=NULL};
-    httpd_uri_t u_api_admin  = {.uri="/api/admin/secret", .method=HTTP_GET,  .handler=api_admin_only_get, .user_ctx=NULL};
-
-    httpd_uri_t api_prov_status = {.uri="/api/provision/status", .method=HTTP_GET,  .handler=provision_status_get, .user_ctx=NULL};
-    httpd_uri_t api_prov_finish = {.uri="/api/provision/finish", .method=HTTP_POST, .handler=provision_finish_post, .user_ctx=NULL};
-    httpd_uri_t api_prov_reset  = {.uri="/api/provision/reset",  .method=HTTP_POST, .handler=provision_reset_post,  .user_ctx=NULL};
-    httpd_uri_t api_prov_general = {.uri="/api/provision/general", .method=HTTP_POST, .handler=provision_general_post, .user_ctx=NULL};
-
-    httpd_register_uri_handler(srv,&ui_root);
-    httpd_register_uri_handler(srv,&ui_login_h);
-    httpd_register_uri_handler(srv,&ui_index_h);
-    httpd_register_uri_handler(srv,&ui_wizard_h);
-    httpd_register_uri_handler(srv,&ui_admin_h);
-    httpd_register_uri_handler(srv,&ui_403_h);
-
-    httpd_register_uri_handler(srv,&ui_app_js);
-    httpd_register_uri_handler(srv,&ui_admin_js);
-    httpd_register_uri_handler(srv,&ui_script_js);
-    httpd_register_uri_handler(srv,&ui_qrcode_js);
-    httpd_register_uri_handler(srv,&ui_bs_js);
-    httpd_register_uri_handler(srv,&ui_bs_js_map);
-    httpd_register_uri_handler(srv,&ui_login_js);
-    httpd_register_uri_handler(srv,&ui_api_js);
-    httpd_register_uri_handler(srv,&ui_css);
-    httpd_register_uri_handler(srv,&ui_bs_css);
-    httpd_register_uri_handler(srv,&ui_bs_css_map);
-
-    httpd_register_uri_handler(srv,&u_api_login);
-    httpd_register_uri_handler(srv,&u_api_logout);
-    httpd_register_uri_handler(srv,&u_api_me);
-    httpd_register_uri_handler(srv,&u_api_admin);
-
-    httpd_register_uri_handler(srv,&api_prov_status);
-    httpd_register_uri_handler(srv,&api_prov_finish);
-    httpd_register_uri_handler(srv,&api_prov_reset);
-    httpd_register_uri_handler(srv,&api_prov_general);
-
-    // API protette
-    httpd_uri_t api_can_nodes_g  = {.uri="/api/can/nodes",           .method=HTTP_GET,     .handler=api_can_nodes_get,          .user_ctx=NULL};
-    httpd_uri_t api_can_nodes_o  = {.uri="/api/can/nodes",           .method=HTTP_OPTIONS, .handler=api_can_nodes_options,      .user_ctx=NULL};
-    httpd_uri_t api_can_scan_p   = {.uri="/api/can/scan",            .method=HTTP_POST,    .handler=api_can_scan_post,          .user_ctx=NULL};
-    httpd_uri_t api_can_scan_o   = {.uri="/api/can/scan",            .method=HTTP_OPTIONS, .handler=api_can_scan_options,       .user_ctx=NULL};
-    httpd_uri_t api_can_ident_p  = {.uri="/api/can/node/*/identify", .method=HTTP_POST,    .handler=api_can_node_identify_post, .user_ctx=NULL};
-    httpd_uri_t api_can_ident_o  = {.uri="/api/can/node/*/identify", .method=HTTP_OPTIONS, .handler=api_can_node_identify_options,.user_ctx=NULL};
-
-    httpd_uri_t api_status     = {.uri="/api/status",             .method=HTTP_GET,  .handler=status_get,           .user_ctx=NULL };
-    httpd_uri_t api_zones      = {.uri="/api/zones",              .method=HTTP_GET,  .handler=zones_get,            .user_ctx=NULL };
-    httpd_uri_t api_zone_cfg_g = {.uri="/api/zones/config",       .method=HTTP_GET,  .handler=zones_config_get,     .user_ctx=NULL};
-    httpd_uri_t api_zone_cfg_p = {.uri="/api/zones/config",       .method=HTTP_POST, .handler=zones_config_post,    .user_ctx=NULL};
-    httpd_uri_t api_scenes_g   = {.uri="/api/scenes",             .method=HTTP_GET,  .handler=scenes_get,           .user_ctx=NULL };
-    httpd_uri_t api_scenes_p   = {.uri="/api/scenes",             .method=HTTP_POST, .handler=scenes_post,          .user_ctx=NULL };
-    httpd_uri_t api_user_pw    = {.uri="/api/user/password",      .method=HTTP_POST, .handler=user_post_password,   .user_ctx=NULL};
-    httpd_uri_t api_user_totp  = {.uri="/api/user/totp",          .method=HTTP_GET,  .handler=user_get_totp,        .user_ctx=NULL};
-    httpd_uri_t api_arm        = {.uri="/api/arm",                .method=HTTP_POST, .handler=arm_post,             .user_ctx=NULL};
-    httpd_uri_t api_disarm     = {.uri="/api/disarm",             .method=HTTP_POST, .handler=disarm_post,          .user_ctx=NULL};
-    httpd_uri_t api_user_pin   = {.uri="/api/user/pin",           .method=HTTP_POST, .handler=user_post_pin,        .user_ctx=NULL};
-
-    httpd_uri_t api_users_ls   = {.uri="/api/users",              .method=HTTP_GET,  .handler=users_list_get,       .user_ctx=NULL};
-    httpd_uri_t api_users_pw   = {.uri="/api/users/password",     .method=HTTP_POST, .handler=users_password_post,  .user_ctx=NULL};
-    
-    httpd_uri_t api_users_create = {.uri="/api/users/create",     .method=HTTP_POST, .handler=users_create_post,    .user_ctx=NULL};
-    httpd_uri_t api_users_pin    = {.uri="/api/users/pin",        .method=HTTP_POST, .handler=users_pin_admin_post, .user_ctx=NULL};
-    httpd_uri_t api_users_rfid_l = {.uri="/api/users/rfid/learn", .method=HTTP_POST, .handler=users_rfid_learn_post,.user_ctx=NULL};
-    httpd_uri_t api_users_rfid_c = {.uri="/api/users/rfid/clear", .method=HTTP_POST, .handler=users_rfid_clear_post,.user_ctx=NULL};
-    httpd_uri_t api_admin_users  = {.uri="/api/admin/users",      .method=HTTP_GET,  .handler=users_admin_list_get, .user_ctx=NULL};
-
-    httpd_uri_t api_sys_net_g  = {.uri="/api/sys/net",  .method=HTTP_GET,  .handler=sys_net_get,  .user_ctx=NULL};
-    httpd_uri_t api_sys_net_p  = {.uri="/api/sys/net",  .method=HTTP_POST, .handler=sys_net_post, .user_ctx=NULL};
-    httpd_uri_t api_sys_mqtt_g = {.uri="/api/sys/mqtt", .method=HTTP_GET,  .handler=sys_mqtt_get, .user_ctx=NULL};
-    httpd_uri_t api_sys_mqtt_p = {.uri="/api/sys/mqtt", .method=HTTP_POST, .handler=sys_mqtt_post,.user_ctx=NULL};
-    httpd_uri_t api_sys_mqtt_t = {.uri="/api/sys/mqtt/test", .method=HTTP_POST, .handler=sys_mqtt_test_post, .user_ctx=NULL};
-
-    httpd_uri_t api_sys_cf_g   = {.uri="/api/sys/cloudflare", .method=HTTP_GET,  .handler=sys_cloudflare_get, .user_ctx=NULL};
-    httpd_uri_t api_sys_cf_p   = {.uri="/api/sys/cloudflare", .method=HTTP_POST, .handler=sys_cloudflare_post,.user_ctx=NULL};
-
-    httpd_uri_t api_sys_websec_g = {.uri="/api/sys/websec", .method=HTTP_GET,  .handler=sys_websec_get, .user_ctx=NULL};
-    httpd_uri_t api_sys_websec_p = {.uri="/api/sys/websec", .method=HTTP_POST, .handler=sys_websec_post,.user_ctx=NULL};
-
-    httpd_uri_t ws_uri           = {.uri="/ws",             .method=HTTP_GET,  .handler=ws_handler,     .user_ctx=NULL, .is_websocket=true};
-
-    httpd_register_uri_handler(srv, &api_status);
-    httpd_register_uri_handler(srv, &api_zones);
-    httpd_register_uri_handler(srv, &api_zone_cfg_g);
-    httpd_register_uri_handler(srv, &api_zone_cfg_p);
-    httpd_register_uri_handler(srv, &api_scenes_g);
-    httpd_register_uri_handler(srv, &api_scenes_p);
-    httpd_register_uri_handler(srv, &api_user_pw);
-    httpd_register_uri_handler(srv, &api_user_totp);
-    httpd_register_uri_handler(srv, &api_arm);
-    httpd_register_uri_handler(srv, &api_disarm);
-    httpd_register_uri_handler(srv, &api_user_pin);
-
-    httpd_register_uri_handler(srv, &api_users_ls);
-    httpd_register_uri_handler(srv, &api_users_pw);
-    
-    httpd_register_uri_handler(srv, &api_users_create);
-    httpd_register_uri_handler(srv, &api_users_pin);
-    httpd_register_uri_handler(srv, &api_users_rfid_l);
-    httpd_register_uri_handler(srv, &api_users_rfid_c);
-    httpd_register_uri_handler(srv, &api_admin_users);
-
-    httpd_register_uri_handler(srv, &api_sys_net_g);
-    httpd_register_uri_handler(srv, &api_sys_net_p);
-    httpd_register_uri_handler(srv, &api_sys_mqtt_g);
-    httpd_register_uri_handler(srv, &api_sys_mqtt_p);
-    httpd_register_uri_handler(srv, &api_sys_mqtt_t);
-
-    httpd_register_uri_handler(srv, &api_sys_cf_g);
-    httpd_register_uri_handler(srv, &api_sys_cf_p);
-
-    httpd_register_uri_handler(srv, &api_sys_websec_g);
-    httpd_register_uri_handler(srv, &api_sys_websec_p);
-
-    httpd_register_uri_handler(srv, &api_can_nodes_o);
-    httpd_register_uri_handler(srv, &api_can_nodes_g);
-    httpd_register_uri_handler(srv, &api_can_scan_o);
-    httpd_register_uri_handler(srv, &api_can_scan_p);
-    httpd_register_uri_handler(srv, &api_can_ident_o);
-    httpd_register_uri_handler(srv, &api_can_ident_p);
-
-    httpd_register_uri_handler(srv, &ws_uri);
 
     ESP_LOGI(TAG, "Server HTTPS avviato su porta %d (%s)",
              cfg.server_port, s_web_tls_state.using_builtin ? "certificato builtin" : "certificato personalizzato");
