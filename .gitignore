@@ -31,3 +31,8 @@ certs/
 *.crt
 *.p12
 *.der
+
+# backup
+spiffs/bkp/
+*.old
+*.last
