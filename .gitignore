@@ -36,3 +36,6 @@ certs/
 spiffs/bkp/
 *.old
 *.last
+
+replacements.txt
+tools/
