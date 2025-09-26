@@ -105,6 +105,7 @@ static const char* ISSUER_NAME = "Alarm Pro";
 typedef enum {
     WEB_TLS_SRC_NONE = 0,
     WEB_TLS_SRC_BUILTIN,
+    WEB_TLS_SRC_EMBEDDED,
     WEB_TLS_SRC_CUSTOM
 } web_tls_source_t;
 
@@ -659,12 +660,22 @@ static void web_tls_state_set_last_error(const char* msg){
 
 static void web_tls_clear_dynamic(void){
     if (s_tls_material.dyn_cert){
-        free(s_tls_material.dyn_cert);
+        uint8_t *ptr = s_tls_material.dyn_cert;
+        free(ptr);
+        if (s_tls_material.cert == ptr){
+            s_tls_material.cert = NULL;
+            s_tls_material.cert_len = 0;
+        }
         s_tls_material.dyn_cert = NULL;
         s_tls_material.dyn_cert_len = 0;
     }
     if (s_tls_material.dyn_key){
-        free(s_tls_material.dyn_key);
+        uint8_t *ptr = s_tls_material.dyn_key;
+        free(ptr);
+        if (s_tls_material.key == ptr){
+            s_tls_material.key = NULL;
+            s_tls_material.key_len = 0;
+        }
         s_tls_material.dyn_key = NULL;
         s_tls_material.dyn_key_len = 0;
     }
@@ -751,23 +762,78 @@ static void web_tls_state_set_custom_from_crt(const mbedtls_x509_crt* crt, uint6
     format_time_iso(installed_at, s_web_tls_state.custom_installed_iso);
 }
 
+// ----- Utilizzo certificati EXAMPLE --------------------------------
+// static void web_tls_use_builtin(void){
+//     web_tls_clear_dynamic();
+//     s_tls_material.cert = (const uint8_t*)builtin_cert_pem;
+//     s_tls_material.cert_len = sizeof(builtin_cert_pem);
+//     s_tls_material.key = (const uint8_t*)builtin_key_pem;
+//     s_tls_material.key_len = sizeof(builtin_key_pem);
+//     s_tls_material.source = WEB_TLS_SRC_BUILTIN;
+
+//     mbedtls_x509_crt crt; mbedtls_x509_crt_init(&crt);
+//     if (mbedtls_x509_crt_parse(&crt, (const unsigned char*)builtin_cert_pem, sizeof(builtin_cert_pem)) == 0){
+//         web_tls_state_set_active_from_crt(&crt, WEB_TLS_SRC_BUILTIN);
+//         if (!s_web_tls_state.custom_available){
+//             web_tls_state_reset_custom();
+//         }
+//     }
+//     mbedtls_x509_crt_free(&crt);
+// }
+
+// ----- Utilizzo certificati REALI ----------------------------------
 static void web_tls_use_builtin(void){
     web_tls_clear_dynamic();
-    s_tls_material.cert = (const uint8_t*)builtin_cert_pem;
-    s_tls_material.cert_len = sizeof(builtin_cert_pem);
-    s_tls_material.key = (const uint8_t*)builtin_key_pem;
-    s_tls_material.key_len = sizeof(builtin_key_pem);
+
+    size_t cert_len = (size_t)(certs_server_cert_pem_end - certs_server_cert_pem_start);
+    size_t key_len = (size_t)(certs_server_key_pem_end - certs_server_key_pem_start);
+
+    uint8_t *cert = NULL;
+    uint8_t *key = NULL;
+
+    if (cert_len > 0){
+        cert = malloc(cert_len + 1);
+    }
+    if (key_len > 0){
+        key = malloc(key_len + 1);
+    }
+
+    if (!cert || !key){
+        ESP_LOGE(TAG, "TLS: unable to allocate buffers for builtin material");
+        free(cert);
+        free(key);
+        s_tls_material.cert = (const uint8_t*)builtin_cert_pem;
+        s_tls_material.cert_len = sizeof(builtin_cert_pem);
+        s_tls_material.key = (const uint8_t*)builtin_key_pem;
+        s_tls_material.key_len = sizeof(builtin_key_pem);
+    } else {
+        memcpy(cert, certs_server_cert_pem_start, cert_len);
+        cert[cert_len] = '\0';
+        memcpy(key, certs_server_key_pem_start, key_len);
+        key[key_len] = '\0';
+
+        s_tls_material.dyn_cert = cert;
+        s_tls_material.dyn_cert_len = cert_len + 1;
+        s_tls_material.dyn_key = key;
+        s_tls_material.dyn_key_len = key_len + 1;
+        s_tls_material.cert = s_tls_material.dyn_cert;
+        s_tls_material.cert_len = s_tls_material.dyn_cert_len;
+        s_tls_material.key = s_tls_material.dyn_key;
+        s_tls_material.key_len = s_tls_material.dyn_key_len;
+    }
     s_tls_material.source = WEB_TLS_SRC_BUILTIN;
 
-    mbedtls_x509_crt crt; mbedtls_x509_crt_init(&crt);
-    if (mbedtls_x509_crt_parse(&crt, (const unsigned char*)builtin_cert_pem, sizeof(builtin_cert_pem)) == 0){
+    mbedtls_x509_crt crt; 
+    mbedtls_x509_crt_init(&crt);
+    if (mbedtls_x509_crt_parse(&crt, (const unsigned char*)s_tls_material.cert, s_tls_material.cert_len) == 0){
         web_tls_state_set_active_from_crt(&crt, WEB_TLS_SRC_BUILTIN);
-        if (!s_web_tls_state.custom_available){
+        if (!s_web_tls_state.custom_available) {
             web_tls_state_reset_custom();
         }
     }
     mbedtls_x509_crt_free(&crt);
 }
+
 
 static int web_tls_check_pk_pair(const mbedtls_pk_context* pub, const mbedtls_pk_context* prv){
     if (!pub || !prv) return MBEDTLS_ERR_PK_BAD_INPUT_DATA;
