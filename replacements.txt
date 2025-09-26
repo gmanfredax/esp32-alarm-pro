@@ -1,0 +1,4 @@
+regex:(?s)"[REMOVED CERTIFICATE]\\n?"==>""
+regex:(?s)"-----BEGIN (?:RSA |EC )?PRIVATE KEY-----.*?-----END (?:RSA |EC )?PRIVATE KEY-----\\n?"==>""
+regex:(?s)[REMOVED CERTIFICATE]==>[REMOVED CERTIFICATE]
+regex:(?s)-----BEGIN (?:RSA |EC )?PRIVATE KEY-----.+?-----END (?:RSA |EC )?PRIVATE KEY-----==>[REMOVED KEY]
