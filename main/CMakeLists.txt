@@ -4,6 +4,7 @@ file(GLOB MAIN_SRCS "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "w
 set(MAIN_EMBED_TXTFILES
     "certs/server_cert.pem"
     "certs/server_key.pem"
+    "certs/broker_ca.pem"
 )
 
 set(MQTT_BROKER_CA_RELATIVE "certs/broker_ca.pem")

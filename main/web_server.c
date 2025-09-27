@@ -74,6 +74,8 @@ extern const unsigned char certs_server_cert_pem_start[] asm("_binary_server_cer
 extern const unsigned char certs_server_cert_pem_end[]   asm("_binary_server_cert_pem_end");
 extern const unsigned char certs_server_key_pem_start[]  asm("_binary_server_key_pem_start");
 extern const unsigned char certs_server_key_pem_end[]    asm("_binary_server_key_pem_end");
+extern const uint8_t certs_broker_ca_pem_start[] asm("_binary_broker_ca_pem_start");
+extern const uint8_t certs_broker_ca_pem_end[]   asm("_binary_broker_ca_pem_end");
 
 extern esp_err_t can_master_request_scan(bool *started);
 
@@ -1541,6 +1543,8 @@ static esp_err_t sys_mqtt_test_post(httpd_req_t* req)
         .transport_errno = 0,
     };
 
+    size_t ca_len = (size_t)(certs_broker_ca_pem_end - certs_broker_ca_pem_start);
+
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = uri,
         .session.keepalive = keepalive,
@@ -1549,6 +1553,18 @@ static esp_err_t sys_mqtt_test_post(httpd_req_t* req)
     cfg.credentials.client_id = cid[0] ? cid : NULL;
     cfg.credentials.username = user[0] ? user : NULL;
     cfg.credentials.authentication.password = pass[0] ? pass : NULL;
+
+    if (ca_len == 0) {
+        vEventGroupDelete(events);
+        cJSON* root = cJSON_CreateObject();
+        if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+        cJSON_AddBoolToObject(root, "success", false);
+        cJSON_AddStringToObject(root, "error", "Certificato CA MQTT mancante nel firmware");
+        return json_reply_cjson(req, root);
+    }
+
+    cfg.broker.verification.certificate = (const char *)certs_broker_ca_pem_start;
+    cfg.broker.verification.certificate_len = ca_len;
 
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&cfg);
     if (!client){
