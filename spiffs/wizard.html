@@ -374,10 +374,12 @@
             <input id="mqtt_keep" name="keepalive" type="number" min="10" max="600" step="5" value="60" />
           </div>
           <p class="summary-footer">Assicurati che il broker accetti connessioni dalla rete della centrale.</p>
+          <button id="mqttTestBtn" type="button" class="btn outline">Esegui test connessione</button>
           <div class="wizard-actions">
-            <button type="button" class="btn outline" data-prev="expansions">Indietro</button>
+            <button type="button" class="btn outline" data-prev="expansions">Indietro</button>            
             <button id="mqttNext" type="submit" class="btn primary">Salva e continua</button>
           </div>
+          <p id="mqttTestStatus" class="wizard-message hidden" role="status"></p>
         </form>
       </section>
 
