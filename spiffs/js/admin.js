@@ -7,7 +7,8 @@
   (function installAuthFetchShim(){
     const _fetch = window.fetch;
     window.fetch = (input, init = {}) => {
-      const headers = new Headers(init.headers || {});
+      const { __skipAuthRedirect, ...rest } = init || {};
+      const headers = new Headers(rest.headers || {});
       const t = (()=>{
         try {
           return (
@@ -22,10 +23,12 @@
         }
       })();
       if (t && !headers.has("Authorization")) headers.set("Authorization", "Bearer " + t);
-      const creds = init.credentials ? init.credentials : "same-origin";
-      return _fetch(input, { ...init, headers, credentials: creds }).then(resp => {
-        if (resp.status === 401) { location.replace("/login.html"); }
-        else if (resp.status === 403) { location.replace("/403.html"); }
+      const creds = rest.credentials ? rest.credentials : "same-origin";
+      return _fetch(input, { ...rest, headers, credentials: creds }).then(resp => {
+        if (!__skipAuthRedirect){
+          if (resp.status === 401) { location.replace("/login.html"); }
+          else if (resp.status === 403) { location.replace("/403.html"); }
+        }
         return resp;
       });
     };
@@ -61,8 +64,13 @@
       throw new Error("Risposta JSON non valida");
     }
   }
-  async function apiPost(url, body){
-    const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: body!=null?JSON.stringify(body):undefined });
+  async function apiPost(url, body, opts = {}){
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body!=null ? JSON.stringify(body) : undefined,
+      __skipAuthRedirect: opts.skipAuthRedirect === true
+    });
     if (r.status === 401) { needLogin(); throw new Error("401"); }
     if (!r.ok) throw new Error(await r.text());
     try { return await r.json(); } catch { return {}; }
@@ -204,10 +212,14 @@
       btn.addEventListener("click", () => {
         const id = btn.getAttribute("data-view");
         $$(".side button").forEach(b => b.classList.toggle("active", b===btn));
-        $$(".view").forEach(v => v.classList.toggle("active", v.id === id));
+        if (id !== "view-mqtt") maskMqttPassword();
       });
     });
   }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) maskMqttPassword();
+  });
 
   function getExpansionItems(){
     const items = Array.isArray(expansionsState.items) ? expansionsState.items : [];
@@ -794,11 +806,156 @@
         overlay.remove();
       }
     });
-}
+  }
 
 
   function attachNewUser(){
     $("#btnNewUser")?.addEventListener("click", newUserModal);
+  }
+
+  const MQTT_PASS_PLACEHOLDER = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022";
+  const MQTT_REVEAL_TIMEOUT_MS = 30000;
+  let mqttRevealTimer = null;
+
+  function getMqttPassField(){ return $("#mq_pass"); }
+
+  function clearMqttRevealTimer(){
+    if (mqttRevealTimer){
+      clearTimeout(mqttRevealTimer);
+      mqttRevealTimer = null;
+    }
+  }
+
+  function initMqttPasswordField(hasSecret){
+    const field = getMqttPassField();
+    if (!field) return;
+    clearMqttRevealTimer();
+    field.type = "password";
+    field.dataset.hasSecret = hasSecret ? "1" : "0";
+    field.dataset.userEdited = "0";
+    field.dataset.visible = "0";
+    if (hasSecret){
+      field.value = MQTT_PASS_PLACEHOLDER;
+      field.dataset.masked = "1";
+    } else {
+      field.value = "";
+      field.dataset.masked = "0";
+    }
+    if (!field._mqttBound){
+      field.addEventListener("input", () => {
+        field.dataset.userEdited = "1";
+        field.dataset.hasSecret = field.value ? "1" : "0";
+        field.dataset.masked = "0";
+        field.dataset.visible = "0";
+        field.type = "password";
+        clearMqttRevealTimer();
+      });
+      field.addEventListener("blur", () => {
+        if (!field.value){ field.dataset.hasSecret = "0"; }
+      });
+      field._mqttBound = true;
+    }
+  }
+
+  function maskMqttPassword(){
+    const field = getMqttPassField();
+    if (!field) return;
+    clearMqttRevealTimer();
+    field.type = "password";
+    field.dataset.visible = "0";
+    if (field.dataset.userEdited === "1") return;
+    if (field.dataset.hasSecret === "1"){
+      field.value = MQTT_PASS_PLACEHOLDER;
+      field.dataset.masked = "1";
+    } else {
+      field.value = "";
+      field.dataset.masked = "0";
+    }
+  }
+
+  function revealMqttPassword(secret){
+    const field = getMqttPassField();
+    if (!field) return;
+    clearMqttRevealTimer();
+    field.type = "text";
+    field.value = secret || "";
+    field.dataset.hasSecret = secret ? "1" : "0";
+    field.dataset.masked = "0";
+    field.dataset.visible = "1";
+    field.dataset.userEdited = "0";
+    mqttRevealTimer = setTimeout(() => {
+      maskMqttPassword();
+    }, MQTT_REVEAL_TIMEOUT_MS);
+  }
+
+  function ensureMqttRevealButton(){
+    const saveBtn = $("#btnMqttSave");
+    if (!saveBtn) return;
+    let revealBtn = $("#btnMqttReveal");
+    if (!revealBtn){
+      revealBtn = document.createElement("button");
+      revealBtn.type = "button";
+      revealBtn.id = "btnMqttReveal";
+      revealBtn.className = "btn";
+      revealBtn.textContent = "Mostra password";
+      revealBtn.style.marginRight = ".5rem";
+      saveBtn.parentElement?.insertBefore(revealBtn, saveBtn);
+    }
+    if (!revealBtn._bound){
+      revealBtn.addEventListener("click", openMqttRevealModal);
+      revealBtn._bound = true;
+    }
+  }
+
+  function openMqttRevealModal(){
+    modal(`
+      <div class="card-head row" style="justify-content:space-between;align-items:center">
+        <h3>Mostra password MQTT</h3>
+        <button class="btn" id="mqttRevealClose" type="button">Chiudi</button>
+      </div>
+      <form class="form" id="mqttRevealForm">
+        <div class="field"><span>Password amministratore</span><input id="mqttRevealAdminPass" type="password" autocomplete="current-password" required></div>
+        <small class="muted">La password verrà mostrata per 30 secondi oppure finché non lasci questa vista.</small>
+        <div id="mqttRevealError" class="muted" style="color:#ef4444;margin-top:.4rem;display:none"></div>
+        <div class="row" style="justify-content:flex-end;margin-top:.8rem;gap:.5rem">
+          <button class="btn" type="submit" id="mqttRevealSubmit">Mostra</button>
+        </div>
+      </form>
+    `);
+    $("#mqttRevealClose")?.addEventListener("click", closeModal);
+    const form = $("#mqttRevealForm");
+    const input = $("#mqttRevealAdminPass");
+    const errorEl = $("#mqttRevealError");
+    const submitBtn = $("#mqttRevealSubmit");
+    input?.focus();
+    form?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      if (!input) return;
+      const adminPw = input.value;
+      if (!adminPw){
+        if (errorEl){ errorEl.textContent = "Inserisci la password amministratore."; errorEl.style.display = "block"; }
+        input.focus();
+        return;
+      }
+      if (errorEl) errorEl.style.display = "none";
+      if (submitBtn){ submitBtn.disabled = true; submitBtn.textContent = "Verifica…"; }
+      try {
+        const resp = await apiPost("/api/sys/mqtt/reveal", { password: adminPw }, { skipAuthRedirect: true });
+        const secret = resp?.pass ?? "";
+        revealMqttPassword(secret);
+        const field = getMqttPassField();
+        if (field) field.dataset.hasSecret = secret ? "1" : "0";
+        closeModal();
+        toast("Password MQTT visibile per 30 secondi");
+      } catch (err){
+        let msg = err?.message || "Errore";
+        if (msg.toLowerCase().includes("bad pass")) msg = "Password amministratore non corretta.";
+        if (errorEl){ errorEl.textContent = msg; errorEl.style.display = "block"; }
+        input.select();
+      } finally {
+        if (submitBtn){ submitBtn.disabled = false; submitBtn.textContent = "Mostra"; }
+      }
+    });
   }
 
   // ========== RETE / MQTT (placeholder salva)
@@ -841,20 +998,37 @@
       $("#mq_uri")  && ($("#mq_uri").value  = c.uri  || "");
       $("#mq_cid")  && ($("#mq_cid").value  = c.cid  || "");
       $("#mq_user") && ($("#mq_user").value = c.user || "");
-      $("#mq_pass") && ($("#mq_pass").value = c.pass || "");
+      const hasSecret = (typeof c.has_pass === "boolean") ? c.has_pass : (typeof c.pass === "string" && c.pass.length > 0);
+      initMqttPasswordField(!!hasSecret);
       $("#mq_keep") && ($("#mq_keep").value = (c.keepalive ?? 60));
     }catch(e){ toast("Errore caricando MQTT: " + e.message, false); }
-    $("#btnMqttSave")?.addEventListener("click", async ()=>{
-      const body = {
-        uri:  $("#mq_uri")?.value  || "",
-        cid:  $("#mq_cid")?.value  || "",
-        user: $("#mq_user")?.value || "",
-        pass: $("#mq_pass")?.value || "",
-        keepalive: parseInt($("#mq_keep")?.value || "60", 10) || 60,
-      };
-      try{ await apiPost("/api/sys/mqtt", body); toast("MQTT salvato"); }
-      catch(e){ toast("Errore salvataggio MQTT: " + e.message, false); }
-    });
+    ensureMqttRevealButton();
+    const saveBtn = $("#btnMqttSave");
+    if (saveBtn && !saveBtn._mqttBound){
+      saveBtn.addEventListener("click", async ()=>{
+        const body = {
+          uri:  $("#mq_uri")?.value  || "",
+          cid:  $("#mq_cid")?.value  || "",
+          user: $("#mq_user")?.value || "",
+          keepalive: parseInt($("#mq_keep")?.value || "60", 10) || 60,
+        };
+        const passField = getMqttPassField();
+        const passEdited = passField?.dataset.userEdited === "1";
+        if (passEdited){
+          body.pass = passField?.value ?? "";
+        }
+        try{
+          await apiPost("/api/sys/mqtt", body);
+          if (passField){
+            if (passEdited){ passField.dataset.hasSecret = body.pass ? "1" : "0"; }
+            initMqttPasswordField(passField.dataset.hasSecret === "1");
+          }
+          toast("MQTT salvato");
+        }
+        catch(e){ toast("Errore salvataggio MQTT: " + e.message, false); }
+      });
+      saveBtn._mqttBound = true;
+    }
   }
 
   // ---- Wrapper come da tua init() originale

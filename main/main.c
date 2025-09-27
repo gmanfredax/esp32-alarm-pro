@@ -50,7 +50,7 @@
 static void sntp_start_and_wait(void){
     // API compatibile con IDF “classico” (LWIP SNTP)
     sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "pool.ntp.org");          // puoi usare anche "time.google.com"
+    sntp_setservername(0, "time.google.com");          // puoi usare anche "time.google.com"
     sntp_init();
 
     // Attendi che time() diventi plausibile (> 2020-01-01)
@@ -375,7 +375,9 @@ static void system_main_task(void *arg)
              device_secret[4],device_secret[5],device_secret[6],device_secret[7]);
     
     esp_err_t eth_ret = eth_start();
-    if (eth_ret != ESP_OK) ESP_LOGW(TAG, "Ethernet not available. Continuing without it...");
+    if (eth_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Ethernet not available. Continuing without it...");
+    }
     ESP_ERROR_CHECK(auth_init());
 // [debug disattivato] loop dump link rimosso per build pulita
 
@@ -391,7 +393,25 @@ static void system_main_task(void *arg)
 
     // reset_buttons_init();
     // ESP_LOGI(TAG, "Pulsanti HW reset su GPIO %d e %d", PIN_HW_RESET_BTN_A, PIN_HW_RESET_BTN_B);
-    sntp_start_and_wait();
+    bool eth_ready_for_time = false;
+    if (eth_ret == ESP_OK) {
+        const TickType_t wait_timeout = pdMS_TO_TICKS(15000);
+        esp_err_t wait_res = eth_wait_for_ip(wait_timeout);
+        if (wait_res == ESP_OK) {
+            eth_ready_for_time = true;
+            ESP_LOGI(TAG, "Ethernet ready, starting SNTP");
+        } else if (wait_res == ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "Timeout waiting for Ethernet IP (%lu ms)",
+                     (unsigned long)(wait_timeout * portTICK_PERIOD_MS));
+        } else {
+            ESP_LOGW(TAG, "Failed waiting for Ethernet IP: %s", esp_err_to_name(wait_res));
+        }
+    }
+    if (eth_ready_for_time) {
+        sntp_start_and_wait();
+    } else {
+        ESP_LOGW(TAG, "Skipping SNTP start because Ethernet is not ready");
+    }
     ESP_ERROR_CHECK(mqtt_start());
 
     alarm_init();

@@ -6,6 +6,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 
 #include "driver/gpio.h"
 
@@ -38,6 +39,9 @@ static esp_eth_handle_t s_eth = NULL;
 static esp_netif_t *s_eth_netif = NULL;
 static esp_eth_netif_glue_handle_t s_glue = NULL;
 static volatile bool s_eth_link_up = false; // aggiornato dagli eventi
+static EventGroupHandle_t s_eth_event_group = NULL;
+
+#define ETH_EVENT_BIT_GOT_IP BIT0
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Per sicurezza: lascia i pad RMII “puliti”: niente pull e direzione disabilitata
@@ -76,6 +80,9 @@ static void on_eth_event(void *arg, esp_event_base_t base, int32_t id, void *dat
         break;
     case ETHERNET_EVENT_DISCONNECTED:
         s_eth_link_up = false;
+        if (s_eth_event_group) {
+            xEventGroupClearBits(s_eth_event_group, ETH_EVENT_BIT_GOT_IP);
+        }
         ESP_LOGW(TAG, "Ethernet LINK DOWN");
         break;
     case ETHERNET_EVENT_STOP:
@@ -93,6 +100,9 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
         const esp_netif_ip_info_t *ip = &event->ip_info;
         ESP_LOGI(TAG, "Got IP: " IPSTR ", Mask: " IPSTR ", GW: " IPSTR,
                  IP2STR(&ip->ip), IP2STR(&ip->netmask), IP2STR(&ip->gw));
+        if (s_eth_event_group) {
+            xEventGroupSetBits(s_eth_event_group, ETH_EVENT_BIT_GOT_IP);
+        }
     }
 }
 
@@ -100,6 +110,15 @@ static void on_ip_event(void *arg, esp_event_base_t base, int32_t id, void *data
 esp_err_t eth_start(void)
 {
     rmii_pins_release(); // IMPORTANTISSIMO: i pin RMII non devono avere pulls
+
+    if (!s_eth_event_group) {
+        s_eth_event_group = xEventGroupCreate();
+        if (!s_eth_event_group) {
+            ESP_LOGE(TAG, "Failed to create Ethernet event group");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    xEventGroupClearBits(s_eth_event_group, ETH_EVENT_BIT_GOT_IP);
 
     // Alimentazione PHY (power pin)
     gpio_config_t pwr = {
@@ -211,6 +230,9 @@ void eth_stop(void)
     }
     gpio_set_level(ETH_POWER_GPIO, 0);
     s_eth_link_up = false;
+    if (s_eth_event_group) {
+        xEventGroupClearBits(s_eth_event_group, ETH_EVENT_BIT_GOT_IP);
+    }
     ESP_LOGI(TAG, "Ethernet stopped");
 }
 
@@ -241,4 +263,21 @@ void eth_dump_link_once(void)
 esp_netif_t* eth_get_netif(void)
 {
     return s_eth_netif;
+}
+
+esp_err_t eth_wait_for_ip(TickType_t timeout)
+{
+    if (!s_eth_event_group) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    EventBits_t bits = xEventGroupWaitBits(
+        s_eth_event_group,
+        ETH_EVENT_BIT_GOT_IP,
+        pdFALSE,
+        pdTRUE,
+        timeout);
+    if (bits & ETH_EVENT_BIT_GOT_IP) {
+        return ESP_OK;
+    }
+    return ESP_ERR_TIMEOUT;
 }

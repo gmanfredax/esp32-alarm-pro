@@ -1579,12 +1579,55 @@ static esp_err_t sys_mqtt_get(httpd_req_t* req){
     cJSON_AddStringToObject(root, "uri", cfg.uri);
     cJSON_AddStringToObject(root, "cid", cfg.cid);
     cJSON_AddStringToObject(root, "user", cfg.user);
-    cJSON_AddStringToObject(root, "pass", cfg.pass);
+    bool has_pass = cfg.pass[0] != '\0';
+    cJSON_AddStringToObject(root, "pass", has_pass ? "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022" : "");
+    cJSON_AddBoolToObject(root, "has_pass", has_pass);
     cJSON_AddNumberToObject(root, "keepalive", cfg.keepalive);
     cJSON_AddStringToObject(root, "device_id", cfg.cid);
     cJSON_AddStringToObject(root, "default_uri", CONFIG_APP_CLOUD_MQTT_URI);
     cJSON_AddNumberToObject(root, "default_keepalive", CONFIG_APP_CLOUD_KEEPALIVE);
     return json_reply_cjson(req, root);
+}
+
+static esp_err_t sys_mqtt_reveal_post(httpd_req_t* req){
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+
+    char admin[32] = {0};
+    if (!current_user_from_req(req, admin, sizeof(admin))){
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    }
+
+    char body[128]; size_t bl = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK){
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body"), ESP_FAIL;
+    }
+
+    cJSON* root = cJSON_ParseWithLength(body, bl);
+    if (!root){
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json"), ESP_FAIL;
+    }
+
+    const cJSON* jpass = cJSON_GetObjectItemCaseSensitive(root, "password");
+    const char* admin_pass = (cJSON_IsString(jpass) && jpass->valuestring) ? jpass->valuestring : NULL;
+    if (!admin_pass || admin_pass[0] == '\0'){
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "password"), ESP_FAIL;
+    }
+
+    bool ok = auth_verify_password(admin, admin_pass);
+    cJSON_Delete(root);
+    if (!ok){
+        return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "bad pass"), ESP_FAIL;
+    }
+
+    provisioning_mqtt_config_t cfg; provisioning_load_mqtt(&cfg);
+    cJSON* resp = cJSON_CreateObject();
+    if (!resp){
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    }
+    cJSON_AddStringToObject(resp, "pass", cfg.pass);
+    cJSON_AddBoolToObject(resp, "has_pass", cfg.pass[0] != '\0');
+    return json_reply_cjson(req, resp);
 }
 
 static esp_err_t sys_mqtt_post(httpd_req_t* req){
@@ -2315,6 +2358,30 @@ static __attribute__((unused)) esp_err_t user_post_totp_disable(httpd_req_t* req
     return json_bool(req, true);
 }
 
+static bool normalize_username_for_api(char *username)
+{
+    if (!username) {
+        return false;
+    }
+
+    size_t len = strlen(username);
+    while (len > 0 && (username[len - 1] == '\n' || username[len - 1] == '\r')) {
+        username[--len] = '\0';
+    }
+
+    if (!username[0]) {
+        return false;
+    }
+
+    if ((username[0] == 'u' || username[0] == 'U') && username[1] == '_') {
+        const char *src = username + 2;
+        size_t new_len = strlen(src);
+        memmove(username, src, new_len + 1);
+    }
+
+    return username[0] != '\0';
+}
+
 static esp_err_t users_list_get(httpd_req_t* req){
     if(!check_bearer(req) || !is_admin_user(req)) return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden"), ESP_FAIL;
     char csv[256]={0};
@@ -2325,6 +2392,7 @@ static esp_err_t users_list_get(httpd_req_t* req){
     while(*p){
         char u[32]={0}; int i=0; while(*p && *p!=',' && i<31) u[i++]=*p++; if(*p==',') p++;
         if(!u[0]) continue;
+        if(!normalize_username_for_api(u)) continue;
         off += snprintf(buf+off, sizeof(buf)-off, "%s\"%s\"", first?"":",", u);
         first=false;
     }
@@ -2505,13 +2573,19 @@ static esp_err_t users_admin_list_get(httpd_req_t* req){
         while(*p && *p!=',' && i<(int)sizeof(username)-1) username[i++]=*p++;
         if(*p==',') p++;
         if(!username[0]) continue;
+        if(!normalize_username_for_api(username)) continue;
+
+        const char *raw_username = username;
+        const char *login_ptr = (raw_username[0]=='u' && raw_username[1]=='_') ? raw_username+2 : raw_username;
+        char login[32]={0};
+        strlcpy(login, login_ptr, sizeof(login));
 
         char first_name[32]={0}, last_name[32]={0};
-        auth_get_user_name(username, first_name, sizeof(first_name), last_name, sizeof(last_name));
-        bool has_pin = auth_has_pin(username);
+        auth_get_user_name(login, first_name, sizeof(first_name), last_name, sizeof(last_name));
+        bool has_pin = auth_has_pin(login);
 
         uint8_t uid[16];
-        int uidlen = auth_get_rfid_uid(username, uid, sizeof(uid));
+        int uidlen = auth_get_rfid_uid(login, uid, sizeof(uid));
         bool has_rfid = uidlen > 0;
         char uid_hex[40]={0};
         if (has_rfid) {
@@ -2526,11 +2600,11 @@ static esp_err_t users_admin_list_get(httpd_req_t* req){
             }
         }
 
-        bool totp_enabled = auth_totp_enabled(username);
+        bool totp_enabled = auth_totp_enabled(login);
 
         cJSON *user = cJSON_CreateObject();
         if (!user ||
-            !cJSON_AddStringToObject(user, "username", username) ||
+            !cJSON_AddStringToObject(user, "username", login) ||
             !cJSON_AddStringToObject(user, "first_name", first_name) ||
             !cJSON_AddStringToObject(user, "last_name", last_name) ||
             !cJSON_AddBoolToObject(user, "has_pin", has_pin) ||
@@ -3162,6 +3236,7 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/sys/net",            .method = HTTP_POST, .handler = sys_net_post },
     { .uri = "/api/sys/mqtt",           .method = HTTP_GET,  .handler = sys_mqtt_get },
     { .uri = "/api/sys/mqtt",           .method = HTTP_POST, .handler = sys_mqtt_post },
+    { .uri = "/api/sys/mqtt/reveal",    .method = HTTP_POST, .handler = sys_mqtt_reveal_post },
     { .uri = "/api/sys/mqtt/test",      .method = HTTP_POST, .handler = sys_mqtt_test_post },
     { .uri = "/api/sys/cloudflare",     .method = HTTP_GET,  .handler = sys_cloudflare_get },
     { .uri = "/api/sys/cloudflare",     .method = HTTP_POST, .handler = sys_cloudflare_post },
