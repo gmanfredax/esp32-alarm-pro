@@ -1445,8 +1445,8 @@ static void provisioning_load_net(provisioning_net_config_t* cfg){
     esp_netif_t* netif = provisioning_get_primary_netif();
     if (!netif) return;
 
-    const char* hostname = esp_netif_get_hostname(netif);
-    if (hostname && hostname[0]){
+    const char *hostname = NULL;
+    if (esp_netif_get_hostname(netif, &hostname) == ESP_OK && hostname && hostname[0]) {
         strlcpy(cfg->hostname, hostname, sizeof(cfg->hostname));
     }
 
@@ -1461,7 +1461,7 @@ static void provisioning_load_net(provisioning_net_config_t* cfg){
 
     esp_netif_dns_info_t dns = {0};
     if (esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK && dns.ip.type == IPADDR_TYPE_V4){
-        ip4addr_ntoa_r(&dns.ip.u_addr.ip4, cfg->dns, sizeof(cfg->dns));
+        ip4addr_ntoa_r((const ip4_addr_t*)&dns.ip.u_addr.ip4, cfg->dns, sizeof(cfg->dns));
     }
 }
 
@@ -3186,7 +3186,7 @@ static void register_uri_set(httpd_handle_t srv, const httpd_uri_t *routes, size
 static esp_err_t start_web(void){
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 12288;
-    cfg.max_uri_handlers = 60;
+    cfg.max_uri_handlers = 80;
     cfg.lru_purge_enable = true;
     cfg.server_port = 443;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
