@@ -54,7 +54,19 @@ function computeOriginForSuffix(suffix){
     return `${protocol}//${host}${port}`;
   }
   const lowerHost = host.toLowerCase();
-  const isLocal = lowerHost === 'localhost' || lowerHost.startsWith('127.') || lowerHost.endsWith('.local');
+  const localSuffixes = ['.local', '.lan', '.home'];
+  const isLanHostname = localSuffixes.some((suffix) => lowerHost.endsWith(suffix));
+  const segments = host.split('.');
+  const isIPv4 = segments.length === 4 && segments.every((segment) => {
+    if (segment === '' || /[^0-9]/.test(segment)) return false;
+    const value = Number(segment);
+    return Number.isInteger(value) && value >= 0 && value <= 255;
+  });
+  const isLocal =
+    lowerHost === 'localhost' ||
+    lowerHost.startsWith('127.') ||
+    isLanHostname ||
+    isIPv4;
   if (isLocal) {
     return `${protocol}//${host}${port}`;
   }

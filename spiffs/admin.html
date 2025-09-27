@@ -18,6 +18,16 @@
     .view.active{display:block}
     .muted{color:var(--muted)}
     .hidden{display:none}
+    .expansion-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:.5rem}
+    .expansion-item{display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem;padding:.75rem .9rem;background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:10px}
+    .expansion-info{min-width:0;flex:1}
+    .expansion-title{font-weight:600;margin-bottom:.2rem;word-break:break-word}
+    .expansion-meta{font-size:.85rem;color:var(--muted);display:flex;flex-wrap:wrap;gap:.35rem}
+    .expansion-actions{display:flex;flex-wrap:wrap;gap:.4rem;align-items:center;justify-content:flex-end}
+    .expansion-empty{padding:.6rem 0;color:var(--muted);font-style:italic}
+    .status-line{margin:.6rem 0 0;font-size:.9rem}
+    .status-line.error{color:#f87171}
+    .status-line.success{color:#34d399}
   </style>
 </head>
 <body>
@@ -68,6 +78,7 @@
             <li><button class="btn w-100" data-view="view-network">Rete</button></li>
             <li><button class="btn w-100" data-view="view-mqtt">MQTT</button></li>
             <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
+            <li><button class="btn w-100" data-view="view-expansions">Espansioni CAN</button></li>
           </ul>
         </aside>
 
@@ -158,6 +169,21 @@
                 </div>
               </form>
               <div id="websecFeedback" class="muted" style="margin-top:.4rem;font-size:.85rem"></div>
+            </div>
+          </section>
+          <!-- ESPANSIONI CAN -->
+          <section id="view-expansions" class="view">
+            <div class="card">
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap">
+                <h3>Espansioni CAN</h3>
+                <div class="row" style="gap:.4rem;flex-wrap:wrap">
+                  <button class="btn outline" id="adminExpansionRefreshBtn" type="button">Aggiorna elenco</button>
+                  <button class="btn" id="adminExpansionScanBtn" type="button">+ Scansiona nuove schede</button>
+                </div>
+              </div>
+              <p id="adminExpansionStatus" class="status-line muted hidden" role="status"></p>
+              <ul id="adminExpansionList" class="expansion-list"></ul>
+              <p id="adminExpansionEmpty" class="expansion-empty hidden">Nessuna scheda rilevata.</p>
             </div>
           </section>
         </section>

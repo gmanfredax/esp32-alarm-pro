@@ -52,6 +52,7 @@ esp_err_t roster_reset(void);
 esp_err_t roster_update_node(uint8_t node_id, const roster_node_info_t *info, bool *out_is_new);
 esp_err_t roster_mark_online(uint8_t node_id, uint64_t now_ms, bool *out_is_new);
 esp_err_t roster_mark_offline(uint8_t node_id, uint64_t now_ms);
+esp_err_t roster_forget_node(uint8_t node_id);
 esp_err_t roster_set_identify(uint8_t node_id, bool active, bool *out_changed);
 bool roster_get_identify(uint8_t node_id, bool *out_active);
 bool roster_node_exists(uint8_t node_id);

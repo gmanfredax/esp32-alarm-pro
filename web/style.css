@@ -64,6 +64,9 @@ body.modal-open { overflow: hidden; }
 /* User dropdown */
 .user.user-menu { position: relative; }
 .user-btn { background: transparent; border: 0; color: var(--fg,#cfe6ff); display:flex; gap:.4rem; align-items:center; }
+#userLabel{display:inline-flex;align-items:center;gap:.45rem;}
+#userLabel .user-name{font-weight:600;letter-spacing:.2px;}
+#userLabel .user-role{font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;}
 .dropdown {
   position: absolute; right: 0; top: calc(100% + .5rem);
   min-width: 200px; background: var(--panel-bg,#0f1824);

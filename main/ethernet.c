@@ -237,3 +237,8 @@ void eth_dump_link_once(void)
     ESP_LOGI(TAG, "Speed: (not available in this IDF build)");
 #endif
 }
+
+esp_netif_t* eth_get_netif(void)
+{
+    return s_eth_netif;
+}

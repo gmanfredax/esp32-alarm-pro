@@ -20,12 +20,12 @@ body{
 }
 
 body.auth-body{display:flex;flex-direction:column;min-height:100vh;}
-.auth-main{flex:1 0 auto;display:flex;align-items:center;justify-content:center;padding:6vh 0;}
+.auth-main{flex:1 0 auto;display:flex;/*align-items:center;*/justify-content:center;padding:6vh 0;}
 .site-header.minimal{position:static;background:transparent;border-bottom:0;box-shadow:none;}
 .site-header.minimal .head-inner{padding:18px 0;}
 .site-header.minimal .brand-name{font-size:1.1rem;}
 
-.app{min-height:100vh;display:flex;flex-direction:column;}
+.app{min-height:100vh;}
 .app .main{flex:1 0 auto;}
 
 .muted{color:var(--muted);}
@@ -64,6 +64,9 @@ body.modal-open { overflow: hidden; }
 /* User dropdown */
 .user.user-menu { position: relative; }
 .user-btn { background: transparent; border: 0; color: var(--fg,#cfe6ff); display:flex; gap:.4rem; align-items:center; }
+#userLabel{display:inline-flex;align-items:center;gap:.45rem;}
+#userLabel .user-name{font-weight:600;letter-spacing:.2px;}
+#userLabel .user-role{font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;}
 .dropdown {
   position: absolute; right: 0; top: calc(100% + .5rem);
   min-width: 200px; background: var(--panel-bg,#0f1824);
@@ -85,15 +88,17 @@ body.modal-open { overflow: hidden; }
 /* modali generiche */
 .modal-overlay{position:fixed; inset:0; display:flex; align-items:center; justify-content:center; z-index:9999; backdrop-filter:blur(3px); background:rgba(0,0,0,.15)}
 .modal{min-width:340px; max-width:min(92vw,520px)}
+.modal.zones-config-modal{max-width:min(96vw,760px);}
+body.modal-open{overflow:hidden;}
 .form .row{display:flex; gap:.5rem; align-items:center}
 .form .field{display:flex; flex-direction:column; gap:.35rem; margin:.35rem 0}
 .form .field span{font-size:.85rem; opacity:.8}
 
 /* pannello login centrato */
 .login-panel {
-  position: fixed;
+  /*position: fixed;
   inset: 0;
-  display: grid;
+  display: grid;*/
   place-items: end center;            /* in basso come nel tuo mock */
   padding: 2rem 1rem;
   z-index: 1000;
@@ -196,6 +201,17 @@ body.modal-open { overflow: hidden; }
 
 /* .zones-grid{display:ruby;grid-template-columns:repeat(2,1fr);gap:12px} */
 .zones-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
+.board-sections{display:flex;flex-direction:column;gap:1.5rem}
+.board-section{display:flex;flex-direction:column;gap:.85rem}
+.board-header{display:flex;align-items:center;justify-content:space-between;gap:.75rem}
+.board-header h4{margin:0;font-size:1.05rem;letter-spacing:.35px}
+.board-meta{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.board-status{display:inline-flex;align-items:center;padding:.2rem .6rem;border-radius:999px;font-size:.75rem;letter-spacing:.2px;border:1px solid rgba(148,163,184,.45);background:rgba(148,163,184,.16);color:#e2e8f0}
+.board-status.online{border-color:rgba(34,197,94,.45);background:rgba(34,197,94,.16);color:#bbf7d0}
+.board-status.offline{border-color:rgba(248,113,113,.45);background:rgba(248,113,113,.16);color:#fecaca}
+.board-status.preop{border-color:rgba(250,204,21,.45);background:rgba(250,204,21,.16);color:#fde68a}
+.board-status.unknown{border-color:rgba(148,163,184,.45);background:rgba(148,163,184,.12);color:#d1d5db}
+.board-count{font-size:.85rem;color:var(--muted)}
 /* Badge nelle card zona (RA/RC/AE) */
 /* .zones-grid .chip { position: relative; padding-right: 3.2rem; min-width: 200px;}*/
 .zones-grid .chip { position: relative; padding-right: 3.2rem; min-width: 160px;}
@@ -207,6 +223,26 @@ body.modal-open { overflow: hidden; }
 
 .chip{display:inline-block;border:1px solid var(--border);padding:.4rem .7rem;border-radius:12px}
 .chip.on{background:var(--accent);color:#00152a;border-color:var(--accent)}
+
+.log-empty.small{font-size:.85rem;padding:1rem 0;}
+
+.zones-config{display:flex;flex-direction:column;gap:.75rem}
+.zones-config-header{display:flex;align-items:center;justify-content:space-between;gap:.75rem}
+.zones-config-body{max-height:60vh;overflow:auto;padding-right:.5rem;display:flex;flex-direction:column;gap:1.25rem}
+.zone-config-section{display:flex;flex-direction:column;gap:.75rem}
+.zone-config-section-head{display:flex;align-items:center;justify-content:space-between;gap:.75rem}
+.zone-config-grid{display:grid;gap:.75rem}
+@media(min-width:600px){.zone-config-grid{grid-template-columns:repeat(auto-fill,minmax(260px,1fr));}}
+.zone-config-card{border:1px solid var(--border);border-radius:14px;background:linear-gradient(180deg,rgba(18,28,48,.96),rgba(10,18,36,.96));padding:.9rem;display:flex;flex-direction:column;gap:.6rem}
+.zone-config-card-head{display:flex;align-items:center;justify-content:space-between;gap:.5rem;font-size:.95rem}
+.zone-config-card-head strong{font-size:1rem}
+.zone-config-card .badges{margin-left:auto}
+.zone-config-card .field{display:flex;flex-direction:column;gap:.35rem;font-size:.9rem}
+.zone-config-card .field span{font-size:.8rem;opacity:.75}
+.zone-config-options{display:flex;flex-direction:column;gap:.45rem}
+.chk.compact{padding:.35rem .5rem}
+.zone-config-card .field input{width:100%}
+.zone-config-card input[type=number]{width:6rem}
 
 .scenes-list{display:grid;gap:16px}
 .card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}

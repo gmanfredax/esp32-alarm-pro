@@ -366,8 +366,9 @@ esp_err_t auth_handle_logout(httpd_req_t* req){
 esp_err_t auth_handle_me(httpd_req_t* req){
     user_info_t u={0};
     if (auth_check_bearer(req,&u) || auth_check_cookie(req,&u)){
-        char resp[160];
-        snprintf(resp,sizeof(resp),"{\"ok\":true,\"user\":\"%s\",\"role\":%d}",u.username,(int)u.role);
+        char resp[200];
+        bool is_admin = ((int)u.role >= (int)ROLE_ADMIN);
+        snprintf(resp,sizeof(resp),"{\"ok\":true,\"user\":\"%s\",\"role\":%d,\"is_admin\":%s}", u.username,(int)u.role,is_admin?"true":"false");
         return json_reply(req, resp);
     }
     return httpd_resp_send_err(req,HTTPD_401_UNAUTHORIZED,"no auth");

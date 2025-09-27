@@ -12,14 +12,66 @@ import {
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 
+const ROLE_ADMIN = 2;
+
 const state = {
   currentUser: '',
+  role: null,
   isAdmin: false,
   status: null,
   zones: [],
+  boards: [],
   scenes: null,
-  logs: []
+  logs: [],
+  activeTab: ''
 };
+
+const STATUS_POLL_INTERVAL = 2000;
+const ZONESS_POLL_INTERVAL = 2000;
+let statusPollTimer = null;
+let zonesPollTimer = null;
+
+function stopStatusUpdates(){
+  if (statusPollTimer) {
+    clearInterval(statusPollTimer);
+    statusPollTimer = null;
+  }
+}
+
+function startStatusUpdates({ immediate = false } = {}){
+  if (statusPollTimer || document.hidden || state.activeTab !== 'status') return;
+  if (immediate) {
+    refreshStatus();
+  }
+  statusPollTimer = window.setInterval(() => {
+    if (document.hidden || state.activeTab !== 'status') {
+      stopStatusUpdates();
+      return;
+    }
+    refreshStatus();
+  }, STATUS_POLL_INTERVAL);
+}
+
+function stopZonesUpdates(){
+  if (zonesPollTimer) {
+    clearInterval(zonesPollTimer);
+    zonesPollTimer = null;
+  }
+}
+
+function startZonesUpdates({ immediate = false } = {}){
+  if (zonesPollTimer || document.hidden || state.activeTab !== 'zones') return;
+  if (immediate) {
+    refreshZones();
+  }
+  zonesPollTimer = window.setInterval(() => {
+    if (document.hidden || state.activeTab !== 'zones') {
+      stopZonesUpdates();
+      return;
+    }
+    refreshZones();
+  }, ZONESS_POLL_INTERVAL);
+}
 
 const dateTimeFormatter = new Intl.DateTimeFormat('it-IT', {
   dateStyle: 'short',
@@ -27,6 +79,112 @@ const dateTimeFormatter = new Intl.DateTimeFormat('it-IT', {
 });
 
 const modalsRoot = document.getElementById('modals-root');
+
+const boardsCache = {
+  list: [],
+  map: new Map(),
+  pending: null
+};
+
+function normalizeBoard(node){
+  if (!node) return null;
+  const rawId = Number(node?.node_id);
+  const nodeId = Number.isFinite(rawId) ? rawId : 0;
+  const label = typeof node?.label === 'string' && node.label.trim()
+    ? node.label.trim()
+    : (nodeId === 0 ? 'Centrale' : `Scheda ${nodeId}`);
+  const stateValue = (node?.state || (nodeId === 0 ? 'ONLINE' : 'UNKNOWN')).toString().toUpperCase();
+  const inputs = Number(node?.inputs_count);
+  return {
+    node_id: nodeId,
+    label,
+    state: stateValue,
+    kind: typeof node?.kind === 'string' ? node.kind : '',
+    inputs_count: Number.isFinite(inputs) ? inputs : 0
+  };
+}
+
+function setBoards(nodes){
+  const normalized = [];
+  if (Array.isArray(nodes)) {
+    nodes.forEach((item) => {
+      const norm = normalizeBoard(item);
+      if (norm) normalized.push(norm);
+    });
+  }
+  if (!normalized.some((item) => item.node_id === 0)) {
+    normalized.unshift({ node_id: 0, label: 'Centrale', state: 'ONLINE', kind: 'master', inputs_count: 0 });
+  }
+  boardsCache.list = normalized;
+  boardsCache.map = new Map(normalized.map((item) => [item.node_id, item]));
+  state.boards = normalized;
+}
+
+function getBoardMeta(boardId){
+  const id = Number(boardId);
+  const safeId = Number.isFinite(id) ? id : 0;
+  return boardsCache.map.get(safeId) || null;
+}
+
+function boardLabel(meta, boardId){
+  if (meta?.label) return meta.label;
+  return boardId === 0 ? 'Centrale' : `Scheda ${boardId}`;
+}
+
+function boardStatusDetails(meta){
+  const raw = (meta?.state || '').toString().toUpperCase();
+  switch (raw) {
+    case 'ONLINE':
+      return { className: 'online', label: 'Online' };
+    case 'OFFLINE':
+      return { className: 'offline', label: 'Offline' };
+    case 'PREOP':
+    case 'PRE-OP':
+      return { className: 'preop', label: 'Pre-operativa' };
+    default:
+      return { className: 'unknown', label: raw && raw !== 'UNKNOWN' ? raw : 'Sconosciuto' };
+  }
+}
+
+function renderBoardStatus(meta){
+  const info = boardStatusDetails(meta);
+  return `<span class="board-status ${info.className}">${escapeHtml(info.label)}</span>`;
+}
+
+function formatZoneCount(value){
+  const count = Number(value) || 0;
+  return count === 1 ? '1 zona' : `${count} zone`;
+}
+
+function sortBoardIds(a, b){
+  if (a === b) return 0;
+  if (a === 0) return -1;
+  if (b === 0) return 1;
+  return a - b;
+}
+
+async function ensureBoardsLoaded(force = false){
+  if (!force && boardsCache.list.length && !boardsCache.pending) {
+    return boardsCache.list;
+  }
+  if (boardsCache.pending) {
+    return boardsCache.pending;
+  }
+  const request = apiGet('/api/can/nodes')
+    .then((nodes) => {
+      setBoards(nodes);
+      boardsCache.pending = null;
+      return boardsCache.list;
+    })
+    .catch((err) => {
+      boardsCache.pending = null;
+      throw err;
+    });
+  boardsCache.pending = request;
+  return request;
+}
+
+setBoards([]);
 
 function requireLogin(){
   clearSession();
@@ -43,15 +201,30 @@ function setBrandSystem(){
   }
 }
 
+function setBrandCentralName(name){
+  const label = document.querySelector('.brand-label');
+  if (!label) return;
+  const trimmed = (name ?? '').toString().trim();
+  label.textContent = trimmed ? `Alarm Pro • ${trimmed}` : 'Alarm Pro';
+}
+
 function setActiveTab(name){
   $$('.tab-btn').forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === name));
   $$('.tab').forEach((section) => section.classList.toggle('active', section.id === `tab-${name}`));
+  state.activeTab = name;
+  if (name !== 'status') {
+    stopStatusUpdates();
+  } else if (name !== 'zones') {
+    stopZonesUpdates();
+  }
   switch (name) {
     case 'status':
       refreshStatus();
+      startStatusUpdates();
       break;
     case 'zones':
       refreshZones();
+      startZonesUpdates();
       break;
     case 'scenes':
       refreshScenes();
@@ -156,6 +329,7 @@ async function refreshStatus(){
   try {
     const data = await apiGet('/api/status');
     state.status = data;
+    setBrandCentralName(data?.central_name);
     const wrap = $('#statusCards');
     if (!wrap) return;
     const zonesActive = Array.isArray(data?.zones_active) ? data.zones_active.filter(Boolean).length : (data?.zones_active || 0);
@@ -168,6 +342,9 @@ async function refreshStatus(){
     ].join('');
     const stateEl = document.getElementById('kpi-state-val');
     if (stateEl) renderAlarmState(stateEl, data, { iconHTML: stateIcon(data?.state) });
+    if (state.activeTab === 'zones' && !document.hidden) {
+      refreshZones();
+    }
   } catch (err) {
     console.error('refreshStatus', err);
     showNotice('Impossibile recuperare lo stato.', 'error');
@@ -178,36 +355,245 @@ function buildZoneBadge(zone){
   const badges = [];
   if (zone?.auto_exclude) badges.push('<span class="badge" title="Autoesclusione">AE</span>');
   if (zone?.zone_delay) badges.push('<span class="badge" title="Ritardo">R</span>');
-  if (zone?.zone_time) badges.push(`<span class="badge" title="Tempo">${zone.zone_time}s</span>`);
+  const time = Number(zone?.zone_time);
+  if (Number.isFinite(time) && time > 0) badges.push(`<span class="badge" title="Tempo">${time}s</span>`);
   return badges.join('');
+}
+
+function renderZoneChip(zone){
+  const id = Number(zone?.id);
+  const boardId = Number(zone?.board);
+  const zoneIdLabel = Number.isFinite(id) ? `Z${id}` : 'Z?';
+  const nameSuffix = zone?.name ? ` – ${escapeHtml(zone.name)}` : '';
+  const display = `${escapeHtml(zoneIdLabel)}${nameSuffix}`;
+  const cls = zone?.active ? 'chip on' : 'chip';
+  const badges = buildZoneBadge(zone);
+  const titleParts = [zoneIdLabel];
+  if (zone?.name) titleParts.push(zone.name);
+  return `
+    <div class="card mini zone-card" data-zone-id="${Number.isFinite(id) ? id : ''}" data-board-id="${Number.isFinite(boardId) ? boardId : 0}">
+      <div class="${cls}" title="${escapeHtml(titleParts.join(' • '))}">
+        ${display}
+        ${badges ? `<span class="badges">${badges}</span>` : ''}
+      </div>
+    </div>`;
+}
+
+function renderBoardSection(boardId, zones){
+  const meta = getBoardMeta(boardId);
+  const label = escapeHtml(boardLabel(meta, boardId));
+  const statusHtml = renderBoardStatus(meta);
+  const zoneCount = escapeHtml(formatZoneCount(zones.length));
+  const content = zones.length
+    ? `<div class="zones-grid">${zones.map((zone) => renderZoneChip(zone)).join('')}</div>`
+    : '<div class="log-empty small">Nessuna zona associata.</div>';
+  return `
+    <section class="board-section" data-board="${boardId}">
+      <div class="board-header">
+        <h4>${label}</h4>
+        <div class="board-meta">
+          ${statusHtml}
+          <span class="board-count">${zoneCount}</span>
+        </div>
+      </div>
+      ${content}
+    </section>`;
 }
 
 async function refreshZones(){
   try {
     const data = await apiGet('/api/zones');
-    state.zones = data;
-    const grid = $('#zonesGrid');
-    if (!grid) return;
     const zones = Array.isArray(data?.zones) ? data.zones : [];
-    if (!zones.length) {
-      grid.innerHTML = '<div class="log-empty">Nessuna zona configurata.</div>';
+    state.zones = zones;
+    const container = $('#zonesBoards');
+    if (!container) return;
+
+    try {
+      await ensureBoardsLoaded();
+    } catch (metaErr) {
+      console.warn('boards metadata', metaErr);
+    }
+
+    const groups = new Map();
+    zones.forEach((zone) => {
+      const bid = Number(zone?.board);
+      const boardId = Number.isFinite(bid) ? bid : 0;
+      const arr = groups.get(boardId) || [];
+      arr.push(zone);
+      groups.set(boardId, arr);
+    });
+
+    for (const arr of groups.values()) {
+      arr.sort((a, b) => {
+        const ida = Number(a?.id) || 0;
+        const idb = Number(b?.id) || 0;
+        return ida - idb;
+      });
+    }
+
+    const boardIdsSet = new Set(boardsCache.list.map((board) => board.node_id));
+    for (const boardId of groups.keys()) boardIdsSet.add(boardId);
+    const boardIds = Array.from(boardIdsSet).sort(sortBoardIds);
+
+    if (!boardIds.length) {
+      container.innerHTML = '<div class="log-empty">Nessuna zona configurata.</div>';
       return;
     }
-    grid.innerHTML = zones.map((zone) => {
-      const name = escapeHtml(zone?.name || `Z${zone?.id ?? '?'}`);
-      const cls = zone?.active ? 'chip on' : 'chip';
-      const badges = buildZoneBadge(zone);
-      return `
-        <div class="card mini">
-          <div class="chip ${cls}" title="${name}">
-            ${name}
-            ${badges ? `<span class="badges">${badges}</span>` : ''}
-          </div>
-        </div>`;
+    container.innerHTML = boardIds.map((boardId) => {
+      const list = groups.get(boardId) || [];
+      return renderBoardSection(boardId, list);
     }).join('');
   } catch (err) {
     console.error('refreshZones', err);
     showNotice('Errore durante il caricamento delle zone.', 'error');
+  }
+}
+
+function renderZoneConfigCard(zone){
+  const id = Number(zone?.id);
+  const boardId = Number(zone?.board);
+  const nameValue = zone?.name ? escapeHtml(zone.name) : '';
+  const delayChecked = zone?.zone_delay ? 'checked' : '';
+  const autoChecked = zone?.auto_exclude ? 'checked' : '';
+  const timeValue = Number(zone?.zone_time);
+  const safeTime = Number.isFinite(timeValue) && timeValue > 0 ? timeValue : 0;
+  const badges = buildZoneBadge(zone);
+  return `
+    <div class="zone-config-card" data-zone-id="${Number.isFinite(id) ? id : ''}" data-board-id="${Number.isFinite(boardId) ? boardId : 0}">
+      <div class="zone-config-card-head">
+        <strong>Z${Number.isFinite(id) ? id : '?'}</strong>
+        ${badges ? `<span class="badges">${badges}</span>` : ''}
+      </div>
+      <label class="field"><span>Nome</span><input type="text" data-field="name" value="${nameValue}" placeholder="Z${Number.isFinite(id) ? id : ''}"></label>
+      <div class="zone-config-options">
+        <label class="chk compact"><input type="checkbox" data-field="zone_delay" ${delayChecked}> Ritardo ingresso/uscita</label>
+        <label class="chk compact"><input type="checkbox" data-field="auto_exclude" ${autoChecked}> Autoesclusione se aperta</label>
+      </div>
+      <label class="field"><span>Tempo ritardo (s)</span><input type="number" min="0" max="600" step="1" data-field="zone_time" value="${safeTime}"></label>
+    </div>
+  `;
+}
+
+function renderZonesConfigSection(boardId, zones){
+  const meta = getBoardMeta(boardId);
+  const label = escapeHtml(boardLabel(meta, boardId));
+  const statusHtml = renderBoardStatus(meta);
+  const zoneCount = escapeHtml(formatZoneCount(zones.length));
+  const body = zones.length
+    ? `<div class="zone-config-grid">${zones.map((zone) => renderZoneConfigCard(zone)).join('')}</div>`
+    : '<div class="log-empty small">Nessuna zona configurata.</div>';
+  return `
+    <section class="zone-config-section" data-board="${boardId}">
+      <div class="zone-config-section-head">
+        <h4>${label}</h4>
+        <div class="board-meta">
+          ${statusHtml}
+          <span class="board-count">${zoneCount}</span>
+        </div>
+      </div>
+      ${body}
+    </section>
+  `;
+}
+
+async function openZonesConfig(){
+  try {
+    const payload = await apiGet('/api/zones/config');
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+
+    try {
+      await ensureBoardsLoaded();
+    } catch (metaErr) {
+      console.warn('boards metadata', metaErr);
+    }
+
+    const groups = new Map();
+    items.forEach((item) => {
+      const bid = Number(item?.board);
+      const boardId = Number.isFinite(bid) ? bid : 0;
+      const arr = groups.get(boardId) || [];
+      arr.push(item);
+      groups.set(boardId, arr);
+    });
+
+    for (const arr of groups.values()) {
+      arr.sort((a, b) => (Number(a?.id) || 0) - (Number(b?.id) || 0));
+    }
+
+    const boardIdsSet = new Set(boardsCache.list.map((board) => board.node_id));
+    for (const boardId of groups.keys()) boardIdsSet.add(boardId);
+    const boardIds = Array.from(boardIdsSet).sort(sortBoardIds);
+
+    const sectionsHtml = boardIds.length
+      ? boardIds.map((boardId) => renderZonesConfigSection(boardId, groups.get(boardId) || [])).join('')
+      : '<div class="log-empty small">Nessuna zona configurabile.</div>';
+
+    const modal = showModal(`
+      <div class="zones-config">
+        <div class="zones-config-header">
+          <h3>Configurazione zone</h3>
+          <button class="btn tiny outline" type="button" id="zonesCfgClose">Chiudi</button>
+        </div>
+        <div class="zones-config-body">
+          ${sectionsHtml}
+        </div>
+        <div id="zonesCfgMsg" class="msg small hidden"></div>
+        <div class="row" style="justify-content:flex-end;gap:.5rem;margin-top:1rem">
+          <button class="btn" type="button" id="zonesCfgCancel">Annulla</button>
+          <button class="btn primary" type="button" id="zonesCfgSave">Salva</button>
+        </div>
+      </div>
+    `, { modalClass: 'zones-config-modal' });
+
+    if (!modal) return;
+
+    const closeModal = () => { clearModals(); };
+    $('#zonesCfgClose', modal)?.addEventListener('click', closeModal);
+    $('#zonesCfgCancel', modal)?.addEventListener('click', closeModal);
+
+    $('#zonesCfgSave', modal)?.addEventListener('click', async () => {
+      const cards = $$('.zone-config-card', modal);
+      const itemsPayload = cards.map((card) => {
+        const id = Number(card.dataset.zoneId);
+        if (!Number.isFinite(id)) return null;
+        const nameInput = $('[data-field="name"]', card);
+        const delayInput = $('[data-field="zone_delay"]', card);
+        const timeInput = $('[data-field="zone_time"]', card);
+        const autoInput = $('[data-field="auto_exclude"]', card);
+        const boardId = Number(card.dataset.boardId);
+        return {
+          id,
+          name: nameInput?.value?.trim() || '',
+          zone_delay: !!(delayInput && delayInput.checked),
+          zone_time: Math.max(0, Number.parseInt(timeInput?.value ?? '0', 10) || 0),
+          auto_exclude: !!(autoInput && autoInput.checked),
+          board: Number.isFinite(boardId) ? boardId : 0
+        };
+      }).filter(Boolean);
+
+      const msg = $('#zonesCfgMsg', modal);
+      if (msg) {
+        msg.textContent = '';
+        msg.classList.add('hidden');
+      }
+
+      try {
+        await apiPost('/api/zones/config', { items: itemsPayload });
+        showNotice('Configurazione zone aggiornata.', 'info');
+        clearModals();
+        refreshZones();
+      } catch (err) {
+        console.error('saveZonesConfig', err);
+        if (msg) {
+          msg.textContent = err instanceof HttpError ? err.message : 'Errore durante il salvataggio.';
+          msg.classList.remove('hidden');
+          msg.style.color = '#f87171';
+        }
+      }
+    });
+  } catch (err) {
+    console.error('openZonesConfig', err);
+    showNotice('Impossibile leggere la configurazione delle zone.', 'error');
   }
 }
 
@@ -327,37 +713,94 @@ function setupCommands(){
   $$('#commandCards button[data-arm]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const mode = btn.dataset.arm;
+      const pin = await promptForPin({
+        title: 'Inserisci PIN per attivare',
+        confirmLabel: 'Attiva',
+        description: mode ? `Modalità: ${mode.toUpperCase()}` : ''
+      });
+      if (pin == null) {
+        return;
+      }
       try {
-        await apiPost('/api/arm', { mode });
+        await apiPost('/api/arm', { mode, pin });
         showNotice(`Comando ${mode?.toUpperCase()} inviato.`, 'info');
         refreshStatus();
+        if (state.activeTab === 'zones') {
+          refreshZones();
+        }
       } catch (err) {
         console.error('arm', err);
-        showNotice('Errore durante l’invio del comando.', 'error');
+        if (err instanceof HttpError) {
+          if (err.status === 401) {
+            showNotice('PIN errato.', 'error');
+          } else if (err.status === 409) {
+            showNotice('Impossibile attivare: zone aperte.', 'error');
+          } else {
+            showNotice(err.message || 'Errore durante l’invio del comando.', 'error');
+          }
+        } else {
+          showNotice('Errore durante l’invio del comando.', 'error');
+        }
       }
     });
   });
   $('#disarmBtn')?.addEventListener('click', async () => {
+    if (state.status?.state === 'DISARMED') {
+      showNotice('La centrale è già disarmata.', 'info');
+      return;
+    }
+    const pin = await promptForPin({
+      title: 'Inserisci PIN per disattivare',
+      confirmLabel: 'Disattiva'
+    });
+    if (pin == null) {
+      return;
+    }
     try {
-      await apiPost('/api/disarm', {});
+      await apiPost('/api/disarm', { pin });
       showNotice('Centrale disarmata.', 'info');
       refreshStatus();
+      if (state.activeTab === 'zones') {
+        refreshZones();
+      }
     } catch (err) {
       console.error('disarm', err);
-      showNotice('Errore durante il comando di disarmo.', 'error');
+      if (err instanceof HttpError) {
+        if (err.status === 401) {
+          showNotice('PIN errato.', 'error');
+        } else if (err.status === 409) {
+          showNotice('Impossibile disarmare: zone aperte.', 'error');
+        } else {
+          showNotice(err.message || 'Errore durante il comando di disarmo.', 'error');
+        }
+      } else {
+        showNotice('Errore durante il comando di disarmo.', 'error');
+      }
     }
   });
 }
 
+function normalizeRole(roleValue){
+  if (typeof roleValue === 'number') return Number.isNaN(roleValue) ? null : roleValue;
+  if (typeof roleValue === 'string' && roleValue.trim() !== '') {
+    const parsed = Number.parseInt(roleValue, 10);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
 function updateAdminVisibility(){
+  document.body.classList.toggle('is-admin', state.isAdmin);
   $$('.admin-only').forEach((el) => {
-    el.style.display = state.isAdmin ? '' : 'none';
+    el.classList.toggle('hidden', !state.isAdmin);
+    el.style.removeProperty('display');
   });
 }
 
 function setupZonesConfig(){
   $('#btnZonesCfg')?.addEventListener('click', () => {
-    window.location.href = './admin.html';
+    if (!state.isAdmin) return;
+    openZonesConfig();
   });
 }
 
@@ -366,16 +809,101 @@ function clearModals(){
   document.body.classList.remove('modal-open');
 }
 
-function showModal(innerHtml){
+function showModal(innerHtml, options = {}){
   if (!modalsRoot) return null;
   clearModals();
-  modalsRoot.innerHTML = `<div class="modal-overlay"><div class="card modal">${innerHtml}</div></div>`;
+  const modalClass = options.modalClass ? ` ${options.modalClass}` : '';
+  modalsRoot.innerHTML = `<div class="modal-overlay"><div class="card modal${modalClass}">${innerHtml}</div></div>`;
   document.body.classList.add('modal-open');
   const overlay = modalsRoot.firstElementChild;
   overlay?.addEventListener('click', (event) => {
-    if (event.target === overlay) clearModals();
+    if (event.target === overlay && !event.defaultPrevented) clearModals();
   });
   return overlay?.querySelector('.modal') || null;
+}
+
+function promptForPin({
+  title = 'Inserisci PIN',
+  confirmLabel = 'Conferma',
+  description = ''
+} = {}){
+  return new Promise((resolve) => {
+    const modal = showModal(`
+      <h3 class="title">${escapeHtml(title)}</h3>
+      ${description ? `<p class="muted">${escapeHtml(description)}</p>` : ''}
+      <form class="form" id="pin_form">
+        <label class="field"><span>PIN</span><input id="pin_input" type="password" inputmode="numeric" autocomplete="one-time-code"></label>
+        <div class="row" style="justify-content:flex-end;gap:.5rem">
+          <button type="button" class="btn secondary" data-act="cancel">Annulla</button>
+          <button type="submit" class="btn primary" data-act="confirm">${escapeHtml(confirmLabel)}</button>
+        </div>
+      </form>
+    `);
+    if (!modal) {
+      resolve(null);
+      return;
+    }
+
+    const overlay = modal.parentElement;
+    const form = modal.querySelector('#pin_form');
+    const input = modal.querySelector('#pin_input');
+    const cancelBtn = modal.querySelector('[data-act="cancel"]');
+    let done = false;
+
+    const cleanup = () => {
+      modal.removeEventListener('keydown', onKeyDown);
+      overlay?.removeEventListener('click', onOverlayClick, true);
+      cancelBtn?.removeEventListener('click', onCancel);
+      form?.removeEventListener('submit', onSubmit);
+    };
+
+    const close = (value) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      clearModals();
+      resolve(value);
+    };
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close(null);
+      }
+    };
+
+    const onOverlayClick = (event) => {
+      if (event.target === overlay) {
+        event.preventDefault();
+        close(null);
+      }
+    };
+
+    const onCancel = (event) => {
+      event.preventDefault();
+      close(null);
+    };
+
+    const onSubmit = (event) => {
+      event.preventDefault();
+      const pin = (input?.value ?? '').trim();
+      if (!pin) {
+        input?.focus();
+        return;
+      }
+      close(pin);
+    };
+
+    modal.addEventListener('keydown', onKeyDown);
+    overlay?.addEventListener('click', onOverlayClick, true);
+    cancelBtn?.addEventListener('click', onCancel);
+    form?.addEventListener('submit', onSubmit);
+
+    setTimeout(() => {
+      input?.focus();
+      input?.select();
+    }, 0);
+  });
 }
 
 function ensureQRCode(target, text){
@@ -576,10 +1104,19 @@ function setupUserMenu(){
 async function loadSession(){
   const me = await apiGet('/api/me');
   state.currentUser = me?.user || '';
-  state.isAdmin = !!me?.is_admin;
+  const role = normalizeRole(me?.role);
+  state.role = role;
+  const fallbackAdmin = !!me?.is_admin;
+  state.isAdmin = role != null ? role >= ROLE_ADMIN : fallbackAdmin;
   const label = $('#userLabel');
   if (label) {
-    label.textContent = state.currentUser ? `${state.currentUser}${state.isAdmin ? ' (admin)' : ''}` : '';
+    if (!state.currentUser) {
+      label.textContent = '';
+    } else {
+      const userHtml = `<span class="user-name">${escapeHtml(state.currentUser)}</span>`;
+      const roleHtml = state.isAdmin ? ' <span class="user-role tag warn">ADMIN</span>' : '';
+      label.innerHTML = `${userHtml}${roleHtml}`;
+    }
   }
   updateAdminVisibility();
 }
@@ -590,7 +1127,7 @@ async function init(){
     return;
   }
 
-  document.getElementById('year')?.textContent = String(new Date().getFullYear());
+  document.getElementById('year').textContent = String(new Date().getFullYear());
   setBrandSystem();
   setupTabs();
   setupCommands();
@@ -598,6 +1135,25 @@ async function init(){
   setupUserMenu();
 
   $('#logsRefresh')?.addEventListener('click', () => refreshLogs());
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      stopStatusUpdates();
+      stopZonesUpdates();
+    } else if (state.activeTab === 'status') {
+      startStatusUpdates({ immediate: true });
+    } else if (state.activeTab === 'zones') {
+      startZonessUpdates({ immediate: true });
+    }
+  });
+  window.addEventListener('pagehide', () => {    
+    stopStatusUpdates();
+    stopZonesUpdates();    
+  });
+  window.addEventListener('beforeunload', () => {    
+    stopStatusUpdates();
+    stopZonesUpdates();    
+  });
 
   try {
     await loadSession();
@@ -607,9 +1163,10 @@ async function init(){
     return;
   }
 
+  ensureBoardsLoaded().catch((err) => console.warn('boards metadata', err));
+
   $('#appRoot')?.classList.remove('hidden');
   setActiveTab('status');
-  refreshStatus();
 }
 
 init();

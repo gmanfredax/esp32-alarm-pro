@@ -8,7 +8,19 @@
     const _fetch = window.fetch;
     window.fetch = (input, init = {}) => {
       const headers = new Headers(init.headers || {});
-      const t = (()=>{ try { return localStorage.getItem("token") || sessionStorage.getItem("token") || ""; } catch { return ""; }})();
+      const t = (()=>{
+        try {
+          return (
+            localStorage.getItem("alarmpro.token") ||
+            sessionStorage.getItem("alarmpro.token") ||
+            localStorage.getItem("token") ||
+            sessionStorage.getItem("token") ||
+            ""
+          );
+        } catch {
+          return "";
+        }
+      })();
       if (t && !headers.has("Authorization")) headers.set("Authorization", "Bearer " + t);
       const creds = init.credentials ? init.credentials : "same-origin";
       return _fetch(input, { ...init, headers, credentials: creds }).then(resp => {
@@ -36,16 +48,44 @@
   }
   const needLogin = () => location.replace("/login.html");
 
+  let currentUser = "";
+  let isAdmin = false;
+
   async function apiGet(url){
     const r = await fetch(url, { headers: { "Accept":"application/json" } });
     if (r.status === 401) { needLogin(); throw new Error("401"); }
     if (!r.ok) throw new Error(await r.text());
-    return r.json();
+    try {
+      return await r.json();
+    } catch (err) {
+      throw new Error("Risposta JSON non valida");
+    }
   }
   async function apiPost(url, body){
     const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: body!=null?JSON.stringify(body):undefined });
     if (r.status === 401) { needLogin(); throw new Error("401"); }
     if (!r.ok) throw new Error(await r.text());
+    try { return await r.json(); } catch { return {}; }
+  }
+
+  async function apiDelete(url){
+    const r = await fetch(url, { method:"DELETE", headers:{ "Accept":"application/json" } });
+    if (r.status === 401) { needLogin(); throw new Error("401"); }
+    if (!r.ok){
+      let detail = "";
+      try {
+        const ct = r.headers.get("content-type") || "";
+        if (ct.includes("application/json")){
+          const data = await r.json();
+          detail = data?.error || data?.message || JSON.stringify(data);
+        } else {
+          detail = await r.text();
+        }
+      } catch(err){
+        detail = err?.message || await r.text();
+      }
+      throw new Error(detail || `${r.status} ${r.statusText}`);
+    }
     try { return await r.json(); } catch { return {}; }
   }
 
@@ -73,14 +113,60 @@
   });
 
   const WEB_TLS_MAX_PEM_LEN = 4096;
+  const ROLE_ADMIN = 2;
+
+  const expansionsState = {
+    items: [],
+    loading: false,
+    error: "",
+    lastScan: null,
+  };
+
+  function formatDateTime(ts){
+    if (ts == null) return "";
+    let date;
+    if (ts instanceof Date) date = ts;
+    else if (typeof ts === "number") date = new Date(ts);
+    else if (typeof ts === "string" && ts) date = new Date(ts);
+    else return "";
+    if (Number.isNaN(date.getTime())) return "";
+    try { return date.toLocaleString("it-IT"); }
+    catch { return date.toISOString(); }
+  }
+
+  const normalizeRole = (roleValue) => {
+    if (typeof roleValue === 'number') return Number.isNaN(roleValue) ? null : roleValue;
+    if (typeof roleValue === 'string' && roleValue.trim() !== '') {
+      const parsed = Number.parseInt(roleValue, 10);
+      return Number.isNaN(parsed) ? null : parsed;
+    }
+    return null;
+  };
 
     // -------------- Header / menu utente --------------
-  function syncHeader(){ $("#userLabel") && ($("#userLabel").textContent = `${currentUser}${isAdmin ? " (admin)" : ""}`); }
+  function syncHeader(){
+    const label = $("#userLabel");
+    if (!label) return;
+    if (!currentUser) {
+      label.textContent = "";
+      return;
+    }
+    const nameHtml = `<span class="user-name">${escapeHtml(currentUser)}</span>`;
+    const roleHtml = isAdmin ? ' <span class="user-role tag warn">ADMIN</span>' : '';
+    label.innerHTML = `${nameHtml}${roleHtml}`;
+  }
   
   function updateAdminVisibility(){
-    $$('.admin-only').forEach(el => { el.style.display = isAdmin ? '' : 'none'; });
+    document.body.classList.toggle('is-admin', isAdmin);
+    $$('.admin-only').forEach(el => {
+      el.classList.toggle('hidden', !isAdmin);
+      el.style.removeProperty('display');
+    });
     const zBtn = $('#btnZonesCfg');
-    if (zBtn) zBtn.style.display = isAdmin ? '' : 'none';
+    if (zBtn) {
+      zBtn.classList.toggle('hidden', !isAdmin);
+      zBtn.style.removeProperty('display');
+    }
   }
 
   function mountUserMenu(){
@@ -91,8 +177,14 @@
     dd.querySelector("[data-act=logout]")?.addEventListener("click", async ()=>{
       dd.classList.add("hidden");
       try{ await apiPost("/api/logout",{});}catch{}
-      try { localStorage.removeItem("token"); } catch(_){}
-      try { sessionStorage.removeItem("token"); } catch(_){}
+      try {
+        localStorage.removeItem("alarmpro.token");
+        localStorage.removeItem("token");
+      } catch(_){}
+      try {
+        sessionStorage.removeItem("alarmpro.token");
+        sessionStorage.removeItem("token");
+      } catch(_){}
       needLogin();
     });
   }
@@ -117,36 +209,262 @@
     });
   }
 
+  function getExpansionItems(){
+    const items = Array.isArray(expansionsState.items) ? expansionsState.items : [];
+    return items.slice().sort((a, b) => {
+      const aId = Number(a?.node_id ?? 0);
+      const bId = Number(b?.node_id ?? 0);
+      return aId - bId;
+    });
+  }
+
+  function nodeTitle(node){
+    if (!node) return "Nodo CAN";
+    const label = (node.label && String(node.label).trim()) || "";
+    if (label) return label;
+    const kind = (node.kind && String(node.kind).trim()) || "";
+    if (kind) return `${kind}${node.node_id != null ? ` #${node.node_id}` : ""}`;
+    if (node.node_id != null) return `Nodo ${node.node_id}`;
+    return "Nodo CAN";
+  }
+
+  function renderExpansionsSection(){
+    const nodes = getExpansionItems();
+    const list = $("#adminExpansionList");
+    if (list){
+      list.innerHTML = nodes.map((node) => {
+        if (!node) return "";
+        const nodeId = Number(node.node_id ?? -1);
+        const title = escapeHtml(nodeTitle(node));
+        const metaParts = [];
+        if (nodeId >= 0) metaParts.push(`ID ${nodeId}`);
+        if (node.kind) metaParts.push(String(node.kind));
+        if (node.state) metaParts.push(String(node.state));
+        const ioParts = [];
+        if (node.inputs_count != null) ioParts.push(`${node.inputs_count} ingressi`);
+        if (node.outputs_count != null) ioParts.push(`${node.outputs_count} uscite`);
+        if (ioParts.length) metaParts.push(ioParts.join(' · '));
+        const meta = metaParts.filter(Boolean).map((part)=>escapeHtml(String(part))).join(' · ');
+        const actions = nodeId === 0
+          ? '<span class="muted">Master</span>'
+          : `<button class="btn btn-sm outline" type="button" data-node-actions="${nodeId}">Azioni</button>`;
+        return `<li class="expansion-item" data-node-id="${nodeId}">
+            <div class="expansion-info">
+              <div class="expansion-title">${title}</div>
+              ${meta ? `<div class="expansion-meta">${meta}</div>` : ''}
+            </div>
+            <div class="expansion-actions">${actions}</div>
+          </li>`;
+      }).join("");
+    }
+    const empty = $("#adminExpansionEmpty");
+    if (empty){
+      const showEmpty = !expansionsState.loading && !expansionsState.error && nodes.length === 0;
+      empty.classList.toggle("hidden", !showEmpty);
+    }
+    const status = $("#adminExpansionStatus");
+    if (status){
+      status.classList.remove("error", "success", "muted", "hidden");
+      let text = "";
+      if (expansionsState.loading){
+        text = "Caricamento nodi CAN…";
+        status.classList.add("muted");
+      } else if (expansionsState.error){
+        text = expansionsState.error;
+        status.classList.add("error");
+      } else if (nodes.length){
+        const when = formatDateTime(expansionsState.lastScan);
+        text = when ? `Ultimo aggiornamento: ${when}` : "Elenco aggiornato.";
+        status.classList.add("success");
+      } else {
+        text = "Nessuna scheda registrata.";
+        status.classList.add("muted");
+      }
+      status.textContent = text;
+      status.classList.toggle("hidden", !text);
+    }
+    const disableActions = !!expansionsState.loading;
+    const scanBtn = $("#adminExpansionScanBtn");
+    if (scanBtn) scanBtn.disabled = disableActions;
+    const refreshBtn = $("#adminExpansionRefreshBtn");
+    if (refreshBtn) refreshBtn.disabled = disableActions;
+  }
+
+  async function loadExpansionNodes(){
+    expansionsState.loading = true;
+    expansionsState.error = "";
+    renderExpansionsSection();
+    try {
+      const nodes = await apiGet("/api/can/nodes");
+      expansionsState.items = Array.isArray(nodes) ? nodes : [];
+      expansionsState.lastScan = Date.now();
+    } catch(err){
+      expansionsState.items = [];
+      expansionsState.error = err?.message || "Impossibile recuperare le schede CAN.";
+    }
+    expansionsState.loading = false;
+    renderExpansionsSection();
+    if (expansionsState.error){
+      toast(`Nodo CAN: ${expansionsState.error}`, false);
+    }
+  }
+
+  async function scanExpansionBus(){
+    if (expansionsState.loading) return;
+    expansionsState.loading = true;
+    expansionsState.error = "";
+    renderExpansionsSection();
+    try {
+      await apiPost("/api/can/scan", {});
+      toast("Scansione CAN avviata");
+    } catch(err){
+      expansionsState.loading = false;
+      expansionsState.error = err?.message || "Impossibile avviare la scansione del bus CAN.";
+      renderExpansionsSection();
+      toast(`Nodo CAN: ${expansionsState.error}`, false);
+      return;
+    }
+    await loadExpansionNodes();
+  }
+
+  function openExpansionActions(nodeId){
+    const node = getExpansionItems().find((item) => Number(item?.node_id) === nodeId);
+    if (!node){
+      toast("Nodo non trovato", false);
+      return;
+    }
+    const title = escapeHtml(nodeTitle(node));
+    modal(`
+      <div class="card-head row" style="justify-content:space-between;align-items:center">
+        <h3>Gestisci nodo CAN</h3>
+        <button class="btn" id="mClose">Chiudi</button>
+      </div>
+      <div class="form" style="padding-bottom:.5rem">
+        <p class="muted">Seleziona l'azione da eseguire su <strong>${title}</strong> (ID ${nodeId}).</p>
+        <div class="row" style="gap:.5rem;flex-wrap:wrap">
+          <button class="btn outline" type="button" data-exp-action="offline" data-node-id="${nodeId}">Segna offline</button>
+          <button class="btn btn-danger" type="button" data-exp-action="forget" data-node-id="${nodeId}">Dimentica nodo</button>
+        </div>
+      </div>
+    `);
+    $("#mClose")?.addEventListener("click", () => closeModal());
+    $$("[data-exp-action]").forEach((btn) => {
+      btn.addEventListener("click", async (ev) => {
+        ev.preventDefault();
+        const mode = btn.getAttribute("data-exp-action");
+        const id = Number(btn.getAttribute("data-node-id"));
+        await handleExpansionAction(id, mode);
+      });
+    });
+  }
+
+  async function handleExpansionAction(nodeId, mode){
+    closeModal();
+    if (!Number.isFinite(nodeId) || nodeId <= 0){
+      toast("Operazione non valida", false);
+      return;
+    }
+    expansionsState.loading = true;
+    expansionsState.error = "";
+    renderExpansionsSection();
+    try {
+      const query = mode === "forget" ? "?hard=1" : "";
+      await apiDelete(`/api/can/nodes/${nodeId}${query}`);
+      toast(mode === "forget" ? "Nodo dimenticato" : "Nodo segnato offline");
+      await loadExpansionNodes();
+    } catch(err){
+      expansionsState.loading = false;
+      const message = err?.message || "Operazione CAN fallita";
+      expansionsState.error = message;
+      renderExpansionsSection();
+      toast(`Nodo CAN: ${message}`, false);
+    }
+  }
+
+  async function setupExpansionsSection(){
+    const scanBtn = $("#adminExpansionScanBtn");
+    if (scanBtn){
+      scanBtn.addEventListener("click", () => { scanExpansionBus(); });
+    }
+    const refreshBtn = $("#adminExpansionRefreshBtn");
+    if (refreshBtn){
+      refreshBtn.addEventListener("click", () => { loadExpansionNodes(); });
+    }
+    const list = $("#adminExpansionList");
+    if (list){
+      list.addEventListener("click", (event) => {
+        const btn = event.target.closest("[data-node-actions]");
+        if (!btn) return;
+        const nodeId = Number(btn.getAttribute("data-node-actions"));
+        if (!Number.isFinite(nodeId) || nodeId <= 0){
+          toast("Nodo master non modificabile", false);
+          return;
+        }
+        openExpansionActions(nodeId);
+      });
+    }
+    renderExpansionsSection();
+    await loadExpansionNodes();
+  }
+
   // ========== USERS
   function renderUsers(list){
     const tb = $("#usersTbody");
-    if (!Array.isArray(list) || !tb){ return; }
+    if (!tb){ return; }
     tb.innerHTML = "";
+    if (!Array.isArray(list)){
+      tb.innerHTML = `<tr><td colspan="7" class="muted">Impossibile leggere la lista utenti</td></tr>`;
+      return;
+    }
     if (list.length === 0){
       tb.innerHTML = `<tr><td colspan="7" class="muted">Nessun utente</td></tr>`;
       return;
     }
+    const frag = document.createDocumentFragment();
     for(const u of list){
       const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${u.username}</td>
-        <td>${u.first_name||""}</td>
-        <td>${u.last_name||""}</td>
-        <td>${u.has_pin ? "✅" : "—"}</td>
-        <td>${u.has_rfid ? (u.rfid_uid||"✅") : "—"}</td>
-        <td>${u.totp_enabled ? "✅" : "—"}</td>
-        <td><button class="btn btn-sm" data-edit="${u.username}">Modifica</button></td>
-      `;
-      tb.appendChild(tr);
+      const username = (u && typeof u.username === "string") ? u.username : "";
+      const firstName = (u && typeof u.first_name === "string") ? u.first_name : "";
+      const lastName = (u && typeof u.last_name === "string") ? u.last_name : "";
+      const hasPin = !!(u && u.has_pin);
+      const hasRfid = !!(u && u.has_rfid);
+      const rfidValue = hasRfid ? ((u && typeof u.rfid_uid === "string" && u.rfid_uid) ? u.rfid_uid : "✅") : "—";
+      const totpValue = !!(u && u.totp_enabled) ? "✅" : "—";
+      const cells = [
+        username,
+        firstName,
+        lastName,
+        hasPin ? "✅" : "—",
+        rfidValue,
+        totpValue
+      ];
+      for (const value of cells){
+        const td = document.createElement("td");
+        td.textContent = value;
+        tr.appendChild(td);
+      }
+      const actionTd = document.createElement("td");
+      const btn = document.createElement("button");
+      btn.className = "btn btn-sm";
+      btn.dataset.edit = username;
+      btn.textContent = "Modifica";
+      actionTd.appendChild(btn);
+      tr.appendChild(actionTd);
+      frag.appendChild(tr);
     }
+    tb.appendChild(frag);
     tb.querySelectorAll("[data-edit]").forEach(btn => btn.addEventListener("click", () => openEditUser(btn.getAttribute("data-edit"))));
   }
 
   async function loadUsers(){
     try{
       const list = await apiGet("/api/admin/users");
+      if (!Array.isArray(list)) throw new Error("formato inatteso");
       renderUsers(list);
-    }catch(e){ toast("Errore caricando utenti: " + e.message, false); }
+    }catch(e){
+      renderUsers(null);
+      toast("Errore caricando utenti: " + e.message, false);
+    }
   }
 
   // ---- Modals
@@ -485,21 +803,24 @@
 
   // ========== RETE / MQTT (placeholder salva)
   async function loadNetwork(){
+    const updateStaticVisibility = () => {
+      const select = $("#net_dhcp");
+      const row = $("#net_static");
+      if (!row) return;
+      const show = (select?.value || "1") === "0";
+      row.style.display = show ? "flex" : "none";
+    };
     try{
       const c = await apiGet("/api/sys/net");
       $("#net_host") && ($("#net_host").value = c.hostname || "");
       $("#net_dhcp") && ($("#net_dhcp").value = c.dhcp ? "1" : "0");
-      const showStatic = (c.dhcp ? "1" : "0") === "0";
-      const row = $("#net_static"); if (row) row.style.display = showStatic ? "flex" : "none";
+      updateStaticVisibility();
       $("#net_ip")   && ($("#net_ip").value   = c.ip   || "");
       $("#net_gw")   && ($("#net_gw").value   = c.gw   || "");
       $("#net_mask") && ($("#net_mask").value = c.mask || "");
       $("#net_dns")  && ($("#net_dns").value  = c.dns  || "");
     }catch(e){ toast("Errore caricando rete: " + e.message, false); }
-    $("#net_dhcp")?.addEventListener("change", (ev)=>{
-      const row = $("#net_static");
-      if (row) row.style.display = (ev.target.value === "0") ? "flex" : "none";
-    });
+    $("#net_dhcp")?.addEventListener("change", updateStaticVisibility);
     $("#btnNetSave")?.addEventListener("click", async ()=>{
       const body = {
         hostname: $("#net_host")?.value || "",
@@ -650,11 +971,13 @@
   (async function init(){
     const me = await apiGet("/api/me");
     currentUser = me.user || "";
-    isAdmin = (typeof me.role === "number" ? me.role : parseInt(me.role, 10) || 0) >= 2;
+    const role = normalizeRole(me.role);
+    isAdmin = role != null ? role >= ROLE_ADMIN : !!me.is_admin;
     syncHeader();
     mountUserMenu();
+    updateAdminVisibility();
     setupSidebar();
-    const setupPromises = [setupNetMqttForms(), setupWebSecForm()];
+    const setupPromises = [setupNetMqttForms(), setupWebSecForm(), setupExpansionsSection()];
     document.querySelector('[data-tab="home"]')?.addEventListener('click', (e) => {
       e.preventDefault();
       location.href = "/index.html";

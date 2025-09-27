@@ -19,16 +19,7 @@
             <span class="brand-label">Alarm Pro</span>
             <span class="brand-sub" id="systemLabel"></span>
           </div>
-        </div>
-
-        <nav class="nav">
-          <div class="tabs toolbar">
-            <button class="tab-btn" data-tab="status">STATO</button>
-            <button class="tab-btn" data-tab="zones">ZONE</button>
-            <button class="tab-btn" data-tab="scenes">SCENARI</button>
-            <button class="tab-btn" data-tab="log">LOG</button>
-          </div>
-        </nav>
+        </div>        
 
         <div class="user user-menu">
           <button id="userBtn" class="user-btn">
@@ -49,23 +40,18 @@
     </header>
 
     <main class="container main">
+      <nav class="nav">
+        <div class="tabs toolbar">
+          <button class="tab-btn" data-tab="status">STATO</button>
+          <button class="tab-btn" data-tab="zones">ZONE</button>
+          <button class="tab-btn" data-tab="scenes">SCENARI</button>
+          <button class="tab-btn" data-tab="log">LOG</button>
+        </div>
+      </nav>
       <section id="tab-status" class="tab active">
         <div id="statusCards" class="kpi-grid"></div>
 
-      <section class="wizard-step active" data-step="general" aria-labelledby="step-general">
-        <form id="generalForm" class="wizard-form" autocomplete="off">
-          <div class="field">
-            <label for="general_name">Nome Centrale</label>
-            <input id="general_name" name="central_name" type="text" placeholder="Centrale principale" required />
-          </div>
-          <p class="summary-footer">Il nome viene mostrato nelle interfacce utente e identifica in modo univoco la centrale.</p>
-          <div class="wizard-actions">
-            <button id="generalNext" type="submit" class="btn primary">Salva e continua</button>
-          </div>
-        </form>
-      </section>
-
-        <div id="commandCards" class="kpi-grid">
+        <div id="commandCards">
           <div class="card">
             <div class="kpi">
               <div class="kpi-title">Comandi</div>
@@ -104,7 +90,7 @@
           <h3>Zone</h3>
           <button id="btnZonesCfg" class="btn small admin-only">Configura zone</button>
         </div>
-        <div id="zonesGrid" class="zones-grid"></div>
+        <div id="zonesBoards" class="board-sections"></div>
       </section>
 
       <section id="tab-scenes" class="tab">

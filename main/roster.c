@@ -190,6 +190,23 @@ esp_err_t roster_mark_offline(uint8_t node_id, uint64_t now_ms)
     return ESP_OK;
 }
 
+esp_err_t roster_forget_node(uint8_t node_id)
+{
+    if (node_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    if (!node || !node->used) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+    memset(node, 0, sizeof(*node));
+    xSemaphoreGive(s_roster_lock);
+    return ESP_OK;
+}
+
 esp_err_t roster_set_identify(uint8_t node_id, bool active, bool *out_changed)
 {
     if (node_id == 0) {

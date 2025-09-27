@@ -19,6 +19,8 @@
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "mqtt_client.h"
+#include "nvs.h"
+
 
 #include "alarm_core.h"
 #include "device_identity.h"
@@ -40,6 +42,11 @@ static esp_mqtt_client_handle_t s_client = NULL;
 
 static bool                     s_connected = false;
 static char                     s_device_id[64] = {0};
+static char                     s_mqtt_uri[96] = {0};
+static char                     s_mqtt_client_id[64] = {0};
+static char                     s_mqtt_user[64] = {0};
+static char                     s_mqtt_pass[64] = {0};
+static uint32_t                 s_mqtt_keepalive = CONFIG_APP_CLOUD_KEEPALIVE;
 static char                     s_topic_state[128];
 static char                     s_topic_zones[128];
 static char                     s_topic_avail[128];
@@ -77,6 +84,56 @@ static void build_topics(void)
     snprintf(s_topic_cmd_base, sizeof(s_topic_cmd_base), "%s/cmd/%s", root, s_device_id);
     snprintf(s_topic_cmd_sub, sizeof(s_topic_cmd_sub), "%s/#", s_topic_cmd_base);
     s_cmd_base_len = strlen(s_topic_cmd_base);
+}
+
+static void load_mqtt_config_from_nvs(void)
+{
+    const char *default_uri = CONFIG_APP_CLOUD_MQTT_URI;
+    const char *default_user = CONFIG_APP_CLOUD_USERNAME[0] ? CONFIG_APP_CLOUD_USERNAME : s_device_id;
+
+    strlcpy(s_mqtt_uri, default_uri, sizeof(s_mqtt_uri));
+    strlcpy(s_mqtt_client_id, s_device_id, sizeof(s_mqtt_client_id));
+    strlcpy(s_mqtt_user, default_user, sizeof(s_mqtt_user));
+    strlcpy(s_mqtt_pass, CONFIG_APP_CLOUD_PASSWORD, sizeof(s_mqtt_pass));
+    s_mqtt_keepalive = CONFIG_APP_CLOUD_KEEPALIVE;
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("sys", NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        return;
+    }
+
+    size_t len = sizeof(s_mqtt_uri);
+    err = nvs_get_str(nvs, "mq_uri", s_mqtt_uri, &len);
+    if (err != ESP_OK) {
+        strlcpy(s_mqtt_uri, default_uri, sizeof(s_mqtt_uri));
+    }
+
+    len = sizeof(s_mqtt_client_id);
+    err = nvs_get_str(nvs, "mq_cid", s_mqtt_client_id, &len);
+    if (err != ESP_OK || s_mqtt_client_id[0] == '\0') {
+        strlcpy(s_mqtt_client_id, s_device_id, sizeof(s_mqtt_client_id));
+    }
+
+    len = sizeof(s_mqtt_user);
+    err = nvs_get_str(nvs, "mq_user", s_mqtt_user, &len);
+    if (err != ESP_OK || s_mqtt_user[0] == '\0') {
+        strlcpy(s_mqtt_user, default_user, sizeof(s_mqtt_user));
+    }
+
+    len = sizeof(s_mqtt_pass);
+    err = nvs_get_str(nvs, "mq_pass", s_mqtt_pass, &len);
+    if (err != ESP_OK) {
+        strlcpy(s_mqtt_pass, CONFIG_APP_CLOUD_PASSWORD, sizeof(s_mqtt_pass));
+    }
+
+    uint32_t keepalive = 0;
+    err = nvs_get_u32(nvs, "mq_keep", &keepalive);
+    if (err == ESP_OK && keepalive > 0) {
+        s_mqtt_keepalive = keepalive;
+    }
+
+    nvs_close(nvs);
 }
 
 static inline const char* alarm_state_to_name(alarm_state_t st)
@@ -447,18 +504,20 @@ esp_err_t mqtt_start(void)
 
     build_device_id();
     build_topics();
+    load_mqtt_config_from_nvs();
+
 
     esp_mqtt_client_config_t cfg = {
-        .broker.address.uri = CONFIG_APP_CLOUD_MQTT_URI,
+        .broker.address.uri = s_mqtt_uri,
         .broker.verification.certificate = (const char *)certs_broker_ca_pem_start,
         .broker.verification.certificate_len = (size_t)(certs_broker_ca_pem_end - certs_broker_ca_pem_start),
         .credentials = {
-            .client_id = s_device_id,
-            .username = CONFIG_APP_CLOUD_USERNAME[0] ? CONFIG_APP_CLOUD_USERNAME : NULL,
-            .authentication.password = CONFIG_APP_CLOUD_PASSWORD[0] ? CONFIG_APP_CLOUD_PASSWORD : NULL,
+            .client_id = s_mqtt_client_id,
+            .username = s_mqtt_user[0] ? s_mqtt_user : NULL,
+            .authentication.password = s_mqtt_pass[0] ? s_mqtt_pass : NULL,
         },
         .session = {
-            .keepalive = CONFIG_APP_CLOUD_KEEPALIVE,
+            .keepalive = (uint16_t)s_mqtt_keepalive,
             .last_will = {
                 .topic = s_topic_avail,
                 .msg = "offline",

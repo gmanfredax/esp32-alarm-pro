@@ -1,4 +1,3 @@
-
 import {
   apiGet,
   apiPost,
@@ -13,14 +12,65 @@ import {
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 
+const ROLE_ADMIN = 2;
+
 const state = {
   currentUser: '',
+  role: null,
   isAdmin: false,
   status: null,
   zones: [],
   scenes: null,
-  logs: []
+  logs: [],
+  activeTab: ''
 };
+
+const STATUS_POLL_INTERVAL = 2000;
+const ZONESS_POLL_INTERVAL = 2000;
+let statusPollTimer = null;
+let zonesPollTimer = null;
+
+function stopStatusUpdates(){
+  if (statusPollTimer) {
+    clearInterval(statusPollTimer);
+    statusPollTimer = null;
+  }
+}
+
+function startStatusUpdates({ immediate = false } = {}){
+  if (statusPollTimer || document.hidden || state.activeTab !== 'status') return;
+  if (immediate) {
+    refreshStatus();
+  }
+  statusPollTimer = window.setInterval(() => {
+    if (document.hidden || state.activeTab !== 'status') {
+      stopStatusUpdates();
+      return;
+    }
+    refreshStatus();
+  }, STATUS_POLL_INTERVAL);
+}
+
+function stopZonesUpdates(){
+  if (zonesPollTimer) {
+    clearInterval(zonesPollTimer);
+    zonesPollTimer = null;
+  }
+}
+
+function startZonesUpdates({ immediate = false } = {}){
+  if (zonesPollTimer || document.hidden || state.activeTab !== 'zones') return;
+  if (immediate) {
+    refreshZones();
+  }
+  zonesPollTimer = window.setInterval(() => {
+    if (document.hidden || state.activeTab !== 'zones') {
+      stopZonesUpdates();
+      return;
+    }
+    refreshZones();
+  }, ZONESS_POLL_INTERVAL);
+}
 
 const dateTimeFormatter = new Intl.DateTimeFormat('it-IT', {
   dateStyle: 'short',
@@ -44,15 +94,30 @@ function setBrandSystem(){
   }
 }
 
+function setBrandCentralName(name){
+  const label = document.querySelector('.brand-label');
+  if (!label) return;
+  const trimmed = (name ?? '').toString().trim();
+  label.textContent = trimmed ? `Alarm Pro • ${trimmed}` : 'Alarm Pro';
+}
+
 function setActiveTab(name){
   $$('.tab-btn').forEach((btn) => btn.classList.toggle('active', btn.dataset.tab === name));
   $$('.tab').forEach((section) => section.classList.toggle('active', section.id === `tab-${name}`));
+  state.activeTab = name;
+  if (name !== 'status') {
+    stopStatusUpdates();
+  } else if (name !== 'zones') {
+    stopZonesUpdates();
+  }
   switch (name) {
     case 'status':
       refreshStatus();
+      startStatusUpdates();
       break;
     case 'zones':
       refreshZones();
+      startZonesUpdates();
       break;
     case 'scenes':
       refreshScenes();
@@ -82,6 +147,7 @@ function showNotice(text, type = 'info'){
     el.classList.add('hidden');
     return;
   }
+
   el.textContent = text;
   el.classList.remove('hidden');
   el.style.color = type === 'error' ? '#f87171' : '#a5f3fc';
@@ -156,6 +222,7 @@ async function refreshStatus(){
   try {
     const data = await apiGet('/api/status');
     state.status = data;
+    setBrandCentralName(data?.central_name);
     const wrap = $('#statusCards');
     if (!wrap) return;
     const zonesActive = Array.isArray(data?.zones_active) ? data.zones_active.filter(Boolean).length : (data?.zones_active || 0);
@@ -168,6 +235,9 @@ async function refreshStatus(){
     ].join('');
     const stateEl = document.getElementById('kpi-state-val');
     if (stateEl) renderAlarmState(stateEl, data, { iconHTML: stateIcon(data?.state) });
+    if (state.activeTab === 'zones' && !document.hidden) {
+      refreshZones();
+    }
   } catch (err) {
     console.error('refreshStatus', err);
     showNotice('Impossibile recuperare lo stato.', 'error');
@@ -327,31 +397,87 @@ function setupCommands(){
   $$('#commandCards button[data-arm]').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const mode = btn.dataset.arm;
+      const pin = await promptForPin({
+        title: 'Inserisci PIN per attivare',
+        confirmLabel: 'Attiva',
+        description: mode ? `Modalità: ${mode.toUpperCase()}` : ''
+      });
+      if (pin == null) {
+        return;
+      }
       try {
-        await apiPost('/api/arm', { mode });
+        await apiPost('/api/arm', { mode, pin });
         showNotice(`Comando ${mode?.toUpperCase()} inviato.`, 'info');
         refreshStatus();
+        if (state.activeTab === 'zones') {
+          refreshZones();
+        }
       } catch (err) {
         console.error('arm', err);
-        showNotice('Errore durante l’invio del comando.', 'error');
+        if (err instanceof HttpError) {
+          if (err.status === 401) {
+            showNotice('PIN errato.', 'error');
+          } else if (err.status === 409) {
+            showNotice('Impossibile attivare: zone aperte.', 'error');
+          } else {
+            showNotice(err.message || 'Errore durante l’invio del comando.', 'error');
+          }
+        } else {
+          showNotice('Errore durante l’invio del comando.', 'error');
+        }
       }
     });
   });
   $('#disarmBtn')?.addEventListener('click', async () => {
+    if (state.status?.state === 'DISARMED') {
+      showNotice('La centrale è già disarmata.', 'info');
+      return;
+    }
+    const pin = await promptForPin({
+      title: 'Inserisci PIN per disattivare',
+      confirmLabel: 'Disattiva'
+    });
+    if (pin == null) {
+      return;
+    }
     try {
-      await apiPost('/api/disarm', {});
+      await apiPost('/api/disarm', { pin });
       showNotice('Centrale disarmata.', 'info');
       refreshStatus();
+      if (state.activeTab === 'zones') {
+        refreshZones();
+      }
     } catch (err) {
       console.error('disarm', err);
-      showNotice('Errore durante il comando di disarmo.', 'error');
+      if (err instanceof HttpError) {
+        if (err.status === 401) {
+          showNotice('PIN errato.', 'error');
+        } else if (err.status === 409) {
+          showNotice('Impossibile disarmare: zone aperte.', 'error');
+        } else {
+          showNotice(err.message || 'Errore durante il comando di disarmo.', 'error');
+        }
+      } else {
+        showNotice('Errore durante il comando di disarmo.', 'error');
+      }
     }
   });
 }
 
+function normalizeRole(roleValue){
+  if (typeof roleValue === 'number') return Number.isNaN(roleValue) ? null : roleValue;
+  if (typeof roleValue === 'string' && roleValue.trim() !== '') {
+    const parsed = Number.parseInt(roleValue, 10);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
 function updateAdminVisibility(){
+  document.body.classList.toggle('is-admin', state.isAdmin);
   $$('.admin-only').forEach((el) => {
-    el.style.display = state.isAdmin ? '' : 'none';
+    el.classList.toggle('hidden', !state.isAdmin);
+    el.style.removeProperty('display');
   });
 }
 
@@ -373,9 +499,93 @@ function showModal(innerHtml){
   document.body.classList.add('modal-open');
   const overlay = modalsRoot.firstElementChild;
   overlay?.addEventListener('click', (event) => {
-    if (event.target === overlay) clearModals();
+    if (event.target === overlay && !event.defaultPrevented) clearModals();
   });
   return overlay?.querySelector('.modal') || null;
+}
+
+function promptForPin({
+  title = 'Inserisci PIN',
+  confirmLabel = 'Conferma',
+  description = ''
+} = {}){
+  return new Promise((resolve) => {
+    const modal = showModal(`
+      <h3 class="title">${escapeHtml(title)}</h3>
+      ${description ? `<p class="muted">${escapeHtml(description)}</p>` : ''}
+      <form class="form" id="pin_form">
+        <label class="field"><span>PIN</span><input id="pin_input" type="password" inputmode="numeric" autocomplete="one-time-code"></label>
+        <div class="row" style="justify-content:flex-end;gap:.5rem">
+          <button type="button" class="btn secondary" data-act="cancel">Annulla</button>
+          <button type="submit" class="btn primary" data-act="confirm">${escapeHtml(confirmLabel)}</button>
+        </div>
+      </form>
+    `);
+    if (!modal) {
+      resolve(null);
+      return;
+    }
+
+    const overlay = modal.parentElement;
+    const form = modal.querySelector('#pin_form');
+    const input = modal.querySelector('#pin_input');
+    const cancelBtn = modal.querySelector('[data-act="cancel"]');
+    let done = false;
+
+    const cleanup = () => {
+      modal.removeEventListener('keydown', onKeyDown);
+      overlay?.removeEventListener('click', onOverlayClick, true);
+      cancelBtn?.removeEventListener('click', onCancel);
+      form?.removeEventListener('submit', onSubmit);
+    };
+
+    const close = (value) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      clearModals();
+      resolve(value);
+    };
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close(null);
+      }
+    };
+
+    const onOverlayClick = (event) => {
+      if (event.target === overlay) {
+        event.preventDefault();
+        close(null);
+      }
+    };
+
+    const onCancel = (event) => {
+      event.preventDefault();
+      close(null);
+    };
+
+    const onSubmit = (event) => {
+      event.preventDefault();
+      const pin = (input?.value ?? '').trim();
+      if (!pin) {
+        input?.focus();
+        return;
+      }
+      close(pin);
+    };
+
+    modal.addEventListener('keydown', onKeyDown);
+    overlay?.addEventListener('click', onOverlayClick, true);
+    cancelBtn?.addEventListener('click', onCancel);
+    form?.addEventListener('submit', onSubmit);
+
+    setTimeout(() => {
+      input?.focus();
+      input?.select();
+    }, 0);
+  });
 }
 
 function ensureQRCode(target, text){
@@ -576,10 +786,19 @@ function setupUserMenu(){
 async function loadSession(){
   const me = await apiGet('/api/me');
   state.currentUser = me?.user || '';
-  state.isAdmin = !!me?.is_admin;
+  const role = normalizeRole(me?.role);
+  state.role = role;
+  const fallbackAdmin = !!me?.is_admin;
+  state.isAdmin = role != null ? role >= ROLE_ADMIN : fallbackAdmin;
   const label = $('#userLabel');
   if (label) {
-    label.textContent = state.currentUser ? `${state.currentUser}${state.isAdmin ? ' (admin)' : ''}` : '';
+    if (!state.currentUser) {
+      label.textContent = '';
+    } else {
+      const userHtml = `<span class="user-name">${escapeHtml(state.currentUser)}</span>`;
+      const roleHtml = state.isAdmin ? ' <span class="user-role tag warn">ADMIN</span>' : '';
+      label.innerHTML = `${userHtml}${roleHtml}`;
+    }
   }
   updateAdminVisibility();
 }
@@ -599,6 +818,25 @@ async function init(){
 
   $('#logsRefresh')?.addEventListener('click', () => refreshLogs());
 
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      stopStatusUpdates();
+      stopZonesUpdates();
+    } else if (state.activeTab === 'status') {
+      startStatusUpdates({ immediate: true });
+    } else if (state.activeTab === 'zones') {
+      startZonessUpdates({ immediate: true });
+    }
+  });
+  window.addEventListener('pagehide', () => {    
+    stopStatusUpdates();
+    stopZonesUpdates();    
+  });
+  window.addEventListener('beforeunload', () => {    
+    stopStatusUpdates();
+    stopZonesUpdates();    
+  });
+
   try {
     await loadSession();
   } catch (err) {
@@ -609,7 +847,6 @@ async function init(){
 
   $('#appRoot')?.classList.remove('hidden');
   setActiveTab('status');
-  refreshStatus();
 }
 
 init();
