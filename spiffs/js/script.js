@@ -1,5 +1,5 @@
 const DEFAULT_CLOUDFLARE_UI = 'https://ui.nsalarm.pro';
-const stepsOrder = ['general', 'network', 'mqtt', 'cloudflare', 'summary'];
+const stepsOrder = ['general', 'network', 'expansions', 'mqtt', 'cloudflare', 'summary'];
 let currentStep = 0;
 
 const state = {
@@ -14,6 +14,13 @@ const state = {
     gw: '',
     mask: '',
     dns: '',
+  },
+  expansions: {
+    items: [],
+    lastScan: null,
+    loading: false,
+    completed: false,
+    error: '',
   },
   mqtt: {
     uri: '',
@@ -130,6 +137,123 @@ function toggleNetStatic(dhcpEnabled){
   });
 }
 
+function formatDateTime(ts){
+  if (!ts && ts !== 0) return '';
+  let date;
+  if (ts instanceof Date) date = ts;
+  else if (typeof ts === 'string' && ts) date = new Date(ts);
+  else if (typeof ts === 'number') date = new Date(ts);
+  else return '';
+  if (Number.isNaN(date.getTime())) return '';
+  try {
+    return date.toLocaleString('it-IT');
+  } catch (err) {
+    return date.toISOString();
+  }
+}
+
+function renderExpansionsSection(){
+  const items = Array.isArray(state.expansions.items) ? state.expansions.items : [];
+  const list = $('#expansionList');
+  if (list){
+    list.innerHTML = items.map((node)=>{
+      if (!node) return '';
+      const titleParts = [];
+      if (typeof node.label === 'string' && node.label.trim()){
+        titleParts.push(node.label.trim());
+      } else if (typeof node.kind === 'string' && node.kind.trim()){
+        titleParts.push(node.kind.trim());
+      } else {
+        titleParts.push(`Nodo ${node.node_id ?? '?'}`);
+      }
+      const metaParts = [];
+      if (node.node_id != null) metaParts.push(`ID ${node.node_id}`);
+      if (node.kind) metaParts.push(String(node.kind));
+      if (node.state) metaParts.push(String(node.state));
+      const ioInfo = [];
+      if (node.inputs_count != null) ioInfo.push(`${node.inputs_count} ingressi`);
+      if (node.outputs_count != null) ioInfo.push(`${node.outputs_count} uscite`);
+      if (ioInfo.length) metaParts.push(ioInfo.join(' · '));
+      const meta = metaParts.filter(Boolean).map((part)=>escapeHtml(String(part))).join(' · ');
+      return `<li class="expansion-item"><div class="expansion-title">${escapeHtml(titleParts.join(' – '))}</div>${meta ? `<div class="expansion-meta">${meta}</div>` : ''}</li>`;
+    }).join('');
+  }
+  const empty = $('#expansionEmpty');
+  if (empty){
+    const expansionsCount = items.filter((node)=>node && Number(node.node_id) > 0).length;
+    const showEmpty = !state.expansions.loading && !state.expansions.error && expansionsCount === 0;
+    empty.classList.toggle('hidden', !showEmpty);
+  }
+  const status = $('#expansionStatus');
+  if (status){
+    status.classList.remove('hidden', 'error', 'success');
+    if (state.expansions.loading){
+      status.textContent = 'Ricerca nodi in corso...';
+    } else if (state.expansions.error){
+      status.textContent = state.expansions.error;
+      status.classList.add('error');
+    } else if (state.expansions.completed){
+      const when = formatDateTime(state.expansions.lastScan);
+      status.textContent = when ? `Ultimo aggiornamento: ${when}` : 'Elenco aggiornato.';
+      status.classList.add('success');
+    } else {
+      status.textContent = '';
+      status.classList.add('hidden');
+    }
+  }
+  const scanBtn = $('#expansionScanBtn');
+  if (scanBtn) scanBtn.disabled = state.expansions.loading;
+  const nextBtn = $('#expansionsNext');
+  if (nextBtn) nextBtn.disabled = !state.expansions.completed || state.expansions.loading;
+}
+
+async function loadCanNodes(){
+  state.expansions.loading = true;
+  state.expansions.error = '';
+  state.expansions.completed = false;
+  renderExpansionsSection();
+  updateSummary();
+  updateProgress();
+  try {
+    const nodes = await apiGet('/api/can/nodes');
+    if (Array.isArray(nodes)){
+      state.expansions.items = nodes;
+    } else {
+      state.expansions.items = [];
+    }
+    state.expansions.completed = true;
+    state.expansions.lastScan = Date.now();
+  } catch (err) {
+    state.expansions.error = err?.message || 'Impossibile recuperare le schede CAN.';
+    state.expansions.items = [];
+    state.expansions.completed = false;
+  }
+  state.expansions.loading = false;
+  renderExpansionsSection();
+  updateSummary();
+  updateProgress();
+}
+
+async function requestCanScan(){
+  state.expansions.loading = true;
+  state.expansions.error = '';
+  state.expansions.completed = false;
+  renderExpansionsSection();
+  updateSummary();
+  updateProgress();
+  try {
+    await apiPost('/api/can/scan', {});
+  } catch (err) {
+    state.expansions.loading = false;
+    state.expansions.error = err?.message || 'Impossibile avviare la scansione del bus CAN.';
+    renderExpansionsSection();
+    updateSummary();
+    updateProgress();
+    return;
+  }
+  await loadCanNodes();
+}
+
 function renderMqttTestFeedback(){
   const box = $('#mqttTestStatus');
   if (!box) return;
@@ -181,6 +305,9 @@ function setStep(index){
   $all('.wizard-step').forEach((section)=>{
     section.classList.toggle('active', section.dataset.step === stepName);
   });
+  if (stepName === 'expansions' && !state.expansions.completed && !state.expansions.loading){
+    loadCanNodes();
+  }
   updateProgress();
   updateSummary();
   refreshMqttControls();
@@ -197,6 +324,7 @@ function updateProgress(){
   const completion = {
     general: isGeneralComplete(),
     network: isNetworkComplete(),
+    expansions: isExpansionsComplete(),
     mqtt: isMqttComplete(),
     cloudflare: isCloudflareComplete(),
     summary: state.provisioned,
@@ -206,6 +334,10 @@ function updateProgress(){
     const idx = stepsOrder.indexOf(key);
     item.classList.toggle('active', idx === currentStep);
     item.classList.toggle('done', completion[key]);
+    const indexBadge = item.querySelector('.step-index');
+    if (indexBadge && idx >= 0){
+      indexBadge.textContent = String(idx + 1);
+    }
   });
 }
 
@@ -235,6 +367,36 @@ function updateSummary(){
     ok: isNetworkComplete(),
     details: networkDetails,
   });
+  
+  const expansionItems = Array.isArray(state.expansions.items) ? state.expansions.items : [];
+  const expansionsDetails = [];
+  const masterNode = expansionItems.find((node)=>node && Number(node.node_id) === 0);
+  if (masterNode){
+    const label = (masterNode.label && String(masterNode.label).trim()) || (masterNode.kind && String(masterNode.kind).trim()) || 'Master';
+    expansionsDetails.push(`Master: ${label}`);
+  }
+  const expansionsCount = expansionItems.filter((node)=>node && Number(node.node_id) > 0).length;
+  expansionsDetails.push(`Schede collegate: ${expansionsCount}`);
+  const lastScan = formatDateTime(state.expansions.lastScan);
+  if (lastScan){
+    expansionsDetails.push(`Ultimo aggiornamento: ${lastScan}`);
+  }
+  if (state.expansions.loading){
+    expansionsDetails.push('Ricerca nodi CAN in corso…');
+  }
+  if (state.expansions.error){
+    expansionsDetails.push(`Errore: ${state.expansions.error}`);
+  }
+  if (!expansionsDetails.length){
+    expansionsDetails.push('Nessun dato disponibile.');
+  }
+  rows.push({
+    id: 'expansions',
+    title: 'Espansioni CAN',
+    ok: isExpansionsComplete(),
+    details: expansionsDetails,
+  });
+
 
   const mqttDetails = [];
   const deviceId = state.deviceId || state.mqtt.cid || state.mqtt.user || '';
@@ -297,11 +459,12 @@ function updateSummary(){
     link.href = url;
     link.classList.toggle('hidden', !state.provisioned);
   }
+}
 
 function readGeneralForm(){
   const centralName = ($('#general_name')?.value || '').trim();
   return { centralName };
-}}
+}
 
 function readNetworkForm(){
   const dhcp = !!$('#net_dhcp')?.checked;
@@ -345,6 +508,10 @@ function isNetworkComplete(){
 
 function isGeneralComplete(){
   return !!state.general.centralName;
+}
+
+function isExpansionsComplete(){
+  return !!state.expansions.completed;
 }
 
 function isMqttComplete(){
@@ -393,7 +560,7 @@ async function submitNetwork(event){
     state.network = { ...state.network, ...payload };
     toggleNetStatic(payload.dhcp);
     showMessage('Configurazione di rete salvata.', 'success');
-    goToStep('mqtt');
+    goToStep('expansions');
   } catch (err) {
     showMessage(err.message || 'Salvataggio rete fallito.', 'error');
   } finally {
@@ -623,6 +790,7 @@ async function loadInitialStatus(){
   } catch (err) {
     showMessage('Impossibile leggere lo stato iniziale: ' + (err.message || ''), 'error');
   }
+  await loadCanNodes();
   hydrateForms();
   refreshMqttControls();
   updateSummary();
@@ -637,6 +805,14 @@ function initWizard(){
   $('#networkForm')?.addEventListener('submit', submitNetwork);
   $('#mqttForm')?.addEventListener('submit', submitMqtt);
   $('#mqttTestBtn')?.addEventListener('click', testMqttConnection);
+  $('#expansionScanBtn')?.addEventListener('click', ()=>{ requestCanScan(); });
+  $('#expansionsNext')?.addEventListener('click', ()=>{
+    if (state.expansions.completed){
+      goToStep('mqtt');
+    } else if (!state.expansions.loading){
+      showMessage('Attendi il completamento del caricamento delle schede CAN prima di proseguire.', 'error');
+    }
+  });
   $('#cloudflareForm')?.addEventListener('submit', submitCloudflare);
   $('#finishBtn')?.addEventListener('click', finishProvisioning);
   ['#mqtt_uri', '#mqtt_cid', '#mqtt_user', '#mqtt_pass', '#mqtt_keep'].forEach((sel)=>{
@@ -646,6 +822,7 @@ function initWizard(){
   });
   bindPrevButtons();
   refreshMqttControls();
+  renderExpansionsSection();
   loadInitialStatus().then(()=>{
     if (state.provisioned){
       const summaryIdx = stepsOrder.indexOf('summary');
@@ -660,7 +837,13 @@ function initWizard(){
         link.classList.remove('hidden');
       }
     } else {
-      setStep(0);
+      if (document.querySelector('.wizard-step[data-step="general"]')){
+        goToStep('general');
+      } else if (document.querySelector('.wizard-step[data-step="network"]')){
+        goToStep('network');
+      } else {
+        setStep(0);
+      }
     }
   });
 }

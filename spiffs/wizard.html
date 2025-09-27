@@ -143,6 +143,24 @@
       outline: 2px solid rgba(34,211,238,.35);
       border-color: rgba(34,211,238,.55);
     }
+    .wizard-note {
+      margin: 0;
+      padding: .65rem .85rem;
+      border-radius: 12px;
+      border: 1px dashed rgba(148,163,184,.35);
+      background: rgba(10,18,36,.45);
+      color: var(--muted);
+      font-size: .9rem;
+      line-height: 1.45;
+    }
+    .wizard-note code {
+      font-family: inherit;
+      font-size: .88rem;
+      color: var(--text);
+      background: rgba(255,255,255,.08);
+      padding: .1rem .35rem;
+      border-radius: 6px;
+    }
     .wizard-actions {
       display: flex;
       gap: .75rem;
@@ -155,6 +173,37 @@
     .summary-grid {
       display: grid;
       gap: .75rem;
+    }
+    .expansion-list {
+      list-style: none;
+      display: grid;
+      gap: .75rem;
+      padding: 0;
+      margin: 0;
+    }
+    .expansion-item {
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: .8rem 1rem;
+      background: rgba(9,16,31,.7);
+      display: grid;
+      gap: .35rem;
+    }
+    .expansion-item .expansion-title {
+      font-weight: 600;
+      font-size: .95rem;
+    }
+    .expansion-item .expansion-meta {
+      font-size: .85rem;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: .4rem;
+    }
+    .expansion-empty {
+      color: var(--muted);
+      font-size: .9rem;
+      margin: 0;
     }
     .summary-item {
       border: 1px solid var(--border);
@@ -231,20 +280,31 @@
       </div>
 
       <ol class="wizard-steps" id="wizardSteps">
-        <li data-step-label="network" class="active"><span class="step-index">1</span><span class="step-label">Rete</span></li>
-        <li data-step-label="mqtt"><span class="step-index">2</span><span class="step-label">MQTT</span></li>
-        <li data-step-label="cloudflare"><span class="step-index">3</span><span class="step-label">Cloudflare</span></li>
-        <li data-step-label="summary"><span class="step-index">4</span><span class="step-label">Riepilogo</span></li>
+        <li data-step-label="general" class="active"><span class="step-index">1</span><span class="step-label">Generale</span></li>
+        <li data-step-label="network"><span class="step-index">2</span><span class="step-label">Rete</span></li>
+        <li data-step-label="expansions"><span class="step-index">2</span><span class="step-label">Espansioni CAN</span></li>
+        <li data-step-label="mqtt"><span class="step-index">3</span><span class="step-label">MQTT</span></li>
+        <li data-step-label="cloudflare"><span class="step-index">4</span><span class="step-label">Cloudflare</span></li>
+        <li data-step-label="summary"><span class="step-index">5</span><span class="step-label">Riepilogo</span></li>
       </ol>
 
       <div id="wizardMessage" class="wizard-message hidden" role="alert"></div>
 
-      <section class="wizard-step active" data-step="network" aria-labelledby="step-network">
-        <form id="networkForm" class="wizard-form" autocomplete="off">
+      <section class="wizard-step active" data-step="general" aria-labelledby="step-general">
+        <form id="generalForm" class="wizard-form" autocomplete="off">
           <div class="field">
-            <label for="net_hostname">Hostname della centrale</label>
-            <input id="net_hostname" name="hostname" type="text" placeholder="nsalarmpro" required />
+            <label for="general_name">Nome della centrale</label>
+            <input id="general_name" name="central_name" type="text" placeholder="Alarm Pro" required />
           </div>
+          <div class="wizard-actions">
+            <button id="generalNext" type="submit" class="btn primary">Salva e continua</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="wizard-step" data-step="network" aria-labelledby="step-network">
+        <form id="networkForm" class="wizard-form" autocomplete="off">
+          <p class="wizard-note">L'hostname del dispositivo &egrave; fissato a <code>nsalarmpro</code>.</p>
           <div class="field">
             <label class="checkbox" for="net_dhcp">
               <input id="net_dhcp" name="dhcp" type="checkbox" checked />
@@ -271,9 +331,24 @@
           </div>
           <p class="summary-footer">I parametri sono salvati subito nella NVS di sistema.</p>
           <div class="wizard-actions">
+            <button type="button" class="btn outline" data-prev="general">Indietro</button>
             <button id="networkNext" type="submit" class="btn primary">Salva e continua</button>
           </div>
         </form>
+      </section>
+
+      <section class="wizard-step" data-step="expansions" aria-labelledby="step-expansions">
+        <div>
+          <p class="summary-footer">Verifica che il master e le schede CAN collegate siano riconosciute correttamente prima di proseguire.</p>
+        </div>
+        <div id="expansionStatus" class="wizard-message hidden" role="status"></div>
+        <ul id="expansionList" class="expansion-list"></ul>
+        <p id="expansionEmpty" class="expansion-empty">nessuna scheda trovata</p>
+        <div class="wizard-actions">
+          <button type="button" class="btn outline" data-prev="network">Indietro</button>
+          <button id="expansionScanBtn" type="button" class="btn outline">Scansiona bus CAN</button>
+          <button id="expansionsNext" type="button" class="btn primary">Continua</button>
+        </div>
       </section>
 
       <section class="wizard-step" data-step="mqtt" aria-labelledby="step-mqtt">
@@ -300,7 +375,7 @@
           </div>
           <p class="summary-footer">Assicurati che il broker accetti connessioni dalla rete della centrale.</p>
           <div class="wizard-actions">
-            <button type="button" class="btn outline" data-prev="network">Indietro</button>
+            <button type="button" class="btn outline" data-prev="expansions">Indietro</button>
             <button id="mqttNext" type="submit" class="btn primary">Salva e continua</button>
           </div>
         </form>

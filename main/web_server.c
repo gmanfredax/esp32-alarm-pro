@@ -519,7 +519,7 @@ static bool parse_can_node_id(const char *uri, uint8_t *out_node)
 
 static esp_err_t api_can_nodes_get(httpd_req_t *req)
 {
-    if (!check_bearer(req)) {
+    if (s_provisioned && !check_bearer(req)) {
         httpd_resp_send_err(req, 401, "token");
         return ESP_FAIL;
     }
@@ -540,7 +540,7 @@ static esp_err_t api_can_nodes_options(httpd_req_t *req)
 
 static esp_err_t api_can_scan_post(httpd_req_t *req)
 {
-    if (!check_bearer(req)) {
+    if (s_provisioned && !check_bearer(req)) {
         httpd_resp_send_err(req, 401, "token");
         return ESP_FAIL;
     }
