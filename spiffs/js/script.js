@@ -497,7 +497,7 @@ function readMqttForm(){
 function readCloudflareForm(){
   let ui_url = ($('#cf_ui')?.value || '').trim();
   if (!ui_url) ui_url = DEFAULT_CLOUDFLARE_UI;
-  return { account_id, tunnel_id, auth_token, ui_url };
+  return { ui_url };
 }
 
 function isNetworkComplete(){
@@ -520,7 +520,7 @@ function isMqttComplete(){
 
 function isCloudflareComplete(){
   const cf = state.cloudflare;
-  return !!(cf.account_id && cf.tunnel_id && cf.ui_url);
+  return !!(cf.ui_url);
 }
 
 async function submitGeneral(event){

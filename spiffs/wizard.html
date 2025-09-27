@@ -386,20 +386,8 @@
       <section class="wizard-step" data-step="cloudflare" aria-labelledby="step-cloudflare">
         <form id="cloudflareForm" class="wizard-form" autocomplete="off">
           <div class="field">
-            <label for="cf_account">Account ID Cloudflare</label>
-            <input id="cf_account" name="account_id" type="text" placeholder="xxxxxxxxxxxxxxxxxxxx" required />
-          </div>
-          <div class="field">
-            <label for="cf_tunnel">ID tunnel</label>
-            <input id="cf_tunnel" name="tunnel_id" type="text" placeholder="uuid-del-tunnel" required />
-          </div>
-          <div class="field">
-            <label for="cf_token">Token API / certificato</label>
-            <textarea id="cf_token" name="auth_token" rows="3" placeholder="Token generato su dash.cloudflare.com"></textarea>
-          </div>
-          <div class="field">
             <label for="cf_ui">URL UI Cloudflare da usare per il redirect finale</label>
-            <input id="cf_ui" name="ui_url" type="url" placeholder="https://dash.cloudflare.com/.." required />
+            <input id="cf_ui" name="ui_url" type="url" placeholder="https://ui.nsalarm.pro/.." required />
           </div>
           <p class="summary-footer">Il token resta salvato localmente nella NVS e non viene trasmesso altrove.</p>
           <div class="wizard-actions">
