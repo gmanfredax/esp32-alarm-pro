@@ -36,10 +36,8 @@ static const char *netif_hostname(void)
         return NULL;
     }
     const char *hostname = NULL;
-    const char *hostname_ptr = NULL;
-    esp_err_t err = esp_netif_get_hostname(netif, &hostname_ptr);
-    if (err == ESP_OK && hostname_ptr && hostname_ptr[0]) {
-        hostname = hostname_ptr;
+    esp_err_t err = esp_netif_get_hostname(netif, &hostname);
+    if (err == ESP_OK && hostname && hostname[0]) {
         return hostname;
     }
     return NULL;
@@ -126,6 +124,7 @@ static void register_http_service_if_needed(void)
     if (s_http_registered) {
         return;
     }
+    // Must remain non-const because mdns_service_add expects mutable TXT entries
     mdns_txt_item_t txt[] = {
         {"path", "/"},
     };
@@ -147,6 +146,7 @@ static esp_err_t register_https_service(void)
     if (s_https_registered) {
         return ESP_OK;
     }
+    // Must remain non-const because mdns_service_add expects mutable TXT entries
     mdns_txt_item_t txt[] = {
         {"path", "/"},
     };

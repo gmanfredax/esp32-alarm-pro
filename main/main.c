@@ -457,10 +457,10 @@ static void system_main_task(void *arg)
     // Main loop: leggi ingressi e alimenta la logica d’allarme
     uint16_t last_mask = 0xFFFFu;
     bool first_cycle = true;
-    const TickType_t loop_delay = pdMS_TO_TICKS(100);
-    const TickType_t reset_hold_ticks = pdMS_TO_TICKS(10000);
-    TickType_t reset_press_start = 0;
-    bool reset_triggered = false;
+    // const TickType_t loop_delay = pdMS_TO_TICKS(100);
+    // const TickType_t reset_hold_ticks = pdMS_TO_TICKS(10000);
+    // TickType_t reset_press_start = 0;
+    // bool reset_triggered = false;
 
     while (true) {
         uint16_t ab = 0;

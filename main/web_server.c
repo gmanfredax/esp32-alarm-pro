@@ -1534,7 +1534,9 @@ static void provisioning_load_net(provisioning_net_config_t* cfg){
     if (!netif) return;
 
     const char *hostname = NULL;
-    if (esp_netif_get_hostname(netif, &hostname) == ESP_OK && hostname && hostname[0]) {
+    if (!cfg->hostname[0] &&
+        esp_netif_get_hostname(netif, &hostname) == ESP_OK &&
+        hostname && hostname[0]) {
         strlcpy(cfg->hostname, hostname, sizeof(cfg->hostname));
     }
 
@@ -1551,6 +1553,13 @@ static void provisioning_load_net(provisioning_net_config_t* cfg){
     if (esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK && dns.ip.type == IPADDR_TYPE_V4){
         ip4addr_ntoa_r((const ip4_addr_t*)&dns.ip.u_addr.ip4, cfg->dns, sizeof(cfg->dns));
     }
+}
+
+static void provisioning_init_netif_config(void)
+{
+    provisioning_net_config_t cfg;
+    provisioning_load_net(&cfg);
+    provisioning_apply_netif_config(&cfg);
 }
 
 static void provisioning_load_mqtt(provisioning_mqtt_config_t* cfg){
@@ -3468,6 +3477,8 @@ esp_err_t web_server_start(void){
     ESP_ERROR_CHECK(auth_init());
 
     provisioning_load_state();
+
+    provisioning_init_netif_config();
     
     ESP_ERROR_CHECK(start_web());
 
