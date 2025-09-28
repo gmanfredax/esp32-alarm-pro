@@ -1,0 +1,78 @@
+menu "ESP32 Alarm Cloud Connectivity"
+
+config APP_CLOUD_MQTT_URI
+    string "MQTT broker URI (use mqtts:// or wss://)"
+    default "mqtts://mqtt.nsalarm.pro:8883"
+    help
+        URI of the managed MQTT broker reachable from the ESP32. Use the mqtts://
+        scheme to enforce TLS. If you are using a WebSocket proxy for outbound
+        connections, specify the wss:// endpoint instead.
+
+config APP_CLOUD_DEVICE_ID
+    string "Device identifier"
+    default ""
+    help
+        Optional explicit device identifier. If empty the firmware derives the
+        identifier from the MAC address and the client ID prefix.
+
+config APP_CLOUD_CLIENT_ID_PREFIX
+    string "Client ID prefix"
+    default "nsalarmpro-"
+    help
+        Prefix used to build the MQTT client identifier when APP_CLOUD_DEVICE_ID
+        is empty. The final ID is prefix plus the Ethernet MAC address.
+
+config APP_CLOUD_TOPIC_ROOT
+    string "MQTT topic root"
+    default "alarmpro"
+    help
+        Root prefix for all MQTT topics used by the application. State topics are
+        published under <root>/state/<deviceId>/... and command topics are
+        consumed from <root>/cmd/<deviceId>/....
+
+config APP_CLOUD_USERNAME
+    string "MQTT username"
+    default ""
+    help
+        Username used by the ESP32 when authenticating to the broker. Leave empty
+        when using mutual TLS with client certificates.
+
+config APP_CLOUD_PASSWORD
+    string "MQTT password"
+    default ""
+    help
+        Password or token used by the ESP32 when authenticating to the broker.
+
+config APP_CLOUD_KEEPALIVE
+    int "MQTT keepalive (seconds)"
+    default 60
+    range 15 600
+
+config APP_CLOUD_QOS_STATE
+    int "QoS for state telemetry"
+    default 1
+    range 0 2
+
+config APP_CLOUD_QOS_COMMANDS
+    int "QoS for command subscriptions"
+    default 1
+    range 0 2
+
+config APP_CLOUD_WS_PATH
+    string "Public MQTT over WebSocket path"
+    default "/mqtt"
+    help
+        Path component to document inside the web UI configuration when the broker
+        is exposed via MQTT over WebSocket (WSS). This value does not affect the
+        firmware behaviour but is shipped in the configuration bundle that can be
+        downloaded from the device.
+
+config APP_CLOUD_TOKEN_ENDPOINT
+    string "Token endpoint for UI clients"
+    default "https://api.example.com/token"
+    help
+        Optional HTTPS endpoint exposed by your backend to mint short lived MQTT
+        credentials for browser clients. The value is exported inside the web UI
+        configuration served from the device.
+
+endmenu

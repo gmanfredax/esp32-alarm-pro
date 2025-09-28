@@ -23,6 +23,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
+#include "freertos/portmacro.h"
 
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -175,6 +176,39 @@ static bool s_restart_pending = false;
 #define DEFAULT_CF_UI_URL "https://dash.cloudflare.com/"
 static bool s_provisioned = false;
 static char s_cloudflare_ui_url[128] = DEFAULT_CF_UI_URL;
+
+typedef struct {
+    char central_name[64];
+} provisioning_general_config_t;
+
+typedef struct {
+    bool dhcp;
+    char hostname[64];
+    char ip[16];
+    char gw[16];
+    char mask[16];
+    char dns[16];
+} provisioning_net_config_t;
+
+typedef struct {
+    char uri[96];
+    char cid[64];
+    char user[64];
+    char pass[64];
+    uint32_t keepalive;
+} provisioning_mqtt_config_t;
+
+typedef struct {
+    char account_id[96];
+    char tunnel_id[96];
+    char auth_token[256];
+    char ui_url[128];
+} provisioning_cloudflare_config_t;
+
+static esp_timer_handle_t s_net_apply_timer = NULL;
+static provisioning_net_config_t s_net_apply_cfg = {0};
+static bool s_net_apply_cfg_valid = false;
+static portMUX_TYPE s_net_apply_lock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef struct ws_client {
     int fd;
@@ -1294,34 +1328,6 @@ static esp_err_t provisioning_set_flag(bool value){
     return err;
 }
 
-typedef struct {
-    char central_name[64];
-} provisioning_general_config_t;
-
-typedef struct {
-    bool dhcp;
-    char hostname[64];
-    char ip[16];
-    char gw[16];
-    char mask[16];
-    char dns[16];
-} provisioning_net_config_t;
-
-typedef struct {
-    char uri[96];
-    char cid[64];
-    char user[64];
-    char pass[64];
-    uint32_t keepalive;
-} provisioning_mqtt_config_t;
-
-typedef struct {
-    char account_id[96];
-    char tunnel_id[96];
-    char auth_token[256];
-    char ui_url[128];
-} provisioning_cloudflare_config_t;
-
 static void provisioning_load_general(provisioning_general_config_t* cfg){
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
@@ -1424,6 +1430,76 @@ static void provisioning_apply_netif_config(const provisioning_net_config_t* cfg
         err = esp_netif_set_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "set_dns_info failed: %s", esp_err_to_name(err));
+        }
+    }
+}
+
+static void provisioning_schedule_netif_apply(const provisioning_net_config_t* cfg);
+
+static void provisioning_netif_apply_timer_cb(void* arg)
+{
+    (void)arg;
+    provisioning_net_config_t cfg = {0};
+    bool have_cfg = false;
+
+    portENTER_CRITICAL(&s_net_apply_lock);
+    if (s_net_apply_cfg_valid) {
+        cfg = s_net_apply_cfg;
+        s_net_apply_cfg_valid = false;
+        have_cfg = true;
+    }
+    portEXIT_CRITICAL(&s_net_apply_lock);
+
+    if (have_cfg) {
+        provisioning_apply_netif_config(&cfg);
+    }
+}
+
+static esp_err_t provisioning_ensure_netif_timer(void)
+{
+    if (s_net_apply_timer) {
+        return ESP_OK;
+    }
+
+    const esp_timer_create_args_t args = {
+        .callback = provisioning_netif_apply_timer_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "net_apply",
+        .skip_unhandled_events = true,
+    };
+
+    esp_err_t err = esp_timer_create(&args, &s_net_apply_timer);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_timer_create(net_apply) failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    return ESP_OK;
+}
+
+static void provisioning_schedule_netif_apply(const provisioning_net_config_t* cfg)
+{
+    if (!cfg) {
+        return;
+    }
+
+    if (provisioning_ensure_netif_timer() != ESP_OK) {
+        return;
+    }
+
+    portENTER_CRITICAL(&s_net_apply_lock);
+    s_net_apply_cfg = *cfg;
+    s_net_apply_cfg_valid = true;
+    portEXIT_CRITICAL(&s_net_apply_lock);
+
+    if (s_net_apply_timer) {
+        esp_err_t err = esp_timer_stop(s_net_apply_timer);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "esp_timer_stop(net_apply) failed: %s", esp_err_to_name(err));
+        }
+        err = esp_timer_start_once(s_net_apply_timer, 200 * 1000);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_timer_start_once(net_apply) failed: %s", esp_err_to_name(err));
         }
     }
 }
@@ -1566,8 +1642,13 @@ static esp_err_t sys_net_post(httpd_req_t* req){
         nvs_set_str(nvs,"dns", jdn->valuestring);
     }
     nvs_commit(nvs); nvs_close(nvs); cJSON_Delete(j);
-    provisioning_apply_netif_config(&cfg);
-    return json_reply(req, "{\"ok\":true}");
+
+    esp_err_t resp_err = json_reply(req, "{\"ok\":true}");
+    if (resp_err != ESP_OK) {
+        ESP_LOGW(TAG, "sys_net_post response failed: %s", esp_err_to_name(resp_err));
+    }
+    provisioning_schedule_netif_apply(&cfg);
+    return resp_err;
 }
 
 // ---- /api/sys/mqtt GET/POST ----
