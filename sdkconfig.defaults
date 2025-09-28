@@ -64,7 +64,7 @@ CONFIG_BT_BLUEDROID_ENABLED=n
 
 # ==== SNTP / mDNS =============================================================
 CONFIG_LWIP_SNTP_MAX_SERVERS=3
-CONFIG_LWIP_LOCAL_HOSTNAME="esp32-alarm-pro"
+CONFIG_LWIP_LOCAL_HOSTNAME="nsalarmpro"
 CONFIG_MDNS_MAX_SERVICES=10
 
 # ==== FreeRTOS tuning =========================================================

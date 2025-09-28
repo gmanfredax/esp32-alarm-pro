@@ -59,6 +59,7 @@
 #include "pdo.h"
 #include "mqtt_client.h"
 #include "app_mqtt.h"
+#include "mdns_service.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1390,6 +1391,16 @@ static void provisioning_apply_netif_config(const provisioning_net_config_t* cfg
     err = esp_netif_set_hostname(netif, host);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "esp_netif_set_hostname failed: %s", esp_err_to_name(err));
+    }
+
+    esp_err_t mdns_err = mdns_service_start();
+    if (mdns_err != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_service_start failed: %s", esp_err_to_name(mdns_err));
+    }
+
+    mdns_err = mdns_service_update_hostname(host);
+    if (mdns_err != ESP_OK) {
+        ESP_LOGW(TAG, "mdns_service_update_hostname failed: %s", esp_err_to_name(mdns_err));
     }
 
     if (cfg->dhcp) {
