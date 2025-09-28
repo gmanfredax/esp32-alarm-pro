@@ -2575,8 +2575,7 @@ static esp_err_t users_admin_list_get(httpd_req_t* req){
         if(!username[0]) continue;
         if(!normalize_username_for_api(username)) continue;
 
-        const char *raw_username = username;
-        const char *login_ptr = (raw_username[0]=='u' && raw_username[1]=='_') ? raw_username+2 : raw_username;
+        const char *login_ptr = username;
         char login[32]={0};
         strlcpy(login, login_ptr, sizeof(login));
 

@@ -211,7 +211,16 @@
     $$(".side button").forEach(btn => {
       btn.addEventListener("click", () => {
         const id = btn.getAttribute("data-view");
+        const targetView = id ? document.getElementById(id) : null;
+        const views = $$(".view");
         $$(".side button").forEach(b => b.classList.toggle("active", b===btn));
+        if (targetView){
+          views.forEach(view => view.classList.toggle("active", view === targetView));
+        }
+        if (!targetView){
+          const current = views.find(view => view.classList.contains("active"));
+          if (current) current.classList.add("active");
+        }
         if (id !== "view-mqtt") maskMqttPassword();
       });
     });

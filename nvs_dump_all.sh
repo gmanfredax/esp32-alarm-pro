@@ -16,6 +16,27 @@ python "$PARTTOOL" --port "$PORT" read_partition --partition-name nvs --output "
 
 # Decodifica: prova a usare il tool di IDF 5; altrimenti fallback a un decoder Python inline
 if python - <<'PY' "$OUTBIN" "$OUTCSV"; then exit 0; fi
+import os
+import subprocess
+import sys
+
+bin_path, csv_path = sys.argv[1:3]
+idf_path = os.environ["IDF_PATH"]
+tool = os.path.join(
+    idf_path,
+    "components",
+    "nvs_flash",
+    "nvs_partition_tool",
+    "nvs_partition_tool.py",
+)
+
+subprocess.run(
+    [sys.executable, tool, "decode", "--input", bin_path, "--output", csv_path],
+    check=True,
+)
+
+print("Creato:", csv_path)
+PY
 # Se il blocco sopra non crea il CSV, usa il fallback qui sotto.
 
 echo "➜ Decodifica binario NVS in CSV (fallback semplice)..."
