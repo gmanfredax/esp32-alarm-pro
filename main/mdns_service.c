@@ -35,7 +35,14 @@ static const char *netif_hostname(void)
     if (!netif) {
         return NULL;
     }
-    return esp_netif_get_hostname(netif);
+    const char *hostname = NULL;
+    const char *hostname_ptr = NULL;
+    esp_err_t err = esp_netif_get_hostname(netif, &hostname_ptr);
+    if (err == ESP_OK && hostname_ptr && hostname_ptr[0]) {
+        hostname = hostname_ptr;
+        return hostname;
+    }
+    return NULL;
 }
 
 static esp_err_t ensure_mdns_initialized(void)
@@ -65,13 +72,13 @@ static void update_service_instance_names(void)
 {
     const char *name = fallback_hostname();
     if (s_https_registered) {
-        esp_err_t err = mdns_service_instance_name_set(NULL, "_https", "_tcp", name);
+        esp_err_t err = mdns_service_instance_name_set("_https", "_tcp", name);
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
             ESP_LOGW(TAG, "https instance update failed: %s", esp_err_to_name(err));
         }
     }
     if (s_http_registered) {
-        esp_err_t err = mdns_service_instance_name_set(NULL, "_http", "_tcp", name);
+        esp_err_t err = mdns_service_instance_name_set("_http", "_tcp", name);
         if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
             ESP_LOGW(TAG, "http instance update failed: %s", esp_err_to_name(err));
         }
@@ -119,7 +126,7 @@ static void register_http_service_if_needed(void)
     if (s_http_registered) {
         return;
     }
-    const mdns_txt_item_t txt[] = {
+    mdns_txt_item_t txt[] = {
         {"path", "/"},
     };
     esp_err_t err = mdns_service_add(NULL, "_http", "_tcp", 80, txt, sizeof(txt) / sizeof(txt[0]));
@@ -140,7 +147,7 @@ static esp_err_t register_https_service(void)
     if (s_https_registered) {
         return ESP_OK;
     }
-    const mdns_txt_item_t txt[] = {
+    mdns_txt_item_t txt[] = {
         {"path", "/"},
     };
     esp_err_t err = mdns_service_add(NULL, "_https", "_tcp", 443, txt, sizeof(txt) / sizeof(txt[0]));

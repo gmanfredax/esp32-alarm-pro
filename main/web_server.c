@@ -3543,7 +3543,8 @@ static void web_server_restart_async(void){
 static esp_err_t arm_post(httpd_req_t* req)
 {
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    char tok[128]={0}, user[32]={0};
+    //char tok[128]={0};
+    char user[32]={0};
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
@@ -3658,7 +3659,8 @@ static esp_err_t arm_post(httpd_req_t* req)
 static esp_err_t disarm_post(httpd_req_t* req)
 {
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    char tok[128]={0}, user[32]={0};
+    //char tok[128]={0};
+    char user[32]={0};
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
@@ -3684,7 +3686,8 @@ static esp_err_t disarm_post(httpd_req_t* req)
 static esp_err_t user_post_pin(httpd_req_t* req)
 {
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    char tok[128]={0}, user[32]={0};
+    //char tok[128]={0};
+    char user[32]={0};
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
