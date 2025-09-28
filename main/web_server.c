@@ -58,6 +58,7 @@
 #include "roster.h"
 #include "pdo.h"
 #include "mqtt_client.h"
+#include "app_mqtt.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1735,6 +1736,13 @@ static esp_err_t sys_mqtt_post(httpd_req_t* req){
     if (pass) nvs_set_str(nvs,"mq_pass",pass);
     if (cJSON_IsNumber(jka)) nvs_set_u32(nvs,"mq_keep",(uint32_t)jka->valuedouble);
     nvs_commit(nvs); nvs_close(nvs); cJSON_Delete(j);
+
+    esp_err_t reload_err = mqtt_reload_config();
+    if (reload_err != ESP_OK) {
+        ESP_LOGE(TAG, "Riavvio MQTT fallito dopo aggiornamento configurazione: %s", esp_err_to_name(reload_err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mqtt"), ESP_FAIL;
+    }
+
     return json_reply(req, "{\"ok\":true}");
 }
 
@@ -2080,6 +2088,13 @@ static esp_err_t provision_general_post(httpd_req_t* req){
 static esp_err_t provision_finish_post(httpd_req_t* req){
     esp_err_t err = provisioning_set_flag(true);
     if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs"), ESP_FAIL;
+
+    err = mqtt_reload_config();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Impossibile riavviare MQTT al termine del provisioning: %s", esp_err_to_name(err));
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mqtt"), ESP_FAIL;
+    }
+
     // cJSON* root = cJSON_CreateObject();
     // if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
     // cJSON_AddBoolToObject(root, "ok", true);
@@ -2530,6 +2545,68 @@ static esp_err_t users_password_post(httpd_req_t* req){
     return json_bool(req, true);
 }
 
+static esp_err_t users_name_post(httpd_req_t* req){
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden"), ESP_FAIL;
+    }
+
+    char body[WEB_MAX_BODY_LEN];
+    size_t blen = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &blen) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body"), ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(body, blen);
+    if (!root) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json"), ESP_FAIL;
+    }
+
+    const cJSON *juser  = cJSON_GetObjectItemCaseSensitive(root, "user");
+    const cJSON *jfirst = cJSON_GetObjectItemCaseSensitive(root, "first_name");
+    const cJSON *jlast  = cJSON_GetObjectItemCaseSensitive(root, "last_name");
+
+    char usr[32] = {0};
+    char first[32] = {0};
+    char last[32] = {0};
+
+    if (cJSON_IsString(juser) && juser->valuestring) {
+        if (strlen(juser->valuestring) >= sizeof(usr)) {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "user"), ESP_FAIL;
+        }
+        strlcpy(usr, juser->valuestring, sizeof(usr));
+    }
+
+    if (cJSON_IsString(jfirst) && jfirst->valuestring) {
+        if (strlen(jfirst->valuestring) >= sizeof(first)) {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "first"), ESP_FAIL;
+        }
+        strlcpy(first, jfirst->valuestring, sizeof(first));
+    }
+
+    if (cJSON_IsString(jlast) && jlast->valuestring) {
+        if (strlen(jlast->valuestring) >= sizeof(last)) {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "last"), ESP_FAIL;
+        }
+        strlcpy(last, jlast->valuestring, sizeof(last));
+    }
+
+    if (!usr[0]) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "user"), ESP_FAIL;
+    }
+
+    esp_err_t err = auth_set_user_name(usr, first, last);
+    cJSON_Delete(root);
+    if (err != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "set name"), ESP_FAIL;
+    }
+
+    return json_bool(req, true);
+}
+
 static __attribute__((unused)) esp_err_t users_totp_reset_post(httpd_req_t* req){
     if(!check_bearer(req) || !is_admin_user(req)) return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden"), ESP_FAIL;
     char body[128]; size_t blen = 0;
@@ -2801,8 +2878,10 @@ static esp_err_t status_get(httpd_req_t* req){
     uint32_t exit_ms = 0, entry_ms = 0; int entry_zone = -1;
     bool exit_p  = alarm_exit_pending(&exit_ms);
     bool entry_p = alarm_entry_pending(&entry_zone, &entry_ms);
-    if (entry_p) state = "PRE_DISARM";
-    else if (exit_p && (_st==ALARM_ARMED_HOME || _st==ALARM_ARMED_AWAY || _st==ALARM_ARMED_NIGHT || _st==ALARM_ARMED_CUSTOM)) state = "PRE_ARM";
+
+    bool is_armed = (_st==ALARM_ARMED_HOME || _st==ALARM_ARMED_AWAY || _st==ALARM_ARMED_NIGHT || _st==ALARM_ARMED_CUSTOM);
+    if (entry_p && is_armed) state = "PRE_DISARM";
+    else if (exit_p && is_armed) state = "PRE_ARM";
 
     uint16_t gpioab = 0;
     inputs_read_all(&gpioab);
@@ -3252,6 +3331,7 @@ static esp_err_t disarm_post(httpd_req_t* req);
 static esp_err_t user_post_pin(httpd_req_t* req);
 
 static esp_err_t users_create_post(httpd_req_t* req);
+static esp_err_t users_name_post(httpd_req_t* req);
 static esp_err_t users_pin_admin_post(httpd_req_t* req);
 static esp_err_t users_rfid_learn_post(httpd_req_t* req);
 static esp_err_t users_rfid_clear_post(httpd_req_t* req);
@@ -3307,6 +3387,7 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/user/pin",           .method = HTTP_POST, .handler = user_post_pin },
     { .uri = "/api/users",              .method = HTTP_GET,  .handler = users_list_get },
     { .uri = "/api/users/password",     .method = HTTP_POST, .handler = users_password_post },
+    { .uri = "/api/users/name",         .method = HTTP_POST, .handler = users_name_post },
     { .uri = "/api/users/create",       .method = HTTP_POST, .handler = users_create_post },
     { .uri = "/api/users/pin",          .method = HTTP_POST, .handler = users_pin_admin_post },
     { .uri = "/api/users/rfid/learn",   .method = HTTP_POST, .handler = users_rfid_learn_post },

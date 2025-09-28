@@ -246,7 +246,11 @@ void alarm_tick(uint16_t zmask, bool tamper)
                     ESP_LOGW(TAG, "ENTRY timeout -> ALARM (Z%d)", s_entry_zone >= 0 ? (s_entry_zone + 1) : -1);
                     mqtt_publish_state();
                 }
-                s_entry_pending = false;
+                s_entry_pending     = false;
+                s_entry_deadline_us = 0;
+                s_entry_zone        = -1;
+                s_entry_zmask       = 0;
+                return;
             }
             // Non “return”: continuiamo comunque a valutare nuovi trigger
         }

@@ -352,11 +352,16 @@ size_t userdb_list_csv(char* buf, size_t buflen)
     size_t off = 0;
 
     nvs_iterator_t it = NULL;
-    esp_err_t err = nvs_entry_find(NULL /* partition */,
+    esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME,
                                    UDB_NS /* namespace */,
                                    NVS_TYPE_BLOB /* tipo record utenti */,
                                    &it);
     if (err != ESP_OK) {
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGD(TAG, "Nessun utente presente in NVS (%s)", esp_err_to_name(err));
+        } else {
+            ESP_LOGE(TAG, "nvs_entry_find fallita: %s", esp_err_to_name(err));
+        }
         if (buf && buflen) buf[0] = 0;
         return 0;
     }

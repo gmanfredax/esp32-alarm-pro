@@ -8,6 +8,8 @@ extern "C" {
 #endif
 
 esp_err_t mqtt_start(void);
+esp_err_t mqtt_stop(void);
+esp_err_t mqtt_reload_config(void);
 esp_err_t mqtt_publish_state(void);
 esp_err_t mqtt_publish_zones(uint16_t mask);
 esp_err_t mqtt_publish_scenes(void);

@@ -13,6 +13,7 @@
 #include <time.h>
 
 #include "esp_check.h"
+#include "esp_err.h"
 #include "esp_event.h"
 #include "esp_eth.h"
 #include "esp_log.h"
@@ -41,6 +42,7 @@ static const char *TAG = "cloud_mqtt";
 static esp_mqtt_client_handle_t s_client = NULL;
 
 static bool                     s_connected = false;
+static bool                     s_config_initialized = false;
 static char                     s_device_id[64] = {0};
 static char                     s_mqtt_uri[96] = {0};
 static char                     s_mqtt_client_id[64] = {0};
@@ -134,6 +136,14 @@ static void load_mqtt_config_from_nvs(void)
     }
 
     nvs_close(nvs);
+}
+
+static void mqtt_prepare_configuration(void)
+{
+    build_device_id();
+    build_topics();
+    load_mqtt_config_from_nvs();
+    s_config_initialized = true;
 }
 
 static inline const char* alarm_state_to_name(alarm_state_t st)
@@ -502,9 +512,9 @@ esp_err_t mqtt_start(void)
 {
     if (s_client) return ESP_OK;
 
-    build_device_id();
-    build_topics();
-    load_mqtt_config_from_nvs();
+    if (!s_config_initialized) {
+        mqtt_prepare_configuration();
+    }
 
 
     esp_mqtt_client_config_t cfg = {
@@ -542,5 +552,54 @@ esp_err_t mqtt_start(void)
 
     // Initial availability is offline until we receive MQTT_EVENT_CONNECTED
     publish_availability("offline");
+    return ESP_OK;
+}
+
+
+esp_err_t mqtt_stop(void)
+{
+    if (!s_client) {
+        s_connected = false;
+        s_config_initialized = false;
+        return ESP_OK;
+    }
+
+    esp_err_t stop_err = esp_mqtt_client_stop(s_client);
+    if (stop_err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT client stop failed: %s", esp_err_to_name(stop_err));
+    }
+
+    esp_err_t destroy_err = esp_mqtt_client_destroy(s_client);
+    if (destroy_err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT client destroy failed: %s", esp_err_to_name(destroy_err));
+    }
+
+    s_client = NULL;
+    s_connected = false;
+    s_config_initialized = false;
+
+    if (stop_err != ESP_OK) {
+        return stop_err;
+    }
+    return destroy_err;
+}
+
+esp_err_t mqtt_reload_config(void)
+{
+    esp_err_t err = mqtt_stop();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT reload failed to stop client: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    mqtt_prepare_configuration();
+
+    err = mqtt_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT reload failed to start client: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "MQTT client configuration reloaded");
     return ESP_OK;
 }
