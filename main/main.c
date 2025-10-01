@@ -32,7 +32,7 @@
 #include "onewire_ds18b20.h"
 #include "log_system.h"
 #include "web_server.h"
-#include "mdns_service.h"
+// #include "mdns_service.h"
 #include "pins.h"
 #include "i2c_bus.h"
 #include "scenes.h"
@@ -401,10 +401,10 @@ static void system_main_task(void *arg)
         if (wait_res == ESP_OK) {
             eth_ready_for_time = true;
             ESP_LOGI(TAG, "Ethernet ready, starting SNTP");
-            esp_err_t mdns_err = mdns_service_start();
-            if (mdns_err != ESP_OK) {
-                ESP_LOGW(TAG, "mDNS start failed: %s", esp_err_to_name(mdns_err));
-            }
+            // esp_err_t mdns_err = mdns_service_start();
+            // if (mdns_err != ESP_OK) {
+            //     ESP_LOGW(TAG, "mDNS start failed: %s", esp_err_to_name(mdns_err));
+            // }
         } else if (wait_res == ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "Timeout waiting for Ethernet IP (%lu ms)",
                      (unsigned long)(wait_timeout * portTICK_PERIOD_MS));
@@ -457,10 +457,10 @@ static void system_main_task(void *arg)
     // Main loop: leggi ingressi e alimenta la logica d’allarme
     uint16_t last_mask = 0xFFFFu;
     bool first_cycle = true;
-    // const TickType_t loop_delay = pdMS_TO_TICKS(100);
-    // const TickType_t reset_hold_ticks = pdMS_TO_TICKS(10000);
-    // TickType_t reset_press_start = 0;
-    // bool reset_triggered = false;
+    const TickType_t loop_delay = pdMS_TO_TICKS(100);
+    const TickType_t reset_hold_ticks = pdMS_TO_TICKS(10000);
+    TickType_t reset_press_start = 0;
+    bool reset_triggered = false;
 
     while (true) {
         uint16_t ab = 0;

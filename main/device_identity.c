@@ -77,3 +77,27 @@ esp_err_t ensure_device_identity(char id_out[DEVICE_ID_MAX],
     nvs_close(n);
     return ESP_OK;
 }
+
+esp_err_t device_identity_get_secret(uint8_t secret_out[DEVICE_SECRET_LEN]) {
+    if (!secret_out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    nvs_handle_t n = 0;
+    esp_err_t err = nvs_open("appcfg", NVS_READONLY, &n);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    size_t len = DEVICE_SECRET_LEN;
+    err = nvs_get_blob(n, "device_secret", secret_out, &len);
+    nvs_close(n);
+
+    if (err != ESP_OK) {
+        return err;
+    }
+    if (len != DEVICE_SECRET_LEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}

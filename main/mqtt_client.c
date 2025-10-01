@@ -47,7 +47,7 @@ static char                     s_device_id[64] = {0};
 static char                     s_mqtt_uri[96] = {0};
 static char                     s_mqtt_client_id[64] = {0};
 static char                     s_mqtt_user[64] = {0};
-static char                     s_mqtt_pass[64] = {0};
+static char                     s_mqtt_pass[96] = {0};
 static uint32_t                 s_mqtt_keepalive = CONFIG_APP_CLOUD_KEEPALIVE;
 static char                     s_topic_state[128];
 static char                     s_topic_zones[128];
@@ -57,10 +57,28 @@ static char                     s_topic_cmd_base[128];
 static char                     s_topic_cmd_sub[160];
 static size_t                   s_cmd_base_len = 0;
 static uint16_t                 s_last_zone_mask = 0xFFFFu;
+static bool                     s_secret_ready = false;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+static bool load_device_secret_hex(void)
+{
+    memset(s_device_secret, 0, sizeof(s_device_secret));
+    memset(s_password_hex, 0, sizeof(s_password_hex));
+
+    esp_err_t err = device_identity_get_secret(s_device_secret);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to load device secret: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    for (size_t i = 0; i < DEVICE_SECRET_LEN; ++i) {
+        snprintf(&s_password_hex[i * 2], 3, "%02X", s_device_secret[i]);
+    }
+    return true;
+}
+
 static void build_device_id(void)
 {
     const char *cfg = CONFIG_APP_CLOUD_DEVICE_ID;
@@ -92,11 +110,13 @@ static void load_mqtt_config_from_nvs(void)
 {
     const char *default_uri = CONFIG_APP_CLOUD_MQTT_URI;
     const char *default_user = CONFIG_APP_CLOUD_USERNAME[0] ? CONFIG_APP_CLOUD_USERNAME : s_device_id;
+    const char *default_pass = CONFIG_APP_CLOUD_PASSWORD[0] ? CONFIG_APP_CLOUD_PASSWORD :
+                              (s_secret_ready ? s_password_hex : "");
 
     strlcpy(s_mqtt_uri, default_uri, sizeof(s_mqtt_uri));
     strlcpy(s_mqtt_client_id, s_device_id, sizeof(s_mqtt_client_id));
     strlcpy(s_mqtt_user, default_user, sizeof(s_mqtt_user));
-    strlcpy(s_mqtt_pass, CONFIG_APP_CLOUD_PASSWORD, sizeof(s_mqtt_pass));
+    strlcpy(s_mqtt_pass, default_pass, sizeof(s_mqtt_pass));
     s_mqtt_keepalive = CONFIG_APP_CLOUD_KEEPALIVE;
 
     nvs_handle_t nvs;
@@ -125,8 +145,9 @@ static void load_mqtt_config_from_nvs(void)
 
     len = sizeof(s_mqtt_pass);
     err = nvs_get_str(nvs, "mq_pass", s_mqtt_pass, &len);
-    if (err != ESP_OK) {
-        strlcpy(s_mqtt_pass, CONFIG_APP_CLOUD_PASSWORD, sizeof(s_mqtt_pass));
+
+    if (err != ESP_OK || s_mqtt_pass[0] == '\0') {
+        strlcpy(s_mqtt_pass, default_pass, sizeof(s_mqtt_pass));
     }
 
     uint32_t keepalive = 0;
@@ -141,6 +162,7 @@ static void load_mqtt_config_from_nvs(void)
 static void mqtt_prepare_configuration(void)
 {
     build_device_id();
+    s_secret_ready = load_device_secret_hex();
     build_topics();
     load_mqtt_config_from_nvs();
     s_config_initialized = true;

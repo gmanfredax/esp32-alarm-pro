@@ -45,9 +45,13 @@ typedef struct {
     time_t created;
     time_t last_seen;
     time_t expires_abs;
+    char  pending_totp_secret[64];
+    time_t pending_totp_time;
 } session_t;
 
 static session_t g_sessions[SESSION_MAX];
+
+#define TOTP_PENDING_TTL_SEC    (10*60)
 
 // ===== Rate limit (per username) =============================================
 #define RL_MAX_TRACK 32
@@ -162,6 +166,37 @@ static bool get_cookie_value(httpd_req_t* req, const char* key, char* out, size_
     }
     free(cookie);
     return found;
+}
+
+static session_t* session_from_request(httpd_req_t* req){
+    if (!req) return NULL;
+    size_t len = httpd_req_get_hdr_value_len(req, "Authorization");
+    if (len){
+        char* hdr = malloc(len+1);
+        if (hdr){
+            if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, len+1) == ESP_OK){
+                if (!strncmp(hdr, "Bearer ", 7)){
+                    const char* token = hdr + 7;
+                    session_t* s = find_by_atk(token);
+                    if (s){
+                        touch_session(s);
+                        free(hdr);
+                        return s;
+                    }
+                }
+            }
+            free(hdr);
+        }
+    }
+    char sid[128] = {0};
+    if (get_cookie_value(req, "SID", sid, sizeof(sid))){
+        session_t* s = find_by_sid(sid);
+        if (s){
+            touch_session(s);
+            return s;
+        }
+    }
+    return NULL;
 }
 
 // ===== Sicurezza / headers ====================================================
@@ -441,6 +476,41 @@ bool auth_totp_enabled(const char* username){
 }
 bool auth_check_totp_for_user(const char* username, const char* otp){
     return userdb_totp_verify(username, otp);
+}
+
+bool auth_totp_store_pending(httpd_req_t* req, const char* secret_base32){
+    session_t* s = session_from_request(req);
+    if (!s) return false;
+    if (secret_base32 && secret_base32[0]){
+        strncpy(s->pending_totp_secret, secret_base32, sizeof(s->pending_totp_secret)-1);
+        s->pending_totp_secret[sizeof(s->pending_totp_secret)-1] = 0;
+        s->pending_totp_time = time(NULL);
+    } else {
+        s->pending_totp_secret[0] = 0;
+        s->pending_totp_time = 0;
+    }
+    return true;
+}
+
+bool auth_totp_get_pending(httpd_req_t* req, char* out, size_t out_cap){
+    if (!out || out_cap == 0) return false;
+    session_t* s = session_from_request(req);
+    if (!s || !s->pending_totp_secret[0]) return false;
+    time_t now = time(NULL);
+    if (!s->pending_totp_time || (now - s->pending_totp_time) > TOTP_PENDING_TTL_SEC){
+        s->pending_totp_secret[0] = 0;
+        s->pending_totp_time = 0;
+        return false;
+    }
+    strlcpy(out, s->pending_totp_secret, out_cap);
+    return true;
+}
+
+void auth_totp_clear_pending(httpd_req_t* req){
+    session_t* s = session_from_request(req);
+    if (!s) return;
+    s->pending_totp_secret[0] = 0;
+    s->pending_totp_time = 0;
 }
 
 // ===== Init ==================================================================

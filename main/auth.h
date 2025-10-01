@@ -76,6 +76,9 @@ esp_err_t auth_totp_enable     (const char* username, const char* base32_secret)
 esp_err_t auth_totp_disable    (const char* username);
 bool      auth_totp_enabled    (const char* username);
 bool      auth_check_totp_for_user(const char* username, const char* otp);
+bool      auth_totp_store_pending(httpd_req_t* req, const char* secret_base32);
+bool      auth_totp_get_pending  (httpd_req_t* req, char* out, size_t out_cap);
+void      auth_totp_clear_pending(httpd_req_t* req);
 
 #ifdef __cplusplus
 }
