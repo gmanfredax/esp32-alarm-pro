@@ -321,7 +321,7 @@ bool userdb_totp_verify(const char* user, const char* otp){
     user_rec_t rec;
     if (load_user(user, &rec) != ESP_OK) return false;
     if (!rec.totp_enabled || rec.totp_secret[0] == 0) return false;
-    return totp_check(rec.totp_secret, otp);
+    return totp_check(rec.totp_secret, otp, TOTP_STEP_SECONDS, TOTP_WINDOW_STEPS);
 }
 
 static void bootstrap_if_missing(const char* username, udb_role_t role, const char* password){

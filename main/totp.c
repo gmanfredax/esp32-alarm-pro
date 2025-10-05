@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <time.h>
 #include "mbedtls/md.h"
 #include "utils.h"
 #include "totp.h"
@@ -38,15 +39,26 @@ static uint32_t hotp(const uint8_t* key, int keylen, uint64_t counter){
     return bin % 1000000;
 }
 
-bool totp_check(const char* base32_secret, const char* otp6){
+bool totp_check(const char* base32_secret, const char* otp6, int step, int window){
     if(!base32_secret || !*base32_secret) return false;
     if(!otp6 || strlen(otp6)!=6) return false;
+    if(step <= 0) return false;
+    if(window < 0) window = 0;
     uint8_t key[40]; int klen = base32_decode(base32_secret, key, sizeof(key));
     if(klen<=0) return false;
-    uint64_t t = utils_time()/30ULL;
-    // check window [-1,0,+1]
-    for(int w=-1; w<=1; ++w){
-        uint32_t code = hotp(key,klen,t+w);
+    time_t now = time(NULL);
+    if(now < 0) return false;
+    uint64_t t = (uint64_t)now / (uint64_t)step;
+    for(int w=-window; w<=window; ++w){
+        uint64_t counter = t;
+        if(w < 0){
+            uint64_t back = (uint64_t)(-w);
+            if(back > counter) continue;
+            counter -= back;
+        } else {
+            counter += (uint64_t)w;
+        }
+        uint32_t code = hotp(key,klen,counter);
         char buf[7];
         snprintf(buf, sizeof(buf), "%06" PRIu32, code);  // al posto di "%06u"
         if(memcmp(buf, otp6, 6)==0) return true;

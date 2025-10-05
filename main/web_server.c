@@ -2,7 +2,7 @@
 // - UI con SPIFFS: index.html, login.html, style.css, app.js, login.js
 // - Gate lato server: cookie HttpOnly "gate=1" decide index vs login su GET "/"
 // - API solo con Authorization: Bearer <token> (no cookie) => no CSRF
-// - Sessioni in RAM (token→username) con TTL assoluto 7g e inattività 30m (sliding)
+// - Sessioni in RAM (token→username) con TTL assoluto 7g e inattività 5m (sliding)
 // - Login con password (+ TOTP opzionale se abilitato per l’utente)
 
 #include "sdkconfig.h"
@@ -59,7 +59,6 @@
 #include "pdo.h"
 #include "mqtt_client.h"
 #include "app_mqtt.h"
-#include "mdns_service.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -98,9 +97,7 @@ static const char *TAG_ADMIN __attribute__((unused)) = "admin_html";
 #define OTP_DISABLED        1   // 1 = disattiva completamente la richiesta OTP su /api/login
 #define WEB_MAX_BODY_LEN     2048
 #define SESSION_TTL_S        (7*24*60*60)  // 7 giorni
-#define SESSION_IDLE_S       (30*60)       // 30 minuti sliding
-#define TOTP_STEP_SECONDS    30
-#define TOTP_WINDOW_STEPS    1
+#define SESSION_IDLE_S       (5*60)       // 30 minuti sliding
 
 static const char* ISSUER_NAME = "Alarm Pro";
 #define GATE_COOKIE "gate"
@@ -1258,8 +1255,9 @@ static esp_err_t https_start(httpd_handle_t* s, httpd_config_t* cfg){
 
 // Stub TOTP (compila; implementa poi quello reale oppure rimuovi gli endpoint se non ti servono)
 static bool totp_verify_b32(const char* b32, const char* otp, int step, int window){
-    (void)step; (void)window;
     if (!b32 || !otp) return false;
+    if (step <= 0) return false;
+    if (window < 0) window = 0;
     char clean[64]; size_t w = 0;
     for (const char* p=b32; *p && w+1<sizeof(clean); ++p){
         char c = *p;
@@ -1269,7 +1267,7 @@ static bool totp_verify_b32(const char* b32, const char* otp, int step, int wind
     }
     clean[w] = 0;
     if (!clean[0]) return false;
-    return totp_check(clean, otp);
+    return totp_check(clean, otp, step, window);
 }
 
 static void nvs_get_str_def(nvs_handle_t h, const char* key, char* out, size_t cap, const char* def){
@@ -1391,16 +1389,6 @@ static void provisioning_apply_netif_config(const provisioning_net_config_t* cfg
     err = esp_netif_set_hostname(netif, host);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "esp_netif_set_hostname failed: %s", esp_err_to_name(err));
-    }
-
-    esp_err_t mdns_err = mdns_service_start();
-    if (mdns_err != ESP_OK) {
-        ESP_LOGW(TAG, "mdns_service_start failed: %s", esp_err_to_name(mdns_err));
-    }
-
-    mdns_err = mdns_service_update_hostname(host);
-    if (mdns_err != ESP_OK) {
-        ESP_LOGW(TAG, "mdns_service_update_hostname failed: %s", esp_err_to_name(mdns_err));
     }
 
     if (cfg->dhcp) {
@@ -1534,9 +1522,7 @@ static void provisioning_load_net(provisioning_net_config_t* cfg){
     if (!netif) return;
 
     const char *hostname = NULL;
-    if (!cfg->hostname[0] &&
-        esp_netif_get_hostname(netif, &hostname) == ESP_OK &&
-        hostname && hostname[0]) {
+    if (esp_netif_get_hostname(netif, &hostname) == ESP_OK && hostname && hostname[0]) {    
         strlcpy(cfg->hostname, hostname, sizeof(cfg->hostname));
     }
 
@@ -1553,13 +1539,6 @@ static void provisioning_load_net(provisioning_net_config_t* cfg){
     if (esp_netif_get_dns_info(netif, ESP_NETIF_DNS_MAIN, &dns) == ESP_OK && dns.ip.type == IPADDR_TYPE_V4){
         ip4addr_ntoa_r((const ip4_addr_t*)&dns.ip.u_addr.ip4, cfg->dns, sizeof(cfg->dns));
     }
-}
-
-static void provisioning_init_netif_config(void)
-{
-    provisioning_net_config_t cfg;
-    provisioning_load_net(&cfg);
-    provisioning_apply_netif_config(&cfg);
 }
 
 static void provisioning_load_mqtt(provisioning_mqtt_config_t* cfg){
@@ -2409,7 +2388,7 @@ static esp_err_t user_post_password(httpd_req_t* req){
     return json_bool(req, true);
 }
 
-static __attribute__((unused)) esp_err_t user_post_totp_enable(httpd_req_t* req){
+static esp_err_t user_post_totp_enable(httpd_req_t* req){
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, 401, "token"), ESP_FAIL;
 
@@ -2427,6 +2406,10 @@ static __attribute__((unused)) esp_err_t user_post_totp_enable(httpd_req_t* req)
         ESP_LOGW(TAG, "auth_totp_disable('%s') failed during enrolment", uname);
     }
 
+    if(!auth_totp_store_pending(req, secret)){
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "totp pending"), ESP_FAIL;
+    }
+
     char uri[256];
     snprintf(uri, sizeof(uri), "otpauth://totp/%s:%s?secret=%s&issuer=%s&digits=6&period=%d&algorithm=SHA1",
              ISSUER_NAME, uname, secret, ISSUER_NAME, TOTP_STEP_SECONDS);
@@ -2434,7 +2417,7 @@ static __attribute__((unused)) esp_err_t user_post_totp_enable(httpd_req_t* req)
     return json_reply(req, resp);
 }
 
-static __attribute__((unused)) esp_err_t user_post_totp_confirm(httpd_req_t* req){
+static esp_err_t user_post_totp_confirm(httpd_req_t* req){
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, 401, "token"), ESP_FAIL;
 
@@ -2449,27 +2432,32 @@ static __attribute__((unused)) esp_err_t user_post_totp_confirm(httpd_req_t* req
     char otp[16]={0};
     char secret[64]={0};
     if (cJSON_IsString(jotp) && jotp->valuestring) strncpy(otp, jotp->valuestring, sizeof(otp)-1);
-    if (cJSON_IsString(jsecret) && jsecret->valuestring) strncpy(secret, jsecret->valuestring, sizeof(secret)-1);
+    if(!auth_totp_get_pending(req, secret, sizeof(secret))){
+        if (cJSON_IsString(jsecret) && jsecret->valuestring) strncpy(secret, jsecret->valuestring, sizeof(secret)-1);
+    }
     cJSON_Delete(root);
 
-    if(!otp[0] || !secret[0]) return httpd_resp_send_err(req, 400, "fields"), ESP_FAIL;
+    if(!otp[0]) return httpd_resp_send_err(req, 400, "fields"), ESP_FAIL;
+    if(!secret[0]) return httpd_resp_send_err(req, 409, "no totp"), ESP_FAIL;
 
     time_t now_chk = time(NULL);
     if (now_chk < 1577836800) { // 2020-01-01
         return httpd_resp_send_err(req, 409, "time not set"), ESP_FAIL;
     }
     if(!totp_verify_b32(secret, otp, TOTP_STEP_SECONDS, TOTP_WINDOW_STEPS)){
-        return httpd_resp_send_err(req, 401, "bad otp"), ESP_FAIL;
+        return httpd_resp_send_err(req, 409, "bad otp"), ESP_FAIL;
     }
 
     if(auth_totp_enable(uname, secret)!=ESP_OK) return httpd_resp_send_err(req,500,"enable"), ESP_FAIL;
+    auth_totp_clear_pending(req);
     return json_bool(req, true);
 }
 
-static __attribute__((unused)) esp_err_t user_post_totp_disable(httpd_req_t* req){
+static esp_err_t user_post_totp_disable(httpd_req_t* req){
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, 401, "token"), ESP_FAIL;
 
+    auth_totp_clear_pending(req);
     if(auth_totp_disable(uname)!=ESP_OK) return httpd_resp_send_err(req, 500, "disable"), ESP_FAIL;
     return json_bool(req, true);
 }
@@ -3402,6 +3390,9 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/scenes",             .method = HTTP_POST, .handler = scenes_post },
     { .uri = "/api/user/password",      .method = HTTP_POST, .handler = user_post_password },
     { .uri = "/api/user/totp",          .method = HTTP_GET,  .handler = user_get_totp },
+    { .uri = "/api/user/totp/enable",   .method = HTTP_POST, .handler = user_post_totp_enable },
+    { .uri = "/api/user/totp/confirm",  .method = HTTP_POST, .handler = user_post_totp_confirm },
+    { .uri = "/api/user/totp/disable",  .method = HTTP_POST, .handler = user_post_totp_disable },
     { .uri = "/api/arm",                .method = HTTP_POST, .handler = arm_post },
     { .uri = "/api/disarm",             .method = HTTP_POST, .handler = disarm_post },
     { .uri = "/api/user/pin",           .method = HTTP_POST, .handler = user_post_pin },
@@ -3477,8 +3468,6 @@ esp_err_t web_server_start(void){
     ESP_ERROR_CHECK(auth_init());
 
     provisioning_load_state();
-
-    provisioning_init_netif_config();
     
     ESP_ERROR_CHECK(start_web());
 
@@ -3554,8 +3543,7 @@ static void web_server_restart_async(void){
 static esp_err_t arm_post(httpd_req_t* req)
 {
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    //char tok[128]={0};
-    char user[32]={0};
+    char tok[128]={0}, user[32]={0};
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
@@ -3670,8 +3658,7 @@ static esp_err_t arm_post(httpd_req_t* req)
 static esp_err_t disarm_post(httpd_req_t* req)
 {
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    //char tok[128]={0};
-    char user[32]={0};
+    char tok[128]={0}, user[32]={0};
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
@@ -3697,8 +3684,7 @@ static esp_err_t disarm_post(httpd_req_t* req)
 static esp_err_t user_post_pin(httpd_req_t* req)
 {
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    //char tok[128]={0};
-    char user[32]={0};
+    char tok[128]={0}, user[32]={0};
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
