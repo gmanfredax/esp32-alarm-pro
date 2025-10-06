@@ -2894,6 +2894,7 @@ static esp_err_t status_get(httpd_req_t* req){
     uint16_t gpioab = 0;
     inputs_read_all(&gpioab);
     bool tamper = inputs_tamper(gpioab);
+    bool tamper_alarm = (alarm_last_alarm_was_tamper() && _st == ALARM_ALARM);
 
     uint16_t outmask = 0;
     outputs_get_mask(&outmask);
@@ -2934,6 +2935,7 @@ static esp_err_t status_get(httpd_req_t* req){
     }
 
     cJSON_AddBoolToObject(root, "tamper", tamper);
+    cJSON_AddBoolToObject(root, "tamper_alarm", tamper_alarm);
     cJSON_AddNumberToObject(root, "outputs_mask", (unsigned)outmask);
     cJSON_AddNumberToObject(root, "bypass_mask", (unsigned)alarm_get_bypass_mask());
     cJSON_AddNumberToObject(root, "exit_pending_ms", (unsigned)exit_ms);
@@ -3336,6 +3338,7 @@ static esp_err_t scenes_get(httpd_req_t* req);
 static esp_err_t scenes_post(httpd_req_t* req);
 static esp_err_t arm_post(httpd_req_t* req);
 static esp_err_t disarm_post(httpd_req_t* req);
+static esp_err_t tamper_reset_post(httpd_req_t* req);
 static esp_err_t user_post_pin(httpd_req_t* req);
 
 static esp_err_t users_create_post(httpd_req_t* req);
@@ -3395,6 +3398,7 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/user/totp/disable",  .method = HTTP_POST, .handler = user_post_totp_disable },
     { .uri = "/api/arm",                .method = HTTP_POST, .handler = arm_post },
     { .uri = "/api/disarm",             .method = HTTP_POST, .handler = disarm_post },
+    { .uri = "/api/tamper/reset",       .method = HTTP_POST, .handler = tamper_reset_post },
     { .uri = "/api/user/pin",           .method = HTTP_POST, .handler = user_post_pin },
     { .uri = "/api/users",              .method = HTTP_GET,  .handler = users_list_get },
     { .uri = "/api/users/password",     .method = HTTP_POST, .handler = users_password_post },
@@ -3652,6 +3656,61 @@ static esp_err_t arm_post(httpd_req_t* req)
     }
     alarm_begin_exit(exit_ms);
 
+    return json_reply(req, "{\"ok\":true}");
+}
+
+static esp_err_t tamper_reset_post(httpd_req_t* req)
+{
+    if (!check_bearer(req)) {
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    }
+
+    char user[32] = {0};
+    if (!current_user_from_req(req, user, sizeof(user))) {
+        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    }
+
+    char body[128]; size_t bl = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body"), ESP_FAIL;
+    }
+
+    cJSON* root = cJSON_ParseWithLength(body, bl);
+    if (!root) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json"), ESP_FAIL;
+    }
+
+    const cJSON* jpass = cJSON_GetObjectItemCaseSensitive(root, "password");
+    const char* pass = (cJSON_IsString(jpass) && jpass->valuestring) ? jpass->valuestring : NULL;
+    if (!pass || pass[0] == '\0') {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "password"), ESP_FAIL;
+    }
+
+    if (!auth_verify_password(user, pass)) {
+        cJSON_Delete(root);
+        return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "bad pass"), ESP_FAIL;
+    }
+
+    bool is_tamper_alarm = (alarm_get_state() == ALARM_ALARM) && alarm_last_alarm_was_tamper();
+    if (!is_tamper_alarm) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "409 Conflict");
+        return json_reply(req, "{\"error\":\"notamper\",\"message\":\"Allarme non generato dal tamper.\"}");
+    }
+
+    uint16_t gpioab = 0;
+    inputs_read_all(&gpioab);
+    if (inputs_tamper(gpioab)) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "409 Conflict");
+        return json_reply(req, "{\"error\":\"tamper_open\",\"message\":\"Linea tamper ancora aperta.\"}");
+    }
+
+    cJSON_Delete(root);
+
+    alarm_disarm();
+    audit_append("tamper_reset", user, 1, "Reset tamper");
     return json_reply(req, "{\"ok\":true}");
 }
 

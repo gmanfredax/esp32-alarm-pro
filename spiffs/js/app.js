@@ -19,6 +19,7 @@ const state = {
   role: null,
   isAdmin: false,
   status: null,
+  tamperAlarm: false,
   zones: [],
   boards: [],
   scenes: null,
@@ -329,6 +330,7 @@ async function refreshStatus(){
   try {
     const data = await apiGet('/api/status');
     state.status = data;
+    state.tamperAlarm = Boolean(data?.tamper_alarm && data?.state === 'ALARM');
     setBrandCentralName(data?.central_name);
     const wrap = $('#statusCards');
     if (!wrap) return;
@@ -340,6 +342,11 @@ async function refreshStatus(){
       kpiCard({ title: 'Tamper', valueHTML: tamper }),
       kpiCard({ title: 'Zone attive', valueHTML: `${zonesActive} / ${zonesCount}` })
     ].join('');
+    const tamperResetBtn = $('#tamperResetBtn');
+    if (tamperResetBtn) {
+      const shouldShow = state.tamperAlarm && Boolean(state.currentUser);
+      tamperResetBtn.classList.toggle('hidden', !shouldShow);
+    }
     const stateEl = document.getElementById('kpi-state-val');
     if (stateEl) renderAlarmState(stateEl, data, { iconHTML: stateIcon(data?.state) });
     if (state.activeTab === 'zones' && !document.hidden) {
@@ -778,6 +785,39 @@ function setupCommands(){
       }
     }
   });
+
+  $('#tamperResetBtn')?.addEventListener('click', async () => {
+    const password = await promptForPassword({
+      title: 'Reset allarme tamper',
+      confirmLabel: 'Reset',
+      description: 'Inserisci la tua password per ripristinare la centrale.'
+    });
+    if (password == null) {
+      return;
+    }
+    if (state.status?.tamper) {
+      showNotice('Linea tamper ancora aperta. Chiudi il contatto prima di resettare.', 'error');
+      return;
+    }
+    try {
+      await apiPost('/api/tamper/reset', { password });
+      showNotice('Allarme tamper resettato.', 'info');
+      refreshStatus();
+    } catch (err) {
+      console.error('tamperReset', err);
+      if (err instanceof HttpError) {
+        if (err.status === 403) {
+          showNotice('Password errata.', 'error');
+        } else if (err.status === 409) {
+          showNotice(err.message || 'Impossibile resettare: verifica lo stato del tamper.', 'error');
+        } else {
+          showNotice(err.message || 'Errore durante il reset tamper.', 'error');
+        }
+      } else {
+        showNotice('Errore durante il reset tamper.', 'error');
+      }
+    }
+  });
 }
 
 function normalizeRole(roleValue){
@@ -892,6 +932,90 @@ function promptForPin({
         return;
       }
       close(pin);
+    };
+
+    modal.addEventListener('keydown', onKeyDown);
+    overlay?.addEventListener('click', onOverlayClick, true);
+    cancelBtn?.addEventListener('click', onCancel);
+    form?.addEventListener('submit', onSubmit);
+
+    setTimeout(() => {
+      input?.focus();
+      input?.select();
+    }, 0);
+  });
+}
+
+function promptForPassword({
+  title = 'Password utente',
+  confirmLabel = 'Conferma',
+  description = ''
+} = {}){
+  return new Promise((resolve) => {
+    const modal = showModal(`
+      <h3 class="title">${escapeHtml(title)}</h3>
+      ${description ? `<p class="muted">${escapeHtml(description)}</p>` : ''}
+      <form class="form" id="user_pw_form">
+        <label class="field"><span>Password</span><input id="user_pw_input" type="password" autocomplete="current-password"></label>
+        <div class="row" style="justify-content:flex-end;gap:.5rem">
+          <button type="button" class="btn secondary" data-act="cancel">Annulla</button>
+          <button type="submit" class="btn primary" data-act="confirm">${escapeHtml(confirmLabel)}</button>
+        </div>
+      </form>
+    `);
+    if (!modal) {
+      resolve(null);
+      return;
+    }
+
+    const overlay = modal.parentElement;
+    const form = modal.querySelector('#user_pw_form');
+    const input = modal.querySelector('#user_pw_input');
+    const cancelBtn = modal.querySelector('[data-act="cancel"]');
+    let done = false;
+
+    const cleanup = () => {
+      modal.removeEventListener('keydown', onKeyDown);
+      overlay?.removeEventListener('click', onOverlayClick, true);
+      cancelBtn?.removeEventListener('click', onCancel);
+      form?.removeEventListener('submit', onSubmit);
+    };
+
+    const close = (value) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      clearModals();
+      resolve(value);
+    };
+
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close(null);
+      }
+    };
+
+    const onOverlayClick = (event) => {
+      if (event.target === overlay) {
+        event.preventDefault();
+        close(null);
+      }
+    };
+
+    const onCancel = (event) => {
+      event.preventDefault();
+      close(null);
+    };
+
+    const onSubmit = (event) => {
+      event.preventDefault();
+      const password = input?.value ?? '';
+      if (!password) {
+        input?.focus();
+        return;
+      }
+      close(password);
     };
 
     modal.addEventListener('keydown', onKeyDown);

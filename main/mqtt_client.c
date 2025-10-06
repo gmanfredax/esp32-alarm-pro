@@ -237,6 +237,7 @@ esp_err_t mqtt_publish_state(void)
     uint16_t gpioab = 0;
     inputs_read_all(&gpioab);
     bool tamper = inputs_tamper(gpioab);
+    bool tamper_alarm = (alarm_last_alarm_was_tamper() && st == ALARM_ALARM);
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
@@ -246,6 +247,7 @@ esp_err_t mqtt_publish_state(void)
     cJSON_AddNumberToObject(root, "outputs_mask", (double)outputs_mask);
     cJSON_AddNumberToObject(root, "bypass_mask", (double)bypass_mask);
     cJSON_AddItemToObject(root, "tamper", cJSON_CreateBool(tamper));
+    cJSON_AddItemToObject(root, "tamper_alarm", cJSON_CreateBool(tamper_alarm));
     cJSON_AddNumberToObject(root, "exit_pending_ms", (double)exit_ms);
     cJSON_AddNumberToObject(root, "entry_pending_ms", (double)entry_ms);
     cJSON_AddNumberToObject(root, "entry_zone", (double)entry_zone);
