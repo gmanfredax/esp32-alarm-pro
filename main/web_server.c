@@ -3284,7 +3284,15 @@ static esp_err_t logs_get(httpd_req_t* req){
         }
     }
 
-    if (match_count > 0) {
+    bool have_reference_ts = false;
+    for (int i = 0; i < match_count; ++i) {
+        if (resolved_wall_ts[i] > 0) {
+            have_reference_ts = true;
+            break;
+        }
+    }
+
+    if (have_reference_ts) {
         int64_t seed = now_wall_us > 0 ? now_wall_us : now_uptime_us;
         if (seed <= 0) {
             seed = esp_timer_get_time();
