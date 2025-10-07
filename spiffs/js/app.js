@@ -24,6 +24,7 @@ const state = {
   boards: [],
   scenes: null,
   logs: [],
+  logFilter: 'all',
   activeTab: ''
 };
 
@@ -666,6 +667,58 @@ function normalizeLogs(payload){
   return [];
 }
 
+function getLogTimestampValue(entry){
+  if (!entry || typeof entry === 'string') return Number.NEGATIVE_INFINITY;
+  const raw = entry?.ts ?? entry?.timestamp ?? entry?.time ?? entry?.date;
+  if (!raw && raw !== 0) return Number.NEGATIVE_INFINITY;
+  if (raw instanceof Date) {
+    const value = raw.getTime();
+    return Number.isNaN(value) ? Number.NEGATIVE_INFINITY : value;
+  }
+  if (typeof raw === 'number') {
+    const ts = raw > 1e12 ? raw : raw * 1000;
+    return Number.isFinite(ts) ? ts : Number.NEGATIVE_INFINITY;
+  }
+  const parsed = Date.parse(raw);
+  return Number.isNaN(parsed) ? Number.NEGATIVE_INFINITY : parsed;
+}
+
+function sortLogEntries(entries){
+  return entries
+    .map((entry, index) => ({ entry, index }))
+    .sort((a, b) => {
+      const diff = getLogTimestampValue(b.entry) - getLogTimestampValue(a.entry);
+      if (diff !== 0) return diff;
+      return a.index - b.index;
+    })
+    .map(({ entry }) => entry);
+}
+
+function getLogLevel(entry){
+  if (!entry || typeof entry === 'string') return '';
+  const level = entry?.level ?? entry?.severity ?? entry?.type;
+  return typeof level === 'string' ? level.toUpperCase() : String(level ?? '');
+}
+
+function filterLogEntries(entries, filter){
+  if (filter === 'all') return entries;
+  return entries.filter((entry) => {
+    const level = getLogLevel(entry);
+    if (!level) return false;
+    if (filter === 'info') return level.includes('INFO');
+    if (filter === 'warn') return level.includes('WARN');
+    if (filter === 'error') return level.includes('ERR');
+    return true;
+  });
+}
+
+function updateLogFilterButtons(){
+  $$('#logsFilterGroup button[data-filter]').forEach((btn) => {
+    const filter = btn.dataset.filter || 'all';
+    btn.classList.toggle('active', filter === state.logFilter);
+  });
+}
+
 function formatLogTimestamp(value){
   if (!value && value !== 0) return '';
   if (value instanceof Date) return dateTimeFormatter.format(value);
@@ -685,12 +738,17 @@ function renderLogEntries(entries){
     list.innerHTML = '<div class="log-empty">Nessun evento registrato.</div>';
     return;
   }
-  list.innerHTML = entries.map((entry) => {
+  const filtered = filterLogEntries(entries, state.logFilter);
+  if (!filtered.length) {
+    list.innerHTML = '<div class="log-empty">Nessun evento per il filtro selezionato.</div>';
+    return;
+  }
+  list.innerHTML = filtered.map((entry) => {
     if (typeof entry === 'string') {
       return `<div class="log-entry"><div class="log-body">${escapeHtml(entry)}</div></div>`;
     }
     const message = escapeHtml(entry?.message || entry?.msg || entry?.text || JSON.stringify(entry));
-    const level = (entry?.level || entry?.severity || entry?.type || '').toString().toUpperCase();
+    const level = getLogLevel(entry);
     const ts = formatLogTimestamp(entry?.ts ?? entry?.timestamp ?? entry?.time ?? entry?.date);
     const levelTag = level ? `<span class="tag ${level.includes('ERR') ? 'err' : level.includes('WARN') ? 'warn' : ''}">${level}</span>` : '';
     return `
@@ -707,13 +765,30 @@ function renderLogEntries(entries){
 async function refreshLogs(){
   try {
     const payload = await apiGet('/api/logs');
-    const entries = normalizeLogs(payload);
+    const entries = sortLogEntries(normalizeLogs(payload));
     state.logs = entries;
     renderLogEntries(entries);
   } catch (err) {
     console.error('refreshLogs', err);
     showNotice('Impossibile recuperare il log eventi.', 'error');
   }
+}
+
+function setupLogFilters(){
+  const group = $('#logsFilterGroup');
+  if (!group) return;
+  group.addEventListener('click', (event) => {
+    const btn = event.target.closest('button[data-filter]');
+    if (!btn) return;
+    const filter = btn.dataset.filter || 'all';
+    if (state.logFilter === filter) return;
+    state.logFilter = filter;
+    updateLogFilterButtons();
+    if (state.logs.length) {
+      renderLogEntries(state.logs);
+    }
+  });
+  updateLogFilterButtons();
 }
 
 function setupCommands(){
@@ -1257,6 +1332,7 @@ async function init(){
   setupCommands();
   setupZonesConfig();
   setupUserMenu();
+  setupLogFilters();
 
   $('#logsRefresh')?.addEventListener('click', () => refreshLogs());
 
