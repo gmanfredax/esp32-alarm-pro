@@ -3026,7 +3026,7 @@ static void logs_filter_parse(httpd_req_t *req, logs_filter_t *filter)
                 continue;
             }
             str_to_lower(token);
-            snprintf(filter->events[filter->event_count], sizeof(filter->events[0]), "%s", token);
+            strlcpy(filter->events[filter->event_count], token, sizeof(filter->events[0]));
             filter->event_count++;
         }
     }
@@ -3229,6 +3229,74 @@ static esp_err_t logs_get(httpd_req_t* req){
         ++match_count;
     }
 
+    int64_t resolved_wall_ts[LOGS_MAX_FETCH];
+    for (int i = 0; i < match_count; ++i) {
+        resolved_wall_ts[i] = match_wall_ts[i];
+    }
+
+    const int64_t fallback_gap_us = 1000000; // 1 second gap when we have no better reference
+    const int64_t max_reasonable_gap_us = (int64_t)7 * 24 * 3600 * 1000000LL; // one week
+
+    bool have_prev = false;
+    int64_t prev_wall = 0;
+    int64_t prev_ts = 0;
+    for (int i = 0; i < match_count; ++i) {
+        int idx = match_indexes[i];
+        int64_t entry_ts = entries_buf[idx].ts_us;
+        if (resolved_wall_ts[i] > 0) {
+            prev_wall = resolved_wall_ts[i];
+            prev_ts = entry_ts;
+            have_prev = true;
+        } else if (have_prev) {
+            int64_t delta_ts = entry_ts - prev_ts;
+            int64_t candidate = prev_wall + ((delta_ts > 0 && delta_ts < max_reasonable_gap_us) ? delta_ts : fallback_gap_us);
+            if (candidate <= prev_wall) {
+                candidate = prev_wall + fallback_gap_us;
+            }
+            resolved_wall_ts[i] = candidate;
+            prev_wall = candidate;
+            prev_ts = entry_ts;
+        }
+    }
+
+    bool have_next = false;
+    int64_t next_wall = 0;
+    int64_t next_ts = 0;
+    for (int i = match_count - 1; i >= 0; --i) {
+        int idx = match_indexes[i];
+        int64_t entry_ts = entries_buf[idx].ts_us;
+        if (resolved_wall_ts[i] > 0) {
+            next_wall = resolved_wall_ts[i];
+            next_ts = entry_ts;
+            have_next = true;
+        } else if (have_next) {
+            int64_t delta_ts = next_ts - entry_ts;
+            int64_t candidate = next_wall - ((delta_ts > 0 && delta_ts < max_reasonable_gap_us) ? delta_ts : fallback_gap_us);
+            if (candidate <= 0 || candidate >= next_wall) {
+                candidate = (next_wall > fallback_gap_us) ? (next_wall - fallback_gap_us) : (next_wall / 2);
+                if (candidate <= 0) {
+                    candidate = 1;
+                }
+            }
+            resolved_wall_ts[i] = candidate;
+            next_wall = candidate;
+            next_ts = entry_ts;
+        }
+    }
+
+    if (match_count > 0) {
+        int64_t seed = now_wall_us > 0 ? now_wall_us : now_uptime_us;
+        if (seed <= 0) {
+            seed = esp_timer_get_time();
+        }
+        for (int i = 0; i < match_count; ++i) {
+            if (resolved_wall_ts[i] <= 0) {
+                seed += fallback_gap_us;
+                resolved_wall_ts[i] = seed;
+            }
+        }
+    }
+
     int start = 0;
     if (filter.limit > 0 && match_count > filter.limit) {
         start = match_count - filter.limit;
@@ -3253,10 +3321,10 @@ static esp_err_t logs_get(httpd_req_t* req){
         return ESP_ERR_NO_MEM;
     }
 
-    for (int j = start; j < match_count; ++j) {
+    for (int j = match_count - 1; j >= start; --j) {
         int idx = match_indexes[j];
         audit_entry_t *ent = &entries_buf[idx];
-        int64_t wall_ts = match_wall_ts[j];
+        int64_t wall_ts = resolved_wall_ts[j];
 
         cJSON *entry = cJSON_CreateObject();
         if (!entry) {
