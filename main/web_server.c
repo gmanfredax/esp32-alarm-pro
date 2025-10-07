@@ -68,6 +68,7 @@
 #include <sys/param.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <time.h>
@@ -2862,6 +2863,452 @@ static void zones_save_to_nvs(void){
     zones_apply_to_alarm();
 }
 
+#define LOGS_DEFAULT_LIMIT     64
+#define LOGS_MAX_FETCH         128
+#define LOGS_EVENT_FILTER_MAX  8
+
+typedef struct {
+    int limit;
+    bool has_result;
+    int result;
+    bool only_success;
+    bool only_failure;
+    bool has_user;
+    char user[sizeof(((audit_entry_t *)0)->username)];
+    size_t event_count;
+    char events[LOGS_EVENT_FILTER_MAX][sizeof(((audit_entry_t *)0)->event)];
+    bool has_since;
+    int64_t since_us;
+    bool has_until;
+    int64_t until_us;
+} logs_filter_t;
+
+static void trim_whitespace(char *str)
+{
+    if (!str) {
+        return;
+    }
+    char *start = str;
+    while (*start && isspace((unsigned char)*start)) {
+        ++start;
+    }
+    if (start != str) {
+        size_t len = strlen(start);
+        memmove(str, start, len + 1);
+    }
+    size_t len = strlen(str);
+    while (len > 0 && isspace((unsigned char)str[len - 1])) {
+        str[--len] = '\0';
+    }
+}
+
+static void str_to_lower(char *str)
+{
+    if (!str) {
+        return;
+    }
+    for (; *str; ++str) {
+        *str = (char)tolower((unsigned char)*str);
+    }
+}
+
+static bool parse_time_param(const char *value, int64_t *out_us)
+{
+    if (!value || !*value || !out_us) {
+        return false;
+    }
+    char *end = NULL;
+    double number = strtod(value, &end);
+    if (end == value) {
+        return false;
+    }
+    while (end && isspace((unsigned char)*end)) {
+        ++end;
+    }
+    if (end && *end != '\0') {
+        return false;
+    }
+    size_t len = strlen(value);
+    double seconds = number;
+    if (len > 16) {
+        seconds = number / 1000000.0;
+    } else if (len > 13) {
+        seconds = number / 1000.0;
+    }
+    if (seconds < -62135596800.0) { // clamp before year 0001
+        seconds = -62135596800.0;
+    }
+    *out_us = (int64_t)(seconds * 1000000.0);
+    return true;
+}
+
+static void logs_filter_parse(httpd_req_t *req, logs_filter_t *filter)
+{
+    if (!filter) {
+        return;
+    }
+    memset(filter, 0, sizeof(*filter));
+    filter->limit = LOGS_DEFAULT_LIMIT;
+
+    size_t qlen = httpd_req_get_url_query_len(req);
+    if (qlen == 0) {
+        return;
+    }
+    if (qlen > 1024) {
+        qlen = 1024;
+    }
+    char *query = calloc(qlen + 1, 1);
+    if (!query) {
+        return;
+    }
+    if (httpd_req_get_url_query_str(req, query, qlen + 1) != ESP_OK) {
+        free(query);
+        return;
+    }
+
+    char value[160];
+
+    if (httpd_query_key_value(query, "limit", value, sizeof(value)) == ESP_OK) {
+        trim_whitespace(value);
+        if (value[0]) {
+            char *end = NULL;
+            long parsed = strtol(value, &end, 10);
+            while (end && isspace((unsigned char)*end)) {
+                ++end;
+            }
+            if (end && *end == '\0') {
+                if (parsed < 0) {
+                    parsed = 0;
+                }
+                if (parsed > LOGS_MAX_FETCH) {
+                    parsed = LOGS_MAX_FETCH;
+                }
+                filter->limit = (int)parsed;
+            }
+        }
+    }
+
+    if (httpd_query_key_value(query, "result", value, sizeof(value)) == ESP_OK) {
+        trim_whitespace(value);
+        str_to_lower(value);
+        if (strcmp(value, "1") == 0 || strcmp(value, "ok") == 0 || strcmp(value, "success") == 0 || strcmp(value, "true") == 0 || strcmp(value, "pass") == 0) {
+            filter->has_result = true;
+            filter->result = 1;
+        } else if (strcmp(value, "0") == 0 || strcmp(value, "fail") == 0 || strcmp(value, "error") == 0 || strcmp(value, "false") == 0 || strcmp(value, "warn") == 0) {
+            filter->has_result = true;
+            filter->result = 0;
+        }
+    }
+
+    if (httpd_query_key_value(query, "level", value, sizeof(value)) == ESP_OK) {
+        trim_whitespace(value);
+        str_to_lower(value);
+        if (strcmp(value, "warn") == 0 || strcmp(value, "warning") == 0 || strcmp(value, "error") == 0) {
+            filter->only_failure = true;
+        } else if (strcmp(value, "info") == 0 || strcmp(value, "success") == 0 || strcmp(value, "ok") == 0) {
+            filter->only_success = true;
+        }
+    }
+
+    if (httpd_query_key_value(query, "user", value, sizeof(value)) == ESP_OK) {
+        trim_whitespace(value);
+        if (value[0]) {
+            strlcpy(filter->user, value, sizeof(filter->user));
+            filter->has_user = true;
+        }
+    }
+
+    if (httpd_query_key_value(query, "event", value, sizeof(value)) == ESP_OK) {
+        char *save = NULL;
+        for (char *token = strtok_r(value, ",", &save); token && filter->event_count < LOGS_EVENT_FILTER_MAX; token = strtok_r(NULL, ",", &save)) {
+            trim_whitespace(token);
+            if (!token[0]) {
+                continue;
+            }
+            str_to_lower(token);
+            snprintf(filter->events[filter->event_count], sizeof(filter->events[0]), "%s", token);
+            filter->event_count++;
+        }
+    }
+
+    if (httpd_query_key_value(query, "since", value, sizeof(value)) == ESP_OK ||
+        httpd_query_key_value(query, "from", value, sizeof(value)) == ESP_OK) {
+        trim_whitespace(value);
+        int64_t since_us = 0;
+        if (parse_time_param(value, &since_us)) {
+            filter->has_since = true;
+            filter->since_us = since_us;
+        }
+    }
+
+    if (httpd_query_key_value(query, "until", value, sizeof(value)) == ESP_OK ||
+        httpd_query_key_value(query, "to", value, sizeof(value)) == ESP_OK) {
+        trim_whitespace(value);
+        int64_t until_us = 0;
+        if (parse_time_param(value, &until_us)) {
+            filter->has_until = true;
+            filter->until_us = until_us;
+        }
+    }
+
+    free(query);
+}
+
+static int64_t logs_compute_wall_ts(const audit_entry_t *entry, int64_t now_wall_us, int64_t now_uptime_us)
+{
+    if (!entry) {
+        return 0;
+    }
+    if (entry->wall_ts_us > 0) {
+        return entry->wall_ts_us;
+    }
+    if (now_wall_us <= 0 || now_uptime_us <= 0 || entry->ts_us <= 0) {
+        return 0;
+    }
+    int64_t delta = now_uptime_us - entry->ts_us;
+    if (delta < 0) {
+        return 0;
+    }
+    int64_t candidate = now_wall_us - delta;
+    return candidate > 0 ? candidate : 0;
+}
+
+static bool logs_entry_matches(const audit_entry_t *entry, const logs_filter_t *filter, int64_t wall_ts_us)
+{
+    if (!entry || !filter) {
+        return false;
+    }
+    if (filter->has_result) {
+        int desired = filter->result > 0 ? 1 : 0;
+        int actual = entry->result > 0 ? 1 : 0;
+        if (desired != actual) {
+            return false;
+        }
+    }
+    if (filter->only_success && entry->result <= 0) {
+        return false;
+    }
+    if (filter->only_failure && entry->result > 0) {
+        return false;
+    }
+    if (filter->has_user) {
+        if (!entry->username[0] || strcasecmp(entry->username, filter->user) != 0) {
+            return false;
+        }
+    }
+    if (filter->event_count > 0) {
+        bool matched = false;
+        for (size_t i = 0; i < filter->event_count; ++i) {
+            if (strcasecmp(entry->event, filter->events[i]) == 0) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            return false;
+        }
+    }
+    if (filter->has_since) {
+        if (wall_ts_us <= 0 || wall_ts_us < filter->since_us) {
+            return false;
+        }
+    }
+    if (filter->has_until) {
+        if (wall_ts_us <= 0 || wall_ts_us > filter->until_us) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool logs_format_iso8601(int64_t ts_us, char *out, size_t cap)
+{
+    if (!out || cap == 0 || ts_us <= 0) {
+        return false;
+    }
+    time_t seconds = (time_t)(ts_us / 1000000LL);
+    struct tm tm_utc;
+    if (!gmtime_r(&seconds, &tm_utc)) {
+        return false;
+    }
+    int64_t micros = ts_us % 1000000LL;
+    if (micros < 0) {
+        micros += 1000000LL;
+    }
+    int written = snprintf(out, cap, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+                           tm_utc.tm_year + 1900,
+                           tm_utc.tm_mon + 1,
+                           tm_utc.tm_mday,
+                           tm_utc.tm_hour,
+                           tm_utc.tm_min,
+                           tm_utc.tm_sec,
+                           (int)(micros / 1000LL));
+    return written > 0 && (size_t)written < cap;
+}
+
+static const char* audit_event_label(const char* code){
+    if (!code || !code[0]) {
+        return "Evento";
+    }
+    if (strcmp(code, "login") == 0) return "Login";
+    if (strcmp(code, "logout") == 0) return "Logout";
+    if (strcmp(code, "hw_reset") == 0) return "Reset hardware";
+    if (strcmp(code, "websec") == 0) return "Certificato web";
+    if (strcmp(code, "tamper_reset") == 0) return "Reset tamper";
+    return code;
+}
+
+static void audit_format_message(const audit_entry_t* ent, char* out, size_t cap){
+    if (!out || cap == 0) {
+        return;
+    }
+    const char* label = audit_event_label(ent ? ent->event : NULL);
+    const char* outcome = (ent && ent->result > 0) ? "riuscito" : "fallito";
+    const bool has_user = ent && ent->username[0] != '\0';
+    const bool has_note = ent && ent->note[0] != '\0';
+
+    if (!ent) {
+        snprintf(out, cap, "%s", label);
+        return;
+    }
+
+    if (has_note) {
+        snprintf(out, cap, "%s %s%s%s (%s)",
+                 label,
+                 outcome,
+                 has_user ? " per " : "",
+                 has_user ? ent->username : "",
+                 ent->note);
+    } else {
+        snprintf(out, cap, "%s %s%s%s",
+                 label,
+                 outcome,
+                 has_user ? " per " : "",
+                 has_user ? ent->username : "");
+    }
+}
+
+static esp_err_t logs_get(httpd_req_t* req){
+    if (!check_bearer(req)) {
+        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token");
+        return ESP_FAIL;
+    }
+
+    logs_filter_t filter;
+    logs_filter_parse(req, &filter);
+
+    audit_entry_t *entries_buf = calloc(LOGS_MAX_FETCH, sizeof(audit_entry_t));
+    if (!entries_buf) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+
+    int fetched = audit_dump_recent(entries_buf, LOGS_MAX_FETCH);
+    if (fetched < 0) {
+        fetched = 0;
+    }
+
+    struct timeval now_tv;
+    int64_t now_wall_us = 0;
+    if (gettimeofday(&now_tv, NULL) == 0) {
+        now_wall_us = (int64_t)now_tv.tv_sec * 1000000LL + (int64_t)now_tv.tv_usec;
+    }
+    int64_t now_uptime_us = esp_timer_get_time();
+
+    int match_indexes[LOGS_MAX_FETCH];
+    int64_t match_wall_ts[LOGS_MAX_FETCH];
+    int match_count = 0;
+
+    for (int i = 0; i < fetched; ++i) {
+        int64_t wall_ts = logs_compute_wall_ts(&entries_buf[i], now_wall_us, now_uptime_us);
+        if (!logs_entry_matches(&entries_buf[i], &filter, wall_ts)) {
+            continue;
+        }
+        match_indexes[match_count] = i;
+        match_wall_ts[match_count] = wall_ts;
+        ++match_count;
+    }
+
+    int start = 0;
+    if (filter.limit > 0 && match_count > filter.limit) {
+        start = match_count - filter.limit;
+    }
+    int returned = match_count - start;
+    if (returned < 0) {
+        returned = 0;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        free(entries_buf);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON *entries = cJSON_CreateArray();
+    if (!entries) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        free(entries_buf);
+        return ESP_ERR_NO_MEM;
+    }
+
+    for (int j = start; j < match_count; ++j) {
+        int idx = match_indexes[j];
+        audit_entry_t *ent = &entries_buf[idx];
+        int64_t wall_ts = match_wall_ts[j];
+
+        cJSON *entry = cJSON_CreateObject();
+        if (!entry) {
+            cJSON_Delete(entries);
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+            free(entries_buf);
+            return ESP_ERR_NO_MEM;
+        }
+
+        char message[160];
+        audit_format_message(ent, message, sizeof(message));
+
+        if (wall_ts > 0) {
+            double epoch_seconds = (double)wall_ts / 1000000.0;
+            cJSON_AddNumberToObject(entry, "ts", epoch_seconds);
+            cJSON_AddNumberToObject(entry, "ts_epoch", epoch_seconds);
+            cJSON_AddNumberToObject(entry, "ts_ms", epoch_seconds * 1000.0);
+            cJSON_AddNumberToObject(entry, "wall_ts_us", (double)wall_ts);
+            char iso[32];
+            if (logs_format_iso8601(wall_ts, iso, sizeof(iso))) {
+                cJSON_AddStringToObject(entry, "ts_iso", iso);
+            }
+        }
+
+        cJSON_AddNumberToObject(entry, "ts_us", (double)ent->ts_us);
+        cJSON_AddNumberToObject(entry, "uptime_s", (double)ent->ts_us / 1000000.0);
+        cJSON_AddNumberToObject(entry, "result", ent->result);
+        cJSON_AddStringToObject(entry, "event", ent->event);
+        cJSON_AddStringToObject(entry, "user", ent->username);
+        cJSON_AddStringToObject(entry, "note", ent->note);
+        cJSON_AddStringToObject(entry, "message", message);
+        cJSON_AddStringToObject(entry, "level", ent->result > 0 ? "INFO" : "WARN");
+        cJSON_AddItemToArray(entries, entry);
+    }
+
+    cJSON_AddItemToObject(root, "entries", entries);
+    cJSON_AddNumberToObject(root, "count", returned);
+    cJSON_AddNumberToObject(root, "total", match_count);
+    cJSON_AddNumberToObject(root, "limit", filter.limit);
+    if (filter.has_since) {
+        cJSON_AddNumberToObject(root, "since", (double)filter.since_us / 1000000.0);
+    }
+    if (filter.has_until) {
+        cJSON_AddNumberToObject(root, "until", (double)filter.until_us / 1000000.0);
+    }
+
+    esp_err_t res = json_reply_cjson(req, root);
+    free(entries_buf);
+    return res;
+}
+
 static esp_err_t status_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
 
@@ -3333,6 +3780,7 @@ static esp_err_t api_admin_only_get(httpd_req_t* req){
 }
 
 static esp_err_t status_get(httpd_req_t* req);
+static esp_err_t logs_get(httpd_req_t* req);
 static esp_err_t zones_get (httpd_req_t* req);
 static esp_err_t scenes_get(httpd_req_t* req);
 static esp_err_t scenes_post(httpd_req_t* req);
@@ -3391,6 +3839,7 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/zones/config",       .method = HTTP_POST, .handler = zones_config_post },
     { .uri = "/api/scenes",             .method = HTTP_GET,  .handler = scenes_get },
     { .uri = "/api/scenes",             .method = HTTP_POST, .handler = scenes_post },
+    { .uri = "/api/logs",               .method = HTTP_GET,  .handler = logs_get },
     { .uri = "/api/user/password",      .method = HTTP_POST, .handler = user_post_password },
     { .uri = "/api/user/totp",          .method = HTTP_GET,  .handler = user_get_totp },
     { .uri = "/api/user/totp/enable",   .method = HTTP_POST, .handler = user_post_totp_enable },

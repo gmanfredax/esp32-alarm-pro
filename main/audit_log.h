@@ -14,6 +14,7 @@ typedef struct {
     char username[32];       // subject username (or attempted user for login)
     int result;              // 1 ok, 0 fail
     char note[64];           // short note/reason
+    int64_t wall_ts_us;      // absolute wall-clock timestamp (gettimeofday), 0 if unknown
 } audit_entry_t;
 
 esp_err_t audit_init(size_t capacity /* e.g., 128 */);
@@ -21,6 +22,9 @@ void audit_append(const char* event, const char* username, int result, const cha
 
 // Stream gli ultimi 'limit' eventi come JSON array nella response (admin API)
 esp_err_t audit_stream_json(httpd_req_t* req, size_t limit);
+
+// Copia gli ultimi eventi (in ordine cronologico) dentro l'array out.
+int audit_dump_recent(audit_entry_t* out, size_t max);
 
 #ifdef __cplusplus
 }
