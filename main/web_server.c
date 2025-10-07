@@ -3385,6 +3385,24 @@ static esp_err_t logs_get(httpd_req_t* req){
     return res;
 }
 
+static esp_err_t logs_clear_post(httpd_req_t* req){
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = audit_clear_all();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "logs_clear_all failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "clear");
+        return err;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
+    return ESP_OK;
+}
+
 static esp_err_t status_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
 
@@ -3857,6 +3875,7 @@ static esp_err_t api_admin_only_get(httpd_req_t* req){
 
 static esp_err_t status_get(httpd_req_t* req);
 static esp_err_t logs_get(httpd_req_t* req);
+static esp_err_t logs_clear_post(httpd_req_t* req);
 static esp_err_t zones_get (httpd_req_t* req);
 static esp_err_t scenes_get(httpd_req_t* req);
 static esp_err_t scenes_post(httpd_req_t* req);
@@ -3916,6 +3935,7 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/scenes",             .method = HTTP_GET,  .handler = scenes_get },
     { .uri = "/api/scenes",             .method = HTTP_POST, .handler = scenes_post },
     { .uri = "/api/logs",               .method = HTTP_GET,  .handler = logs_get },
+    { .uri = "/api/logs/clear",         .method = HTTP_POST, .handler = logs_clear_post },
     { .uri = "/api/user/password",      .method = HTTP_POST, .handler = user_post_password },
     { .uri = "/api/user/totp",          .method = HTTP_GET,  .handler = user_get_totp },
     { .uri = "/api/user/totp/enable",   .method = HTTP_POST, .handler = user_post_totp_enable },

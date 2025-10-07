@@ -83,6 +83,32 @@ void audit_append(const char* event, const char* username, int result, const cha
     save_meta();
 }
 
+esp_err_t audit_clear_all(void){
+    if (!s_nvs) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_err_t last_err = ESP_OK;
+    for (uint16_t i = 0; i < s_cap; ++i) {
+        char key[16];
+        key_for_index(i, key);
+        esp_err_t err = nvs_erase_key(s_nvs, key);
+        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+            last_err = err;
+        }
+    }
+
+    s_head = 0;
+    s_count = 0;
+
+    esp_err_t meta_err = save_meta();
+    if (meta_err != ESP_OK) {
+        return meta_err;
+    }
+
+    return last_err;
+}
+
 esp_err_t audit_stream_json(httpd_req_t* req, size_t limit){
     if (limit==0 || limit > s_count) limit = s_count;
     httpd_resp_set_type(req,"application/json");

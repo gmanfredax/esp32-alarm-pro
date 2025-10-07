@@ -19,6 +19,7 @@ typedef struct {
 
 esp_err_t audit_init(size_t capacity /* e.g., 128 */);
 void audit_append(const char* event, const char* username, int result, const char* note);
+esp_err_t audit_clear_all(void);
 
 // Stream gli ultimi 'limit' eventi come JSON array nella response (admin API)
 esp_err_t audit_stream_json(httpd_req_t* req, size_t limit);

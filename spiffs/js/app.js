@@ -1335,7 +1335,21 @@ async function init(){
   setupLogFilters();
 
   $('#logsRefresh')?.addEventListener('click', () => refreshLogs());
-
+  $('#logsClear')?.addEventListener('click', async () => {
+    if (!state.isAdmin) return;
+    if (!window.confirm('Sei sicuro di voler cancellare tutti i log?')) {
+      return;
+    }
+    try {
+      await apiPost('/api/logs/clear', {});
+      state.logs = [];
+      renderLogEntries([]);
+      showNotice('Log cancellati con successo.', 'info');
+    } catch (err) {
+      console.error('logsClear', err);
+      showNotice('Impossibile cancellare il log eventi.', 'error');
+    }
+  });
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       stopStatusUpdates();
