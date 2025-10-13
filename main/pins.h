@@ -2,6 +2,7 @@
 #pragma once
 #include "driver/gpio.h"
 #include "driver/spi_master.h"   // per SPIx_HOST
+#include "sdkconfig.h"
 #include "driver/i2c_master.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,6 +60,17 @@
 #endif
 #ifndef PN532_PIN_CS
   #define PN532_PIN_CS          GPIO_NUM_16
+#endif
+
+
+// =============================== CAN / TWAI ==================================
+#if defined(CONFIG_APP_CAN_ENABLED)
+  #ifndef CAN_TX_GPIO
+    #define CAN_TX_GPIO ((gpio_num_t)CONFIG_APP_CAN_TX_GPIO)
+  #endif
+  #ifndef CAN_RX_GPIO
+    #define CAN_RX_GPIO ((gpio_num_t)CONFIG_APP_CAN_RX_GPIO)
+  #endif
 #endif
 
 
@@ -168,6 +180,10 @@ _ASSERT_NOT_RMII(ONEWIRE_GPIO);
 _ASSERT_NOT_RMII(ETH_MDC_GPIO);
 _ASSERT_NOT_RMII(ETH_MDIO_GPIO);
 
+#if defined(CONFIG_APP_CAN_ENABLED)
+_ASSERT_NOT_RMII(CAN_TX_GPIO);
+_ASSERT_NOT_RMII(CAN_RX_GPIO);
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Utility a runtime: stampa mappa pin (chiamala all’avvio, es. in app_main)
@@ -186,6 +202,20 @@ static inline void pins_print_map(void) {
            I2C_PORT, I2C_SDA_GPIO, I2C_SCL_GPIO, I2C_SPEED_HZ);
 
     printf("1-Wire GPIO=%d\n", ONEWIRE_GPIO);
+
+#if defined(CONFIG_APP_CAN_ENABLED)
+    int can_bitrate = 0;
+#if defined(CONFIG_APP_CAN_BITRATE_125K)
+    can_bitrate = 125000;
+#elif defined(CONFIG_APP_CAN_BITRATE_500K)
+    can_bitrate = 500000;
+#else
+    can_bitrate = 250000;
+#endif
+    printf("CAN  TWAI  TX=%d RX=%d bitrate=%d\n", CAN_TX_GPIO, CAN_RX_GPIO, can_bitrate);
+#else
+    printf("CAN  TWAI  disabled\n");
+#endif
 
     printf("MCP23017 addr=0x%02X  PORTB bits: RELAY=%d LED_STATO=%d LED_MANUT=%d TAMPER=%d\n",
            MCP23017_ADDR, MCPB_RELAY_BIT, MCPB_LED_STATO_BIT, MCPB_LED_MANUT_BIT, MCPB_TAMPER_BIT);

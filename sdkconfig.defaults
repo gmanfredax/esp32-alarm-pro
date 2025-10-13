@@ -47,6 +47,14 @@ CONFIG_APP_CLOUD_QOS_COMMANDS=1
 CONFIG_APP_CLOUD_WS_PATH="/mqtt"
 CONFIG_APP_CLOUD_TOKEN_ENDPOINT="https://api.example.com/token"
 
+# ==== CAN / TWAI ==============================================================
+CONFIG_APP_CAN_ENABLED=y
+CONFIG_APP_CAN_TX_GPIO=5
+CONFIG_APP_CAN_RX_GPIO=4
+CONFIG_APP_CAN_BITRATE_250K=y
+CONFIG_APP_CAN_NODE_TIMEOUT_MS=5000
+CONFIG_APP_CAN_RX_TASK_STACK=4096
+
 # ==== I²C / SPI ===============================================================
 CONFIG_I2C_ISR_IRAM_SAFE=y
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y

@@ -2,6 +2,9 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
+#include <stdio.h>
+#include <inttypes.h>
 #include "sdkconfig.h"
 
 #include "esp_mac.h"
@@ -19,6 +22,7 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "driver/twai.h"
 
 // Header del progetto
 #include "ethernet.h"
@@ -71,6 +75,14 @@ static void sntp_start_and_wait(void){
 
 static const char *TAG = "app";
 
+#if defined(CONFIG_APP_CAN_ENABLED)
+static const char *TAG_CAN = "can";
+
+static esp_err_t can_master_handle_node_info(uint8_t node_id, const roster_node_info_t *info);
+static void can_master_handle_node_online(uint8_t node_id);
+static void can_master_handle_node_offline(uint8_t node_id);
+#endif
+
 #define SYSTEM_MAIN_TASK_STACK_BYTES      (16384)
 #define SYSTEM_MAIN_TASK_PRIORITY         (tskIDLE_PRIORITY + 5)
 #define WEB_SERVER_START_TASK_STACK_BYTES (16384)
@@ -84,6 +96,329 @@ _Static_assert((SYSTEM_MAIN_TASK_STACK_BYTES % sizeof(StackType_t)) == 0,
 
 #define CAN_SCAN_WINDOW_US (2000000ULL)
 #define MASTER_OUTPUTS_COUNT 3
+
+#if defined(CONFIG_APP_CAN_ENABLED)
+
+#define CAN_RX_TASK_STACK_BYTES (CONFIG_APP_CAN_RX_TASK_STACK)
+#define CAN_RX_TASK_PRIORITY    (tskIDLE_PRIORITY + 4)
+
+#define CAN_MAX_NODE_ID         (127u)
+#define CAN_NODE_TIMEOUT_MS     ((uint32_t)CONFIG_APP_CAN_NODE_TIMEOUT_MS)
+
+_Static_assert((CAN_RX_TASK_STACK_BYTES % sizeof(StackType_t)) == 0,
+               "CAN_RX_TASK_STACK_BYTES must align to StackType_t size");
+
+typedef struct {
+    bool used;
+    bool online;
+    uint8_t last_state;
+    uint64_t last_seen_ms;
+} can_node_state_t;
+
+static bool s_can_driver_started = false;
+static TaskHandle_t s_can_rx_task = NULL;
+static SemaphoreHandle_t s_can_state_lock = NULL;
+static can_node_state_t s_can_nodes[CAN_MAX_NODE_ID + 1];
+
+static inline uint64_t can_now_ms(void)
+{
+    return (uint64_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static SemaphoreHandle_t can_state_lock_get(void)
+{
+    if (!s_can_state_lock) {
+        s_can_state_lock = xSemaphoreCreateMutex();
+    }
+    return s_can_state_lock;
+}
+
+static inline twai_timing_config_t can_timing_config(void)
+{
+#if defined(CONFIG_APP_CAN_BITRATE_125K)
+    return (twai_timing_config_t)TWAI_TIMING_CONFIG_125KBITS();
+#elif defined(CONFIG_APP_CAN_BITRATE_500K)
+    return (twai_timing_config_t)TWAI_TIMING_CONFIG_500KBITS();
+#else
+    return (twai_timing_config_t)TWAI_TIMING_CONFIG_250KBITS();
+#endif
+}
+
+static void can_log_frame_debug(const twai_message_t *msg)
+{
+    if (!msg) {
+        return;
+    }
+    char payload[3 * TWAI_FRAME_MAX_DLC + 1];
+    size_t off = 0;
+    for (int i = 0; i < msg->data_length_code && off + 3 < sizeof(payload); ++i) {
+        off += snprintf(&payload[off], sizeof(payload) - off, "%02X ", msg->data[i]);
+    }
+    if (off == 0) {
+        payload[0] = '\0';
+    } else if (off > 0) {
+        payload[off - 1] = '\0';
+    }
+    ESP_LOGD(TAG_CAN, "RX id=0x%03" PRIx32 " len=%d rtr=%d data=%s",
+             msg->identifier & 0x7FFu,
+             (int)msg->data_length_code,
+             (int)msg->rtr,
+             payload);
+}
+
+static void can_state_mark_seen(uint8_t node_id, uint8_t state)
+{
+    if (node_id == 0 || node_id > CAN_MAX_NODE_ID) {
+        return;
+    }
+    SemaphoreHandle_t lock = can_state_lock_get();
+    if (!lock) {
+        return;
+    }
+    uint64_t now_ms = can_now_ms();
+    bool became_online = false;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    can_node_state_t *entry = &s_can_nodes[node_id];
+    became_online = !entry->online;
+    entry->used = true;
+    entry->online = true;
+    entry->last_state = state;
+    entry->last_seen_ms = now_ms;
+    xSemaphoreGive(lock);
+
+    if (became_online) {
+        ESP_LOGI(TAG_CAN, "node %u online (state=0x%02X)", (unsigned)node_id, state);
+        can_master_handle_node_online(node_id);
+    }
+}
+
+static void can_state_check_timeouts(void)
+{
+    SemaphoreHandle_t lock = can_state_lock_get();
+    if (!lock) {
+        return;
+    }
+    uint8_t offline_nodes[CAN_MAX_NODE_ID + 1];
+    const size_t offline_capacity = sizeof(offline_nodes) / sizeof(offline_nodes[0]);
+    size_t offline_count = 0;
+    uint64_t now_ms = can_now_ms();
+    xSemaphoreTake(lock, portMAX_DELAY);
+    for (uint32_t node_id = 1; node_id <= CAN_MAX_NODE_ID; ++node_id) {
+        can_node_state_t *entry = &s_can_nodes[node_id];
+        if (!entry->used || !entry->online) {
+            continue;
+        }
+        if ((now_ms - entry->last_seen_ms) > CAN_NODE_TIMEOUT_MS) {
+            entry->online = false;
+            if (offline_count < offline_capacity) {
+                offline_nodes[offline_count++] = (uint8_t)node_id;
+            }
+        }
+    }
+    xSemaphoreGive(lock);
+
+    for (size_t i = 0; i < offline_count; ++i) {
+        uint8_t node_id = offline_nodes[i];
+        ESP_LOGW(TAG_CAN, "node %u offline (timeout)", (unsigned)node_id);
+        can_master_handle_node_offline(node_id);
+    }
+}
+
+static void can_process_pdo_or_heartbeat(uint32_t cob_id, const twai_message_t *msg)
+{
+    uint8_t node_id = (uint8_t)(cob_id & 0x7Fu);
+    uint8_t state = (msg && msg->data_length_code > 0) ? msg->data[0] : 0x05u;
+    can_state_mark_seen(node_id, state);
+}
+
+static void can_process_node_info(uint8_t node_id, const twai_message_t *msg)
+{
+    if (!msg) {
+        return;
+    }
+    roster_node_info_t info = {
+        .label = NULL,
+        .kind = NULL,
+        .uid = NULL,
+        .has_uid = false,
+        .model = 0,
+        .fw = 0,
+        .caps = 0,
+        .inputs_count = 0,
+        .outputs_count = 0,
+    };
+
+    if (msg->data_length_code >= 8) {
+        info.model = (uint16_t)((uint16_t)msg->data[1] << 8 | (uint16_t)msg->data[0]);
+        info.fw = (uint16_t)((uint16_t)msg->data[3] << 8 | (uint16_t)msg->data[2]);
+        info.inputs_count = msg->data[4];
+        info.outputs_count = msg->data[5];
+        info.caps = (uint16_t)((uint16_t)msg->data[7] << 8 | (uint16_t)msg->data[6]);
+        can_master_handle_node_info(node_id, &info);
+    }
+}
+
+static void can_process_frame(const twai_message_t *msg)
+{
+    if (!msg || msg->extd) {
+        return;
+    }
+    can_log_frame_debug(msg);
+    uint32_t cob_id = msg->identifier & 0x7FFu;
+
+    if ((cob_id & 0x780u) == 0x700u) { // Heartbeat or boot-up
+        can_process_pdo_or_heartbeat(cob_id, msg);
+        return;
+    }
+
+    if (cob_id >= 0x180u && cob_id <= 0x1FFu) { // PDO1 (inputs)
+        can_process_pdo_or_heartbeat(cob_id, msg);
+        return;
+    }
+
+    if (cob_id >= 0x580u && cob_id <= 0x5FFu) { // SDO response
+        uint8_t node_id = (uint8_t)(cob_id - 0x580u);
+        if (node_id == 0) {
+            return;
+        }
+        can_state_mark_seen(node_id, 0x05u);
+        can_process_node_info(node_id, msg);
+        return;
+    }
+}
+
+static void can_rx_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG_CAN, "RX task started");
+    while (true) {
+        twai_message_t msg = {0};
+        esp_err_t err = twai_receive(&msg, pdMS_TO_TICKS(200));
+        if (err == ESP_OK) {
+            can_process_frame(&msg);
+        } else if (err != ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG_CAN, "twai_receive failed: %s", esp_err_to_name(err));
+            if (err == ESP_ERR_INVALID_STATE) {
+                vTaskDelay(pdMS_TO_TICKS(200));
+            }
+        }
+        can_state_check_timeouts();
+    }
+}
+
+static esp_err_t can_master_send_frame(uint32_t cob_id, const uint8_t *data, uint8_t len)
+{
+    if (!s_can_driver_started) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    twai_message_t msg = {0};
+    msg.identifier = cob_id & 0x7FFu;
+    msg.extd = 0;
+    msg.rtr = 0;
+    msg.data_length_code = len;
+    if (data && len > 0) {
+        if (len > sizeof(msg.data)) {
+            len = sizeof(msg.data);
+            msg.data_length_code = sizeof(msg.data);
+        }
+        memcpy(msg.data, data, len);
+    } else {
+        memset(msg.data, 0, sizeof(msg.data));
+    }
+    return twai_transmit(&msg, pdMS_TO_TICKS(50));
+}
+
+static esp_err_t can_master_send_nmt(uint8_t command, uint8_t target)
+{
+    uint8_t payload[2] = { command, target };
+    esp_err_t err = can_master_send_frame(0x000u, payload, sizeof(payload));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG_CAN, "NMT 0x%02X to %u failed: %s", (unsigned)command, (unsigned)target, esp_err_to_name(err));
+    }
+    return err;
+}
+
+static void can_master_trigger_discovery(void)
+{
+    if (!s_can_driver_started) {
+        return;
+    }
+    (void)can_master_send_nmt(0x82u, 0x00u); // Reset communication
+    (void)can_master_send_nmt(0x01u, 0x00u); // Start all nodes
+}
+
+static esp_err_t can_master_driver_start(void)
+{
+    if (s_can_driver_started) {
+        return ESP_OK;
+    }
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
+    g_config.clkout_divider = 0;
+    g_config.rx_queue_len = 32;
+    g_config.tx_queue_len = 32;
+    g_config.alerts_enabled = TWAI_ALERT_NONE;
+#if CONFIG_TWAI_ISR_IN_IRAM
+    g_config.intr_flags = ESP_INTR_FLAG_IRAM;
+#endif
+
+    twai_timing_config_t t_config = can_timing_config();
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_CAN, "twai_driver_install failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = twai_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_CAN, "twai_start failed: %s", esp_err_to_name(err));
+        twai_driver_uninstall();
+        return err;
+    }
+
+    uint32_t current_alerts = 0;
+    err = twai_reconfigure_alerts(TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED |
+                                  TWAI_ALERT_ERR_PASS | TWAI_ALERT_RX_DATA |
+                                  TWAI_ALERT_TX_FAILED | TWAI_ALERT_RX_QUEUE_FULL,
+                                  &current_alerts);
+    (void)current_alerts;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG_CAN, "twai_reconfigure_alerts failed: %s", esp_err_to_name(err));
+    }
+
+    memset(s_can_nodes, 0, sizeof(s_can_nodes));
+
+    const BaseType_t task_ok = xTaskCreatePinnedToCore(
+        can_rx_task,
+        "can_rx",
+        CAN_RX_TASK_STACK_BYTES / sizeof(StackType_t),
+        NULL,
+        CAN_RX_TASK_PRIORITY,
+        &s_can_rx_task,
+        tskNO_AFFINITY);
+    if (task_ok != pdPASS) {
+        ESP_LOGE(TAG_CAN, "unable to create CAN RX task (%ld)", (long)task_ok);
+        twai_stop();
+        twai_driver_uninstall();
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_can_driver_started = true;
+    ESP_LOGI(TAG_CAN, "driver started (bitrate %s)",
+#if defined(CONFIG_APP_CAN_BITRATE_125K)
+             "125k"
+#elif defined(CONFIG_APP_CAN_BITRATE_500K)
+             "500k"
+#else
+             "250k"
+#endif
+    );
+    can_master_trigger_discovery();
+    return ESP_OK;
+}
+
+#endif // CONFIG_APP_CAN_ENABLED
 
 static SemaphoreHandle_t s_scan_mutex = NULL;
 static esp_timer_handle_t s_scan_timer = NULL;
@@ -179,6 +514,12 @@ static void can_scan_timer_cb(void *arg)
 
 esp_err_t can_master_request_scan(bool *started)
 {
+#if !defined(CONFIG_APP_CAN_ENABLED)
+    if (started) {
+        *started = false;
+    }
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
     SemaphoreHandle_t mtx = ensure_scan_mutex();
     if (!mtx) {
         if (started) *started = false;
@@ -229,13 +570,17 @@ esp_err_t can_master_request_scan(bool *started)
         web_server_ws_broadcast_event("scan_started", evt);
     }
 
+#if defined(CONFIG_APP_CAN_ENABLED)
+    can_master_trigger_discovery();
+#endif
+
     if (started) {
         *started = true;
     }
     return ESP_OK;
 }
 
-esp_err_t can_master_handle_node_info(uint8_t node_id, const roster_node_info_t *info)
+static esp_err_t can_master_handle_node_info(uint8_t node_id, const roster_node_info_t *info)
 {
     if (!info || node_id == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -252,7 +597,7 @@ esp_err_t can_master_handle_node_info(uint8_t node_id, const roster_node_info_t 
     return ESP_OK;
 }
 
-void can_master_handle_node_online(uint8_t node_id)
+static void can_master_handle_node_online(uint8_t node_id)
 {
     if (node_id == 0) {
         return;
@@ -284,7 +629,7 @@ void can_master_handle_node_online(uint8_t node_id)
     }
 }
 
-void can_master_handle_node_offline(uint8_t node_id)
+static void can_master_handle_node_offline(uint8_t node_id)
 {
     if (node_id == 0) {
         return;
@@ -312,16 +657,6 @@ static void nvs_init_safe(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     } else {
         ESP_ERROR_CHECK(err);
-    }
-}
-
-static void nvs_erase_namespace_once(const char* ns){
-    nvs_handle_t h;
-    if (nvs_open(ns, NVS_READWRITE, &h) == ESP_OK){
-        nvs_erase_all(h);
-        nvs_commit(h);
-        nvs_close(h);
-        ESP_LOGW("nvs","namespace '%s' wiped", ns);
     }
 }
 
@@ -392,6 +727,12 @@ static void system_main_task(void *arg)
     ensure_scan_mutex();
     roster_init(INPUT_ZONES_COUNT, MASTER_OUTPUTS_COUNT, 0);
 
+#if defined(CONFIG_APP_CAN_ENABLED)
+    ESP_ERROR_CHECK(can_master_driver_start());
+#else
+    ESP_LOGW(TAG, "CAN master disabled via Kconfig");
+#endif
+
     // reset_buttons_init();
     // ESP_LOGI(TAG, "Pulsanti HW reset su GPIO %d e %d", PIN_HW_RESET_BTN_A, PIN_HW_RESET_BTN_B);
     bool eth_ready_for_time = false;
@@ -436,7 +777,7 @@ static void system_main_task(void *arg)
 
     // Avvia web server (serve i file SPIFFS)
     //ESP_ERROR_CHECK(web_server_start());
-    ESP_ERROR_CHECK(web_server_start());
+    ESP_ERROR_CHECK(web_server_start_with_stack());
 
     // Riduci il rumore di handshake cancellati dal client (-0x0050) e altre riconnessioni
     esp_log_level_set("esp-tls-mbedtls", ESP_LOG_WARN);
@@ -457,10 +798,6 @@ static void system_main_task(void *arg)
     // Main loop: leggi ingressi e alimenta la logica d’allarme
     uint16_t last_mask = 0xFFFFu;
     bool first_cycle = true;
-    const TickType_t loop_delay = pdMS_TO_TICKS(100);
-    const TickType_t reset_hold_ticks = pdMS_TO_TICKS(10000);
-    TickType_t reset_press_start = 0;
-    bool reset_triggered = false;
 
     while (true) {
         uint16_t ab = 0;

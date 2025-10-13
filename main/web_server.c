@@ -2801,13 +2801,6 @@ static esp_err_t users_admin_list_get(httpd_req_t* req){
 // ─────────────────────────────────────────────────────────────────────────────
 // STATUS / ZONES / SCENES
 // ─────────────────────────────────────────────────────────────────────────────
-static nvs_handle_t s_nvs = 0;
-static esp_err_t open_nvs_if_needed(void){
-    if (s_nvs) return ESP_OK;
-    esp_err_t err = nvs_open("app", NVS_READWRITE, &s_nvs);
-    if (err != ESP_OK) ESP_LOGE(TAG, "nvs_open: %s", esp_err_to_name(err));
-    return err;
-}
 
 typedef struct {
     bool     zone_delay;   // ritardo unico abilitato
@@ -3163,12 +3156,22 @@ static void audit_format_message(const audit_entry_t* ent, char* out, size_t cap
         return;
     }
     const char* label = audit_event_label(ent ? ent->event : NULL);
-    const char* outcome = (ent && ent->result > 0) ? "riuscito" : "fallito";
     const bool has_user = ent && ent->username[0] != '\0';
     const bool has_note = ent && ent->note[0] != '\0';
+    const bool otp_pending = ent && strcmp(ent->note, "otp required") == 0;
+    const char* outcome = otp_pending ? "in attesa OTP" : (ent && ent->result > 0) ? "riuscito" : "fallito";
 
     if (!ent) {
         snprintf(out, cap, "%s", label);
+        return;
+    }
+
+    if (otp_pending) {
+        if (has_user) {
+            snprintf(out, cap, "%s %s per %s", label, outcome, ent->username);
+        } else {
+            snprintf(out, cap, "%s %s", label, outcome);
+        }
         return;
     }
 
@@ -3365,7 +3368,8 @@ static esp_err_t logs_get(httpd_req_t* req){
         cJSON_AddStringToObject(entry, "user", ent->username);
         cJSON_AddStringToObject(entry, "note", ent->note);
         cJSON_AddStringToObject(entry, "message", message);
-        cJSON_AddStringToObject(entry, "level", ent->result > 0 ? "INFO" : "WARN");
+        const bool otp_pending = ent && strcmp(ent->note, "otp required") == 0;
+        cJSON_AddStringToObject(entry, "level", (ent->result > 0 || otp_pending) ? "INFO" : "WARN");
         cJSON_AddItemToArray(entries, entry);
     }
 
@@ -4092,7 +4096,7 @@ static void web_server_restart_async(void){
 static esp_err_t arm_post(httpd_req_t* req)
 {
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    char tok[128]={0}, user[32]={0};
+    char user[32]={0};
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
@@ -4262,7 +4266,7 @@ static esp_err_t tamper_reset_post(httpd_req_t* req)
 static esp_err_t disarm_post(httpd_req_t* req)
 {
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    char tok[128]={0}, user[32]={0};
+    char user[32]={0};
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
@@ -4288,7 +4292,7 @@ static esp_err_t disarm_post(httpd_req_t* req)
 static esp_err_t user_post_pin(httpd_req_t* req)
 {
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    char tok[128]={0}, user[32]={0};
+    char user[32]={0};
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;

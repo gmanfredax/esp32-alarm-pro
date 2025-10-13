@@ -2,7 +2,6 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
-#include "esp_log.h"
 #include "esp_http_server.h"
 #include <string.h>
 #include <stdio.h>
@@ -10,7 +9,6 @@
 #include <sys/time.h>
 #include <stdbool.h>
 
-static const char* TAG="audit";
 static nvs_handle_t s_nvs = 0;
 static uint16_t s_cap = 128;   // capacity
 static uint16_t s_head = 0;    // next write index
@@ -36,7 +34,6 @@ static esp_err_t save_meta(void){
 
 static esp_err_t load_meta(void){
     esp_err_t e;
-    size_t cap=0,head=0,cnt=0;
     e = nvs_get_u16(s_nvs,"cap",&s_cap); if(e!=ESP_OK) s_cap=128;
     e = nvs_get_u16(s_nvs,"head",&s_head); if(e!=ESP_OK) s_head=0;
     e = nvs_get_u16(s_nvs,"cnt",&s_count); if(e!=ESP_OK) s_count=0;

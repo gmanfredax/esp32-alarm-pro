@@ -1,3 +1,4 @@
+#include "sdkconfig.h"
 #include "pdo.h"
 
 #include <string.h>
@@ -16,6 +17,28 @@
 
 #define PDO_LED_CMD_BLINK_ONESHOT  0x01u
 #define PDO_LED_CMD_IDENTIFY_TOGGLE 0x02u
+
+#if !defined(CONFIG_APP_CAN_ENABLED)
+
+esp_err_t pdo_send_led_oneshot(uint8_t node_id, uint8_t pattern_arg, uint16_t duration_ms)
+{
+    (void)node_id;
+    (void)pattern_arg;
+    (void)duration_ms;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t pdo_send_led_identify_toggle(uint8_t node_id, bool enable, bool *out_changed)
+{
+    (void)node_id;
+    (void)enable;
+    if (out_changed) {
+        *out_changed = false;
+    }
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+#else
 
 static const char *TAG = "pdo";
 
@@ -87,3 +110,5 @@ esp_err_t pdo_send_led_identify_toggle(uint8_t node_id, bool enable, bool *out_c
     }
     return err;
 }
+
+#endif

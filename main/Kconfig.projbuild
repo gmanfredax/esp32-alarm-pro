@@ -76,3 +76,70 @@ config APP_CLOUD_TOKEN_ENDPOINT
         configuration served from the device.
 
 endmenu
+
+menu "ESP32 Alarm CAN bus"
+
+config APP_CAN_ENABLED
+    bool "Enable CAN/TWAI master support"
+    default y
+    help
+        Enable the internal CAN (TWAI) master used to communicate with expansion
+        boards. Disable this option when the hardware does not populate the CAN
+        transceiver or when the feature is not required.
+
+if APP_CAN_ENABLED
+
+config APP_CAN_TX_GPIO
+    int "TWAI TX GPIO"
+    default 5
+    range 0 39
+    help
+        GPIO used for the TWAI TX signal. The selected pin must not conflict with
+        RMII Ethernet signals or other peripherals already configured in the
+        firmware.
+
+config APP_CAN_RX_GPIO
+    int "TWAI RX GPIO"
+    default 4
+    range 0 39
+    help
+        GPIO used for the TWAI RX signal. The selected pin must support input
+        mode and must not overlap with RMII Ethernet signals.
+
+choice APP_CAN_BITRATE
+    prompt "TWAI bitrate"
+    default APP_CAN_BITRATE_250K
+    help
+        Select the bitrate used on the CAN/TWAI bus. Make sure that every node
+        connected to the bus is configured with the same bitrate.
+
+config APP_CAN_BITRATE_125K
+    bool "125 kbit/s"
+
+config APP_CAN_BITRATE_250K
+    bool "250 kbit/s"
+
+config APP_CAN_BITRATE_500K
+    bool "500 kbit/s"
+
+endchoice
+
+config APP_CAN_NODE_TIMEOUT_MS
+    int "Node offline timeout (ms)"
+    default 5000
+    range 1000 60000
+    help
+        Time window without heartbeats or PDO frames after which a node is
+        considered offline.
+
+config APP_CAN_RX_TASK_STACK
+    int "CAN RX task stack size (bytes)"
+    default 4096
+    range 2048 8192
+    help
+        Stack size used by the FreeRTOS task responsible for receiving TWAI
+        frames.
+
+endif # APP_CAN_ENABLED
+
+endmenu
