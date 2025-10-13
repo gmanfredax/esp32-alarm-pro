@@ -81,6 +81,9 @@ static const char *TAG_CAN = "can";
 static esp_err_t can_master_handle_node_info(uint8_t node_id, const roster_node_info_t *info);
 static void can_master_handle_node_online(uint8_t node_id);
 static void can_master_handle_node_offline(uint8_t node_id);
+static esp_err_t can_master_driver_start(void);
+static void can_master_driver_stop(void);
+static void can_master_process_restart(void);
 #endif
 
 #define SYSTEM_MAIN_TASK_STACK_BYTES      (16384)
@@ -116,9 +119,13 @@ typedef struct {
 } can_node_state_t;
 
 static bool s_can_driver_started = false;
+static bool s_can_driver_starting = false;
+static bool s_can_driver_restart_pending = false;
+static bool s_can_driver_stop_pending = false;
 static TaskHandle_t s_can_rx_task = NULL;
 static SemaphoreHandle_t s_can_state_lock = NULL;
 static can_node_state_t s_can_nodes[CAN_MAX_NODE_ID + 1];
+static char s_can_driver_stop_reason[64];
 
 static inline uint64_t can_now_ms(void)
 {
@@ -131,6 +138,59 @@ static SemaphoreHandle_t can_state_lock_get(void)
         s_can_state_lock = xSemaphoreCreateMutex();
     }
     return s_can_state_lock;
+}
+
+static void can_master_request_driver_restart(const char *reason)
+{
+    if (!s_can_driver_restart_pending) {
+        s_can_driver_restart_pending = true;
+    }
+
+    if (reason && reason[0] != '\0') {
+        snprintf(s_can_driver_stop_reason, sizeof(s_can_driver_stop_reason), "%s", reason);
+    } else {
+        s_can_driver_stop_reason[0] = '\0';
+    }
+
+    if (!s_can_driver_stop_pending) {
+        s_can_driver_stop_pending = true;
+        if (s_can_driver_started) {
+            const char *log_reason = s_can_driver_stop_reason[0] ? s_can_driver_stop_reason : "fault";
+            ESP_LOGW(TAG_CAN, "Scheduling CAN driver stop (%s)", log_reason);
+        }
+    }
+
+    if (s_can_rx_task) {
+        xTaskNotifyGive(s_can_rx_task);
+    }
+}
+
+static void can_master_driver_stop(void)
+{
+    if (!s_can_driver_started) {
+        if (!s_can_driver_starting) {
+            s_can_driver_stop_pending = false;
+            s_can_driver_stop_reason[0] = '\0';
+        }
+        return;
+    }
+
+    const char *reason = s_can_driver_stop_reason[0] ? s_can_driver_stop_reason : "fault";
+    ESP_LOGW(TAG_CAN, "Stopping CAN driver (%s)", reason);
+
+    esp_err_t err = twai_stop();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG_CAN, "twai_stop failed: %s", esp_err_to_name(err));
+    }
+
+    err = twai_driver_uninstall();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG_CAN, "twai_driver_uninstall failed: %s", esp_err_to_name(err));
+    }
+
+    s_can_driver_started = false;
+    s_can_driver_stop_pending = false;
+    s_can_driver_stop_reason[0] = '\0';
 }
 
 static inline twai_timing_config_t can_timing_config(void)
@@ -292,24 +352,57 @@ static void can_rx_task(void *arg)
     (void)arg;
     ESP_LOGI(TAG_CAN, "RX task started");
     while (true) {
+        if (s_can_driver_stop_pending) {
+            if (s_can_driver_started) {
+                can_master_driver_stop();
+            } else if (!s_can_driver_starting) {
+                s_can_driver_stop_pending = false;
+                s_can_driver_stop_reason[0] = '\0';
+            }
+            can_state_check_timeouts();
+            can_master_process_restart();
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if (!s_can_driver_started) {
+            can_master_process_restart();
+            vTaskDelay(pdMS_TO_TICKS(50));
+            can_state_check_timeouts();
+            continue;
+        }
         twai_message_t msg = {0};
         esp_err_t err = twai_receive(&msg, pdMS_TO_TICKS(200));
         if (err == ESP_OK) {
             can_process_frame(&msg);
         } else if (err != ESP_ERR_TIMEOUT) {
-            ESP_LOGW(TAG_CAN, "twai_receive failed: %s", esp_err_to_name(err));
+            if (!(err == ESP_ERR_INVALID_STATE && !s_can_driver_started)) {
+                ESP_LOGW(TAG_CAN, "twai_receive failed: %s", esp_err_to_name(err));
+            }
             if (err == ESP_ERR_INVALID_STATE) {
-                vTaskDelay(pdMS_TO_TICKS(200));
+                can_master_request_driver_restart("rx invalid state");
+                vTaskDelay(pdMS_TO_TICKS(50));
             }
         }
         can_state_check_timeouts();
+        can_master_process_restart();
     }
 }
 
 static esp_err_t can_master_send_frame(uint32_t cob_id, const uint8_t *data, uint8_t len)
 {
-    if (!s_can_driver_started) {
+    if (s_can_driver_stop_pending) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_can_driver_started) {
+        if (!s_can_driver_starting && !s_can_driver_restart_pending) {
+            esp_err_t serr = can_master_driver_start();
+            if (serr != ESP_OK) {
+                return serr;
+            }
+        } else {
+            return ESP_ERR_INVALID_STATE;
+        }
     }
     twai_message_t msg = {0};
     msg.identifier = cob_id & 0x7FFu;
@@ -325,7 +418,11 @@ static esp_err_t can_master_send_frame(uint32_t cob_id, const uint8_t *data, uin
     } else {
         memset(msg.data, 0, sizeof(msg.data));
     }
-    return twai_transmit(&msg, pdMS_TO_TICKS(50));
+    esp_err_t err = twai_transmit(&msg, pdMS_TO_TICKS(50));
+    if (err == ESP_ERR_INVALID_STATE) {
+        can_master_request_driver_restart("tx invalid state");
+    }
+    return err;
 }
 
 static esp_err_t can_master_send_nmt(uint8_t command, uint8_t target)
@@ -347,11 +444,32 @@ static void can_master_trigger_discovery(void)
     (void)can_master_send_nmt(0x01u, 0x00u); // Start all nodes
 }
 
+static void can_master_process_restart(void)
+{
+    if (!s_can_driver_restart_pending || s_can_driver_starting || s_can_driver_stop_pending) {
+        return;
+    }
+    esp_err_t err = can_master_driver_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG_CAN, "CAN driver restart failed: %s", esp_err_to_name(err));
+        s_can_driver_restart_pending = true;
+        vTaskDelay(pdMS_TO_TICKS(250));
+        return;
+    }
+    s_can_driver_restart_pending = false;
+    can_master_trigger_discovery();
+}
+
 static esp_err_t can_master_driver_start(void)
 {
     if (s_can_driver_started) {
         return ESP_OK;
     }
+    if (s_can_driver_starting) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_can_driver_starting = true;
+
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
     g_config.clkout_divider = 0;
     g_config.rx_queue_len = 32;
@@ -367,6 +485,7 @@ static esp_err_t can_master_driver_start(void)
     esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
     if (err != ESP_OK) {
         ESP_LOGE(TAG_CAN, "twai_driver_install failed: %s", esp_err_to_name(err));
+        s_can_driver_starting = false;
         return err;
     }
 
@@ -374,6 +493,7 @@ static esp_err_t can_master_driver_start(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG_CAN, "twai_start failed: %s", esp_err_to_name(err));
         twai_driver_uninstall();
+        s_can_driver_starting = false;
         return err;
     }
 
@@ -389,22 +509,28 @@ static esp_err_t can_master_driver_start(void)
 
     memset(s_can_nodes, 0, sizeof(s_can_nodes));
 
-    const BaseType_t task_ok = xTaskCreatePinnedToCore(
-        can_rx_task,
-        "can_rx",
-        CAN_RX_TASK_STACK_BYTES / sizeof(StackType_t),
-        NULL,
-        CAN_RX_TASK_PRIORITY,
-        &s_can_rx_task,
-        tskNO_AFFINITY);
-    if (task_ok != pdPASS) {
-        ESP_LOGE(TAG_CAN, "unable to create CAN RX task (%ld)", (long)task_ok);
-        twai_stop();
-        twai_driver_uninstall();
-        return ESP_ERR_NO_MEM;
+    if (!s_can_rx_task) {
+        const BaseType_t task_ok = xTaskCreatePinnedToCore(
+            can_rx_task,
+            "can_rx",
+            CAN_RX_TASK_STACK_BYTES / sizeof(StackType_t),
+            NULL,
+            CAN_RX_TASK_PRIORITY,
+            &s_can_rx_task,
+            tskNO_AFFINITY);
+        if (task_ok != pdPASS) {
+            ESP_LOGE(TAG_CAN, "unable to create CAN RX task (%ld)", (long)task_ok);
+            twai_stop();
+            twai_driver_uninstall();
+            s_can_driver_starting = false;
+            return ESP_ERR_NO_MEM;
+        }
     }
 
     s_can_driver_started = true;
+    s_can_driver_starting = false;
+    s_can_driver_restart_pending = false;
+
     ESP_LOGI(TAG_CAN, "driver started (bitrate %s)",
 #if defined(CONFIG_APP_CAN_BITRATE_125K)
              "125k"
