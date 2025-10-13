@@ -84,6 +84,7 @@ static void can_master_handle_node_offline(uint8_t node_id);
 static esp_err_t can_master_driver_start(void);
 static void can_master_driver_stop(void);
 static void can_master_process_restart(void);
+static void can_master_trigger_discovery(void);
 #endif
 
 #define SYSTEM_MAIN_TASK_STACK_BYTES      (16384)
@@ -122,6 +123,7 @@ static bool s_can_driver_started = false;
 static bool s_can_driver_starting = false;
 static bool s_can_driver_restart_pending = false;
 static bool s_can_driver_stop_pending = false;
+static bool s_can_discovery_pending = false;
 static TaskHandle_t s_can_rx_task = NULL;
 static SemaphoreHandle_t s_can_state_lock = NULL;
 static can_node_state_t s_can_nodes[CAN_MAX_NODE_ID + 1];
@@ -386,6 +388,9 @@ static void can_rx_task(void *arg)
         }
         can_state_check_timeouts();
         can_master_process_restart();
+        if (s_can_discovery_pending) {
+            can_master_trigger_discovery();
+        }
     }
 }
 
@@ -435,13 +440,37 @@ static esp_err_t can_master_send_nmt(uint8_t command, uint8_t target)
     return err;
 }
 
-static void can_master_trigger_discovery(void)
+static inline bool can_driver_ready_for_discovery(void)
 {
-    if (!s_can_driver_started) {
-        return;
+    if (!(s_can_driver_started && !s_can_driver_starting &&
+          !s_can_driver_stop_pending && !s_can_driver_restart_pending)) {
+        return false;
     }
+
+    twai_status_info_t status = {0};
+    esp_err_t err = twai_get_status_info(&status);
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    return status.state == TWAI_STATE_RUNNING;
+}
+
+static void can_master_send_discovery_commands(void)
+{
     (void)can_master_send_nmt(0x82u, 0x00u); // Reset communication
     (void)can_master_send_nmt(0x01u, 0x00u); // Start all nodes
+}
+
+static void can_master_trigger_discovery(void)
+{
+    if (!can_driver_ready_for_discovery()) {
+        s_can_discovery_pending = true;
+        return;
+    }
+
+    s_can_discovery_pending = false;
+    can_master_send_discovery_commands();
 }
 
 static void can_master_process_restart(void)
