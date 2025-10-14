@@ -40,6 +40,7 @@
 #include "pins.h"
 #include "i2c_bus.h"
 #include "scenes.h"
+#include "can_proto.h"
 
 #include "lwip/apps/sntp.h"
 #include "esp_idf_version.h"
@@ -51,6 +52,10 @@
 #include "pdo.h"
 #include "web_server.h"
 #include "cJSON.h"
+
+#ifndef TWAI_FRAME_MAX_DLC
+#define TWAI_FRAME_MAX_DLC 8
+#endif
 
 static void sntp_start_and_wait(void){
     // API compatibile con IDF “classico” (LWIP SNTP)
@@ -415,11 +420,12 @@ static void can_rx_task(void *arg)
     }
 }
 
-static esp_err_t can_master_send_frame(uint32_t cob_id, const uint8_t *data, uint8_t len)
+static esp_err_t can_master_send_frame_common(uint32_t cob_id, const uint8_t *data, uint8_t len, bool rtr)
 {
     if (s_can_driver_stop_pending) {
         return ESP_ERR_INVALID_STATE;
     }
+
     if (!s_can_driver_started) {
         if (!s_can_driver_starting && !s_can_driver_restart_pending) {
             esp_err_t serr = can_master_driver_start();
@@ -430,25 +436,46 @@ static esp_err_t can_master_send_frame(uint32_t cob_id, const uint8_t *data, uin
             return ESP_ERR_INVALID_STATE;
         }
     }
+
     twai_message_t msg = {0};
     msg.identifier = cob_id & 0x7FFu;
     msg.extd = 0;
-    msg.rtr = 0;
+    msg.rtr = rtr ? 1 : 0;
     msg.data_length_code = len;
-    if (data && len > 0) {
+
+    if (!rtr) {
         if (len > sizeof(msg.data)) {
             len = sizeof(msg.data);
             msg.data_length_code = sizeof(msg.data);
         }
-        memcpy(msg.data, data, len);
-    } else {
-        memset(msg.data, 0, sizeof(msg.data));
+        if (data && len > 0) {
+            memcpy(msg.data, data, len);
+            if (len < sizeof(msg.data)) {
+                memset(msg.data + len, 0, sizeof(msg.data) - len);
+            }
+        } else {
+            memset(msg.data, 0, sizeof(msg.data));
+        }
     }
+
     esp_err_t err = twai_transmit(&msg, pdMS_TO_TICKS(50));
     if (err == ESP_ERR_INVALID_STATE) {
         (void)can_master_request_driver_restart("tx invalid state");
     }
     return err;
+}
+
+static esp_err_t can_master_send_frame(uint32_t cob_id, const uint8_t *data, uint8_t len)
+{
+    return can_master_send_frame_common(cob_id, data, len, false);
+}
+
+static esp_err_t can_master_send_remote_frame(uint32_t cob_id, uint8_t len)
+{
+    if (len > TWAI_FRAME_MAX_DLC) {
+        len = TWAI_FRAME_MAX_DLC;
+    }
+    return can_master_send_frame_common(cob_id, NULL, len, true);
 }
 
 static esp_err_t can_master_send_nmt(uint8_t command, uint8_t target)
@@ -518,7 +545,16 @@ static inline bool can_driver_ready_for_discovery(void)
 static void can_master_send_discovery_commands(void)
 {
     (void)can_master_send_nmt(0x82u, 0x00u); // Reset communication
+    vTaskDelay(pdMS_TO_TICKS(50));
     (void)can_master_send_nmt(0x01u, 0x00u); // Start all nodes
+
+    for (uint32_t node_id = 1; node_id <= CAN_MAX_NODE_ID; ++node_id) {
+        uint32_t cob_id = COBID_HEARTBEAT(node_id);
+        (void)can_master_send_remote_frame(cob_id, 1);
+        if ((node_id % 8u) == 0u) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
 }
 
 static void can_master_trigger_discovery(void)
