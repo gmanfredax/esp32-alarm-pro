@@ -181,6 +181,13 @@
                   <button class="btn" id="adminExpansionScanBtn" type="button">+ Scansiona nuove schede</button>
                 </div>
               </div>
+              <div style="margin-top:.75rem;">
+                <div class="row" style="gap:.6rem;flex-wrap:wrap;align-items:center;">
+                  <span style="font-weight:600;">Test CAN bus</span>
+                  <button class="btn" id="canTestToggleBtn" type="button">Invia ON</button>
+                  <span id="canTestToggleStatus" class="muted">Premi per inviare &quot;on&quot; sul bus CAN.</span>
+                </div>
+              </div>
               <p id="adminExpansionStatus" class="status-line muted hidden" role="status"></p>
               <ul id="adminExpansionList" class="expansion-list"></ul>
               <p id="adminExpansionEmpty" class="expansion-empty hidden">Nessuna scheda rilevata.</p>

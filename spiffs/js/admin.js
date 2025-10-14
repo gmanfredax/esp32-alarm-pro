@@ -130,6 +130,12 @@
     lastScan: null,
   };
 
+  const canTestToggleState = {
+    active: false,
+    sending: false,
+    hasSent: false,
+  };
+
   function formatDateTime(ts){
     if (ts == null) return "";
     let date;
@@ -311,6 +317,47 @@
     if (refreshBtn) refreshBtn.disabled = disableActions;
   }
 
+    function updateCanTestToggleUI(){
+    const btn = $("#canTestToggleBtn");
+    if (btn){
+      btn.disabled = canTestToggleState.sending;
+      const label = canTestToggleState.active ? "Invia OFF" : "Invia ON";
+      btn.textContent = canTestToggleState.sending ? "Invio…" : label;
+      btn.classList.toggle("outline", canTestToggleState.active && !canTestToggleState.sending);
+      btn.setAttribute("aria-pressed", canTestToggleState.active ? "true" : "false");
+    }
+    const status = $("#canTestToggleStatus");
+    if (status){
+      if (canTestToggleState.sending){
+        status.textContent = "Invio comando CAN…";
+      } else if (canTestToggleState.hasSent){
+        status.textContent = `Ultimo comando inviato: ${canTestToggleState.active ? "on" : "off"}.`;
+      } else {
+        status.textContent = "Premi per inviare \"on\" o \"off\" sul bus CAN.";
+      }
+    }
+  }
+
+  async function sendCanTestToggle(nextState){
+    if (canTestToggleState.sending){
+      return;
+    }
+    canTestToggleState.sending = true;
+    updateCanTestToggleUI();
+    try {
+      await apiPost("/api/can/test-toggle", { state: nextState ? "on" : "off" });
+      canTestToggleState.active = nextState;
+      canTestToggleState.hasSent = true;
+      toast(`CAN: comando ${nextState ? "ON" : "OFF"} inviato`);
+    } catch (err){
+      const message = err?.message || "Invio comando CAN fallito";
+      toast(`CAN: ${message}`, false);
+    } finally {
+      canTestToggleState.sending = false;
+      updateCanTestToggleUI();
+    }
+  }
+
   async function loadExpansionNodes(){
     expansionsState.loading = true;
     expansionsState.error = "";
@@ -424,6 +471,14 @@
         openExpansionActions(nodeId);
       });
     }
+    const toggleBtn = $("#canTestToggleBtn");
+    if (toggleBtn){
+      toggleBtn.addEventListener("click", () => {
+        const nextState = !canTestToggleState.active;
+        sendCanTestToggle(nextState);
+      });
+    }
+    updateCanTestToggleUI();
     renderExpansionsSection();
     await loadExpansionNodes();
   }

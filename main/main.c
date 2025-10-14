@@ -85,6 +85,7 @@ static esp_err_t can_master_driver_start(void);
 static void can_master_driver_stop(void);
 static void can_master_process_restart(void);
 static void can_master_trigger_discovery(void);
+static esp_err_t can_master_wait_until_running(TickType_t timeout_ticks);
 #endif
 
 #define SYSTEM_MAIN_TASK_STACK_BYTES      (16384)
@@ -440,6 +441,37 @@ static esp_err_t can_master_send_nmt(uint8_t command, uint8_t target)
     return err;
 }
 
+esp_err_t can_master_send_test_toggle(bool enable)
+{
+#if !defined(CONFIG_APP_CAN_ENABLED)
+    (void)enable;
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    static const uint32_t k_test_toggle_cob_id = 0x123u;
+    static const uint8_t payload_on[] = { 'o', 'n' };
+    static const uint8_t payload_off[] = { 'o', 'f', 'f' };
+
+    const uint8_t *payload = enable ? payload_on : payload_off;
+    const uint8_t payload_len = enable ? sizeof(payload_on) : sizeof(payload_off);
+
+    esp_err_t err = can_master_send_frame(k_test_toggle_cob_id, payload, payload_len);
+    if (err == ESP_ERR_INVALID_STATE) {
+        esp_err_t wait_err = can_master_wait_until_running(pdMS_TO_TICKS(500));
+        if (wait_err == ESP_OK) {
+            err = can_master_send_frame(k_test_toggle_cob_id, payload, payload_len);
+        } else {
+            err = wait_err;
+        }
+    }
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG_CAN, "Test toggle command sent: %s", enable ? "on" : "off");
+    } else {
+        ESP_LOGW(TAG_CAN, "Test toggle (%s) failed: %s", enable ? "on" : "off", esp_err_to_name(err));
+    }
+    return err;
+#endif
+}
+
 static inline bool can_driver_ready_for_discovery(void)
 {
     if (!(s_can_driver_started && !s_can_driver_starting &&
@@ -571,6 +603,26 @@ static esp_err_t can_master_driver_start(void)
     );
     can_master_trigger_discovery();
     return ESP_OK;
+}
+
+static esp_err_t can_master_wait_until_running(TickType_t timeout_ticks)
+{
+    const TickType_t start = xTaskGetTickCount();
+    while ((xTaskGetTickCount() - start) < timeout_ticks) {
+        if (!s_can_driver_stop_pending && s_can_driver_started && !s_can_driver_starting) {
+            twai_status_info_t status = {0};
+            if (twai_get_status_info(&status) == ESP_OK && status.state == TWAI_STATE_RUNNING) {
+                return ESP_OK;
+            }
+        } else if (!s_can_driver_started && !s_can_driver_starting && !s_can_driver_stop_pending) {
+            esp_err_t serr = can_master_driver_start();
+            if (serr != ESP_OK && serr != ESP_ERR_INVALID_STATE) {
+                return serr;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+    return ESP_ERR_TIMEOUT;
 }
 
 #endif // CONFIG_APP_CAN_ENABLED

@@ -86,6 +86,7 @@ extern const uint8_t certs_broker_ca_pem_start[] asm("_binary_broker_ca_pem_star
 extern const uint8_t certs_broker_ca_pem_end[]   asm("_binary_broker_ca_pem_end");
 
 extern esp_err_t can_master_request_scan(bool *started);
+extern esp_err_t can_master_send_test_toggle(bool enable);
 
 static void web_server_restart_async(void);
 
@@ -632,6 +633,79 @@ static esp_err_t api_can_scan_post(httpd_req_t *req)
 }
 
 static esp_err_t api_can_scan_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+
+static esp_err_t api_can_test_toggle_post(httpd_req_t *req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+    cors_apply(req);
+
+    char body[64];
+    size_t body_len = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &body_len) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body");
+        return ESP_FAIL;
+    }
+
+    cJSON *json = cJSON_ParseWithLength(body, body_len);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json");
+        return ESP_FAIL;
+    }
+
+    cJSON *jstate = cJSON_GetObjectItemCaseSensitive(json, "state");
+    bool enable = false;
+    bool has_state = false;
+    if (cJSON_IsBool(jstate)) {
+        enable = cJSON_IsTrue(jstate);
+        has_state = true;
+    } else if (cJSON_IsString(jstate) && jstate->valuestring) {
+        const char *value = jstate->valuestring;
+        if (strcasecmp(value, "on") == 0 ||
+            strcasecmp(value, "1") == 0 ||
+            strcasecmp(value, "true") == 0) {
+            enable = true;
+            has_state = true;
+        } else if (strcasecmp(value, "off") == 0 ||
+                   strcasecmp(value, "0") == 0 ||
+                   strcasecmp(value, "false") == 0) {
+            enable = false;
+            has_state = true;
+        }
+    }
+
+    cJSON_Delete(json);
+
+    if (!has_state) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "state");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = can_master_send_test_toggle(enable);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        return httpd_resp_send_err(req, 503, "can"), ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "can");
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+        return ESP_FAIL;
+    }
+    cJSON_AddStringToObject(resp, "state", enable ? "on" : "off");
+    cJSON_AddBoolToObject(resp, "on", enable);
+    return json_reply_cjson(req, resp);
+}
+
+static esp_err_t api_can_test_toggle_options(httpd_req_t *req)
 {
     return cors_handle_options(req);
 }
@@ -3930,6 +4004,8 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/can/nodes/*",         .method = HTTP_OPTIONS, .handler = api_can_node_delete_options },
     { .uri = "/api/can/scan",            .method = HTTP_POST,    .handler = api_can_scan_post },
     { .uri = "/api/can/scan",            .method = HTTP_OPTIONS, .handler = api_can_scan_options },
+    { .uri = "/api/can/test-toggle",     .method = HTTP_POST,    .handler = api_can_test_toggle_post },
+    { .uri = "/api/can/test-toggle",     .method = HTTP_OPTIONS, .handler = api_can_test_toggle_options },
     { .uri = "/api/can/node/*/identify", .method = HTTP_POST,    .handler = api_can_node_identify_post },
     { .uri = "/api/can/node/*/identify", .method = HTTP_OPTIONS, .handler = api_can_node_identify_options },
     { .uri = "/api/status",             .method = HTTP_GET,  .handler = status_get },
