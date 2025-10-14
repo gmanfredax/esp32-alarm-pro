@@ -443,30 +443,37 @@ static esp_err_t can_master_send_nmt(uint8_t command, uint8_t target)
 
 esp_err_t can_master_send_test_toggle(bool enable)
 {
-#if !defined(CONFIG_APP_CAN_ENABLED)
+#if !defined(CONFIG_APP_CAN_ENABLED) || !defined(CAN_TEST_BROADCAST)
     (void)enable;
     return ESP_ERR_NOT_SUPPORTED;
 #else
-    static const uint32_t k_test_toggle_cob_id = 0x123u;
-    static const uint8_t payload_on[] = { 'o', 'n' };
-    static const uint8_t payload_off[] = { 'o', 'f', 'f' };
+    static const uint32_t k_test_broadcast_cob_id = 0x100u;
 
-    const uint8_t *payload = enable ? payload_on : payload_off;
-    const uint8_t payload_len = enable ? sizeof(payload_on) : sizeof(payload_off);
+    esp_err_t wait_err = can_master_wait_until_running(pdMS_TO_TICKS(250));
+    if (wait_err != ESP_OK) {
+        if (wait_err == ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG_CAN, "CAN test broadcast aborted: driver not ready");
+        } else {
+            ESP_LOGW(TAG_CAN, "CAN test broadcast wait failed: %s", esp_err_to_name(wait_err));
+        }
+        return wait_err;
+    }
 
-    esp_err_t err = can_master_send_frame(k_test_toggle_cob_id, payload, payload_len);
+    uint8_t payload = enable ? 0x01u : 0x00u;
+    esp_err_t err = can_master_send_frame(k_test_broadcast_cob_id, &payload, sizeof(payload));
+
     if (err == ESP_ERR_INVALID_STATE) {
-        esp_err_t wait_err = can_master_wait_until_running(pdMS_TO_TICKS(500));
+        wait_err = can_master_wait_until_running(pdMS_TO_TICKS(500));
         if (wait_err == ESP_OK) {
-            err = can_master_send_frame(k_test_toggle_cob_id, payload, payload_len);
+            err = can_master_send_frame(k_test_broadcast_cob_id, &payload, sizeof(payload));
         } else {
             err = wait_err;
         }
     }
     if (err == ESP_OK) {
-        ESP_LOGI(TAG_CAN, "Test toggle command sent: %s", enable ? "on" : "off");
+        ESP_LOGI(TAG_CAN, "CAN test broadcast sent: %s", enable ? "on" : "off");
     } else {
-        ESP_LOGW(TAG_CAN, "Test toggle (%s) failed: %s", enable ? "on" : "off", esp_err_to_name(err));
+        ESP_LOGW(TAG_CAN, "CAN test broadcast (%s) failed: %s", enable ? "on" : "off", esp_err_to_name(err));
     }
     return err;
 #endif

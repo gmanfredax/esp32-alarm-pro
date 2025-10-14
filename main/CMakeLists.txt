@@ -53,6 +53,8 @@ idf_component_register(
 #        "certs/broker_ca.pem"
 )
 
+target_compile_definitions(${COMPONENT_LIB} PRIVATE CAN_TEST_BROADCAST=1)
+
 # Genera l’immagine SPIFFS dalla cartella spiffs/
 spiffs_create_partition_image(spiffs ${CMAKE_SOURCE_DIR}/spiffs FLASH_IN_PROJECT)
 add_custom_target(spiffs DEPENDS spiffs_spiffs_bin)

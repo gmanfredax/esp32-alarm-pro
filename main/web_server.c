@@ -352,6 +352,19 @@ static esp_err_t json_reply_cjson(httpd_req_t* req, cJSON* json){
     return err;
 }
 
+static esp_err_t json_error_reply(httpd_req_t *req, const char *status, const char *error_code)
+{
+    if (status) {
+        httpd_resp_set_status(req, status);
+    }
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    }
+    cJSON_AddStringToObject(resp, "error", error_code ? error_code : "error");
+    return json_reply_cjson(req, resp);
+}
+
 // ----- START CANBUS -----------------------------------
 static SemaphoreHandle_t ws_lock_get(void)
 {
@@ -637,10 +650,45 @@ static esp_err_t api_can_scan_options(httpd_req_t *req)
     return cors_handle_options(req);
 }
 
-static esp_err_t api_can_test_toggle_post(httpd_req_t *req)
+static bool can_test_require_admin(httpd_req_t *req)
 {
     if (!check_bearer(req) || !is_admin_user(req)) {
         httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return false;
+    }
+    return true;
+}
+
+static esp_err_t can_test_broadcast_send(httpd_req_t *req, bool enable)
+{
+#if !defined(CAN_TEST_BROADCAST)
+    return json_error_reply(req, "503 Service Unavailable", "can_not_supported");
+#else
+    esp_err_t err = can_master_send_test_toggle(enable);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        return json_error_reply(req, "503 Service Unavailable", "can_not_supported");
+    }
+    if (err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_STATE) {
+        return json_error_reply(req, "503 Service Unavailable", "can_not_ready");
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "can");
+        return ESP_FAIL;
+    }
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+        return ESP_FAIL;
+    }
+    cJSON_AddStringToObject(resp, "state", enable ? "on" : "off");
+    cJSON_AddBoolToObject(resp, "on", enable);
+    return json_reply_cjson(req, resp);
+#endif
+}
+
+static esp_err_t api_can_test_toggle_post(httpd_req_t *req)
+{
+    if (!can_test_require_admin(req)) {
         return ESP_FAIL;
     }
     cors_apply(req);
@@ -686,26 +734,33 @@ static esp_err_t api_can_test_toggle_post(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    esp_err_t err = can_master_send_test_toggle(enable);
-    if (err == ESP_ERR_NOT_SUPPORTED) {
-        return httpd_resp_send_err(req, 503, "can"), ESP_FAIL;
-    }
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "can");
-        return ESP_FAIL;
-    }
-
-    cJSON *resp = cJSON_CreateObject();
-    if (!resp) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
-        return ESP_FAIL;
-    }
-    cJSON_AddStringToObject(resp, "state", enable ? "on" : "off");
-    cJSON_AddBoolToObject(resp, "on", enable);
-    return json_reply_cjson(req, resp);
+    return can_test_broadcast_send(req, enable);
 }
 
 static esp_err_t api_can_test_toggle_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+
+static esp_err_t api_can_test_broadcast_on_post(httpd_req_t *req)
+{
+    if (!can_test_require_admin(req)) {
+        return ESP_FAIL;
+    }
+    cors_apply(req);
+    return can_test_broadcast_send(req, true);
+}
+
+static esp_err_t api_can_test_broadcast_off_post(httpd_req_t *req)
+{
+    if (!can_test_require_admin(req)) {
+        return ESP_FAIL;
+    }
+    cors_apply(req);
+    return can_test_broadcast_send(req, false);
+}
+
+static esp_err_t api_can_test_broadcast_options(httpd_req_t *req)
 {
     return cors_handle_options(req);
 }
@@ -4004,8 +4059,12 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/can/nodes/*",         .method = HTTP_OPTIONS, .handler = api_can_node_delete_options },
     { .uri = "/api/can/scan",            .method = HTTP_POST,    .handler = api_can_scan_post },
     { .uri = "/api/can/scan",            .method = HTTP_OPTIONS, .handler = api_can_scan_options },
-    { .uri = "/api/can/test-toggle",     .method = HTTP_POST,    .handler = api_can_test_toggle_post },
-    { .uri = "/api/can/test-toggle",     .method = HTTP_OPTIONS, .handler = api_can_test_toggle_options },
+    { .uri = "/api/can/test-toggle",           .method = HTTP_POST,    .handler = api_can_test_toggle_post },
+    { .uri = "/api/can/test-toggle",           .method = HTTP_OPTIONS, .handler = api_can_test_toggle_options },
+    { .uri = "/api/can/test/broadcast/on",     .method = HTTP_POST,    .handler = api_can_test_broadcast_on_post },
+    { .uri = "/api/can/test/broadcast/on",     .method = HTTP_OPTIONS, .handler = api_can_test_broadcast_options },
+    { .uri = "/api/can/test/broadcast/off",    .method = HTTP_POST,    .handler = api_can_test_broadcast_off_post },
+    { .uri = "/api/can/test/broadcast/off",    .method = HTTP_OPTIONS, .handler = api_can_test_broadcast_options },
     { .uri = "/api/can/node/*/identify", .method = HTTP_POST,    .handler = api_can_node_identify_post },
     { .uri = "/api/can/node/*/identify", .method = HTTP_OPTIONS, .handler = api_can_node_identify_options },
     { .uri = "/api/status",             .method = HTTP_GET,  .handler = status_get },

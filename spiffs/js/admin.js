@@ -130,10 +130,12 @@
     lastScan: null,
   };
 
-  const canTestToggleState = {
-    active: false,
+  const canTestBroadcastState = {
     sending: false,
-    hasSent: false,
+    pendingState: null,
+    lastState: null,
+    lastError: "",
+    lastRequestAt: 0,
   };
 
   function formatDateTime(ts){
@@ -317,44 +319,72 @@
     if (refreshBtn) refreshBtn.disabled = disableActions;
   }
 
-    function updateCanTestToggleUI(){
-    const btn = $("#canTestToggleBtn");
-    if (btn){
-      btn.disabled = canTestToggleState.sending;
-      const label = canTestToggleState.active ? "Invia OFF" : "Invia ON";
-      btn.textContent = canTestToggleState.sending ? "Invio…" : label;
-      btn.classList.toggle("outline", canTestToggleState.active && !canTestToggleState.sending);
-      btn.setAttribute("aria-pressed", canTestToggleState.active ? "true" : "false");
+  function updateCanTestBroadcastUI(){
+    const onBtn = $("#canTestBroadcastOnBtn");
+    const offBtn = $("#canTestBroadcastOffBtn");
+    const { sending, pendingState, lastState } = canTestBroadcastState;
+    if (onBtn){
+      const busy = sending && pendingState === true;
+      onBtn.disabled = sending;
+      onBtn.textContent = busy ? "Invio…" : "BUS ON";
+      onBtn.classList.toggle("outline", lastState !== true);
+      onBtn.setAttribute("aria-pressed", lastState === true ? "true" : "false");
     }
-    const status = $("#canTestToggleStatus");
+    if (offBtn){
+      const busy = sending && pendingState === false;
+      offBtn.disabled = sending;
+      offBtn.textContent = busy ? "Invio…" : "BUS OFF";
+      offBtn.classList.toggle("outline", lastState !== false);
+      offBtn.setAttribute("aria-pressed", lastState === false ? "true" : "false");
+    }
+    const status = $("#canTestBroadcastStatus");
     if (status){
-      if (canTestToggleState.sending){
-        status.textContent = "Invio comando CAN…";
-      } else if (canTestToggleState.hasSent){
-        status.textContent = `Ultimo comando inviato: ${canTestToggleState.active ? "on" : "off"}.`;
+      status.classList.remove("error", "success");
+      if (sending){
+        status.textContent = `Invio comando CAN ${pendingState ? "ON" : "OFF"}…`;
+        status.classList.remove("muted");
+      } else if (canTestBroadcastState.lastError){
+        status.textContent = canTestBroadcastState.lastError;
+        status.classList.remove("muted");
+        status.classList.add("error");
+      } else if (lastState === true || lastState === false){
+        status.textContent = `Ultimo broadcast: ${lastState ? "ON" : "OFF"}.`;
+        status.classList.remove("muted");
+        status.classList.add("success");
       } else {
-        status.textContent = "Premi per inviare \"on\" o \"off\" sul bus CAN.";
+        status.textContent = "Premi per inviare \"ON\" o \"OFF\" sul bus CAN.";
+        status.classList.add("muted");
       }
     }
   }
 
-  async function sendCanTestToggle(nextState){
-    if (canTestToggleState.sending){
+  async function sendCanBroadcast(nextState){
+    const now = Date.now();
+    if (now - canTestBroadcastState.lastRequestAt < 200){
       return;
     }
-    canTestToggleState.sending = true;
-    updateCanTestToggleUI();
+    canTestBroadcastState.lastRequestAt = now;
+    if (canTestBroadcastState.sending){
+      return;
+    }
+    canTestBroadcastState.sending = true;
+    canTestBroadcastState.pendingState = nextState;
+    canTestBroadcastState.lastError = "";
+    updateCanTestBroadcastUI();
     try {
-      await apiPost("/api/can/test-toggle", { state: nextState ? "on" : "off" });
-      canTestToggleState.active = nextState;
-      canTestToggleState.hasSent = true;
-      toast(`CAN: comando ${nextState ? "ON" : "OFF"} inviato`);
+      const endpoint = nextState ? "/api/can/test/broadcast/on" : "/api/can/test/broadcast/off";
+      const resp = await apiPost(endpoint, null);
+      const isOn = typeof resp?.on === "boolean" ? resp.on : nextState;
+      canTestBroadcastState.lastState = isOn;
+      toast(`CAN: broadcast ${isOn ? "ON" : "OFF"} inviato`);
     } catch (err){
       const message = err?.message || "Invio comando CAN fallito";
+      canTestBroadcastState.lastError = `Errore: ${message}`;
       toast(`CAN: ${message}`, false);
     } finally {
-      canTestToggleState.sending = false;
-      updateCanTestToggleUI();
+      canTestBroadcastState.sending = false;
+      canTestBroadcastState.pendingState = null;
+      updateCanTestBroadcastUI();
     }
   }
 
@@ -471,14 +501,15 @@
         openExpansionActions(nodeId);
       });
     }
-    const toggleBtn = $("#canTestToggleBtn");
-    if (toggleBtn){
-      toggleBtn.addEventListener("click", () => {
-        const nextState = !canTestToggleState.active;
-        sendCanTestToggle(nextState);
-      });
+    const broadcastOnBtn = $("#canTestBroadcastOnBtn");
+    if (broadcastOnBtn){
+      broadcastOnBtn.addEventListener("click", () => { sendCanBroadcast(true); });
     }
-    updateCanTestToggleUI();
+    const broadcastOffBtn = $("#canTestBroadcastOffBtn");
+    if (broadcastOffBtn){
+      broadcastOffBtn.addEventListener("click", () => { sendCanBroadcast(false); });
+    }
+    updateCanTestBroadcastUI();
     renderExpansionsSection();
     await loadExpansionNodes();
   }
