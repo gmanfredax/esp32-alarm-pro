@@ -83,6 +83,7 @@ static void can_master_handle_node_online(uint8_t node_id);
 static void can_master_handle_node_offline(uint8_t node_id);
 static esp_err_t can_master_driver_start(void);
 static void can_master_driver_stop(void);
+static bool can_master_request_driver_restart(const char *reason);
 static void can_master_process_restart(void);
 static void can_master_trigger_discovery(void);
 static esp_err_t can_master_wait_until_running(TickType_t timeout_ticks);
@@ -129,6 +130,8 @@ static TaskHandle_t s_can_rx_task = NULL;
 static SemaphoreHandle_t s_can_state_lock = NULL;
 static can_node_state_t s_can_nodes[CAN_MAX_NODE_ID + 1];
 static char s_can_driver_stop_reason[64];
+static TickType_t s_can_last_driver_start_ticks = 0;
+static TickType_t s_can_last_restart_request_ticks = 0;
 
 static inline uint64_t can_now_ms(void)
 {
@@ -143,11 +146,25 @@ static SemaphoreHandle_t can_state_lock_get(void)
     return s_can_state_lock;
 }
 
-static void can_master_request_driver_restart(const char *reason)
+static bool can_master_request_driver_restart(const char *reason)
 {
-    if (!s_can_driver_restart_pending) {
-        s_can_driver_restart_pending = true;
+    const TickType_t now = xTaskGetTickCount();
+    const bool restart_in_progress =
+        s_can_driver_stop_pending || s_can_driver_restart_pending || s_can_driver_starting;
+
+    if (!restart_in_progress) {
+        const TickType_t since_last_restart = now - s_can_last_restart_request_ticks;
+        const TickType_t since_last_start = now - s_can_last_driver_start_ticks;
+        const bool restart_recent =
+            (s_can_last_restart_request_ticks != 0 && since_last_restart < pdMS_TO_TICKS(500));
+        const bool start_recent =
+            (s_can_last_driver_start_ticks != 0 && since_last_start < pdMS_TO_TICKS(250));
+        if (restart_recent || start_recent) {
+            return false;
+        }
     }
+
+    s_can_driver_restart_pending = true;
 
     if (reason && reason[0] != '\0') {
         snprintf(s_can_driver_stop_reason, sizeof(s_can_driver_stop_reason), "%s", reason);
@@ -157,6 +174,7 @@ static void can_master_request_driver_restart(const char *reason)
 
     if (!s_can_driver_stop_pending) {
         s_can_driver_stop_pending = true;
+        s_can_last_restart_request_ticks = now;
         if (s_can_driver_started) {
             const char *log_reason = s_can_driver_stop_reason[0] ? s_can_driver_stop_reason : "fault";
             ESP_LOGW(TAG_CAN, "Scheduling CAN driver stop (%s)", log_reason);
@@ -166,6 +184,8 @@ static void can_master_request_driver_restart(const char *reason)
     if (s_can_rx_task) {
         xTaskNotifyGive(s_can_rx_task);
     }
+
+    return true;
 }
 
 static void can_master_driver_stop(void)
@@ -383,7 +403,7 @@ static void can_rx_task(void *arg)
                 ESP_LOGW(TAG_CAN, "twai_receive failed: %s", esp_err_to_name(err));
             }
             if (err == ESP_ERR_INVALID_STATE) {
-                can_master_request_driver_restart("rx invalid state");
+                (void)can_master_request_driver_restart("rx invalid state");
                 vTaskDelay(pdMS_TO_TICKS(50));
             }
         }
@@ -426,7 +446,7 @@ static esp_err_t can_master_send_frame(uint32_t cob_id, const uint8_t *data, uin
     }
     esp_err_t err = twai_transmit(&msg, pdMS_TO_TICKS(50));
     if (err == ESP_ERR_INVALID_STATE) {
-        can_master_request_driver_restart("tx invalid state");
+        (void)can_master_request_driver_restart("tx invalid state");
     }
     return err;
 }
@@ -598,6 +618,7 @@ static esp_err_t can_master_driver_start(void)
     s_can_driver_started = true;
     s_can_driver_starting = false;
     s_can_driver_restart_pending = false;
+    s_can_last_driver_start_ticks = xTaskGetTickCount();
 
     ESP_LOGI(TAG_CAN, "driver started (bitrate %s)",
 #if defined(CONFIG_APP_CAN_BITRATE_125K)
@@ -615,11 +636,24 @@ static esp_err_t can_master_driver_start(void)
 static esp_err_t can_master_wait_until_running(TickType_t timeout_ticks)
 {
     const TickType_t start = xTaskGetTickCount();
+    bool restart_requested = false;
+
     while ((xTaskGetTickCount() - start) < timeout_ticks) {
         if (!s_can_driver_stop_pending && s_can_driver_started && !s_can_driver_starting) {
             twai_status_info_t status = {0};
-            if (twai_get_status_info(&status) == ESP_OK && status.state == TWAI_STATE_RUNNING) {
-                return ESP_OK;
+            if (twai_get_status_info(&status) == ESP_OK) {
+                if (status.state == TWAI_STATE_RUNNING) {
+                    return ESP_OK;
+                }
+
+                if (!restart_requested &&
+                    (status.state == TWAI_STATE_BUS_OFF || status.state == TWAI_STATE_STOPPED)) {
+                    const char *reason =
+                        (status.state == TWAI_STATE_BUS_OFF) ? "bus off" : "stopped";
+                    restart_requested = can_master_request_driver_restart(reason);
+                }
+            } else if (!restart_requested) {
+                restart_requested = can_master_request_driver_restart("status");
             }
         } else if (!s_can_driver_started && !s_can_driver_starting && !s_can_driver_stop_pending) {
             esp_err_t serr = can_master_driver_start();
