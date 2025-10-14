@@ -636,33 +636,58 @@ static esp_err_t can_master_driver_start(void)
 static esp_err_t can_master_wait_until_running(TickType_t timeout_ticks)
 {
     const TickType_t start = xTaskGetTickCount();
-    bool restart_requested = false;
 
-    while ((xTaskGetTickCount() - start) < timeout_ticks) {
-        if (!s_can_driver_stop_pending && s_can_driver_started && !s_can_driver_starting) {
+    TickType_t anchor = start;
+    TickType_t last_start_tick = s_can_last_driver_start_ticks;
+    const TickType_t extra_wait = pdMS_TO_TICKS(1000);
+    TickType_t max_wait_window = timeout_ticks + extra_wait;
+    if (max_wait_window < timeout_ticks) {
+        max_wait_window = timeout_ticks;
+    }
+
+    while ((xTaskGetTickCount() - start) < max_wait_window) {
+        const TickType_t now = xTaskGetTickCount();
+        if ((now - anchor) >= timeout_ticks) {
+            return ESP_ERR_TIMEOUT;
+        }
+
+        if (s_can_driver_stop_pending || s_can_driver_starting) {
+            anchor = now;
+        } else if (!s_can_driver_started) {
+            esp_err_t serr = can_master_driver_start();
+            if (serr != ESP_OK && serr != ESP_ERR_INVALID_STATE) {
+                return serr;
+            }
+            anchor = xTaskGetTickCount();
+        } else {
             twai_status_info_t status = {0};
             if (twai_get_status_info(&status) == ESP_OK) {
                 if (status.state == TWAI_STATE_RUNNING) {
                     return ESP_OK;
                 }
 
-                if (!restart_requested &&
-                    (status.state == TWAI_STATE_BUS_OFF || status.state == TWAI_STATE_STOPPED)) {
+                if (status.state == TWAI_STATE_RECOVERING) {
+                    anchor = now;
+                } else if (status.state == TWAI_STATE_BUS_OFF || status.state == TWAI_STATE_STOPPED) {
                     const char *reason =
                         (status.state == TWAI_STATE_BUS_OFF) ? "bus off" : "stopped";
-                    restart_requested = can_master_request_driver_restart(reason);
+                    (void)can_master_request_driver_restart(reason);
+                    anchor = now;
                 }
-            } else if (!restart_requested) {
-                restart_requested = can_master_request_driver_restart("status");
-            }
-        } else if (!s_can_driver_started && !s_can_driver_starting && !s_can_driver_stop_pending) {
-            esp_err_t serr = can_master_driver_start();
-            if (serr != ESP_OK && serr != ESP_ERR_INVALID_STATE) {
-                return serr;
+            } else {
+                (void)can_master_request_driver_restart("status");
+                anchor = now;
             }
         }
+
+        if (last_start_tick != s_can_last_driver_start_ticks) {
+            last_start_tick = s_can_last_driver_start_ticks;
+            anchor = xTaskGetTickCount();
+        }
+
         vTaskDelay(pdMS_TO_TICKS(25));
     }
+
     return ESP_ERR_TIMEOUT;
 }
 #endif // CONFIG_APP_CAN_ENABLED
