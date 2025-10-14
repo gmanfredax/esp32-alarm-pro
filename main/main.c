@@ -91,6 +91,7 @@ static void can_master_driver_stop(void);
 static bool can_master_request_driver_restart(const char *reason);
 static void can_master_process_restart(void);
 static void can_master_trigger_discovery(void);
+static esp_err_t can_master_request_node_info(uint8_t node_id);
 static esp_err_t can_master_wait_until_running(TickType_t timeout_ticks);
 #endif
 
@@ -122,8 +123,10 @@ _Static_assert((CAN_RX_TASK_STACK_BYTES % sizeof(StackType_t)) == 0,
 typedef struct {
     bool used;
     bool online;
+    bool info_received;
     uint8_t last_state;
     uint64_t last_seen_ms;
+    uint64_t last_info_request_ms;
 } can_node_state_t;
 
 static bool s_can_driver_started = false;
@@ -254,6 +257,21 @@ static void can_log_frame_debug(const twai_message_t *msg)
              payload);
 }
 
+static void can_state_note_info_received(uint8_t node_id)
+{
+    if (node_id == 0 || node_id > CAN_MAX_NODE_ID) {
+        return;
+    }
+    SemaphoreHandle_t lock = can_state_lock_get();
+    if (!lock) {
+        return;
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+    can_node_state_t *entry = &s_can_nodes[node_id];
+    entry->info_received = true;
+    xSemaphoreGive(lock);
+}
+
 static void can_state_mark_seen(uint8_t node_id, uint8_t state)
 {
     if (node_id == 0 || node_id > CAN_MAX_NODE_ID) {
@@ -265,6 +283,9 @@ static void can_state_mark_seen(uint8_t node_id, uint8_t state)
     }
     uint64_t now_ms = can_now_ms();
     bool became_online = false;
+    bool request_info = false;
+    bool already_info = false;
+    uint64_t last_info_req = 0;
     xSemaphoreTake(lock, portMAX_DELAY);
     can_node_state_t *entry = &s_can_nodes[node_id];
     became_online = !entry->online;
@@ -272,11 +293,23 @@ static void can_state_mark_seen(uint8_t node_id, uint8_t state)
     entry->online = true;
     entry->last_state = state;
     entry->last_seen_ms = now_ms;
+    already_info = entry->info_received;
+    last_info_req = entry->last_info_request_ms;
     xSemaphoreGive(lock);
 
     if (became_online) {
         ESP_LOGI(TAG_CAN, "node %u online (state=0x%02X)", (unsigned)node_id, state);
         can_master_handle_node_online(node_id);
+    }
+
+    if (!already_info) {
+        if (became_online || last_info_req == 0 || (now_ms - last_info_req) >= 1000ULL) {
+            request_info = true;
+        }
+    }
+
+    if (request_info) {
+        (void)can_master_request_node_info(node_id);
     }
 }
 
@@ -316,6 +349,7 @@ static void can_process_pdo_or_heartbeat(uint32_t cob_id, const twai_message_t *
 {
     uint8_t node_id = (uint8_t)(cob_id & 0x7Fu);
     uint8_t state = (msg && msg->data_length_code > 0) ? msg->data[0] : 0x05u;
+    state &= 0x7Fu;
     can_state_mark_seen(node_id, state);
 }
 
@@ -342,7 +376,9 @@ static void can_process_node_info(uint8_t node_id, const twai_message_t *msg)
         info.inputs_count = msg->data[4];
         info.outputs_count = msg->data[5];
         info.caps = (uint16_t)((uint16_t)msg->data[7] << 8 | (uint16_t)msg->data[6]);
-        can_master_handle_node_info(node_id, &info);
+        if (can_master_handle_node_info(node_id, &info) == ESP_OK) {
+            can_state_note_info_received(node_id);
+        }
     }
 }
 
@@ -478,6 +514,26 @@ static esp_err_t can_master_send_remote_frame(uint32_t cob_id, uint8_t len)
     return can_master_send_frame_common(cob_id, NULL, len, true);
 }
 
+static esp_err_t can_master_request_node_info(uint8_t node_id)
+{
+    if (node_id == 0 || node_id > CAN_MAX_NODE_ID) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    uint32_t cob_id = COBID_SDO_TX(node_id);
+    esp_err_t err = can_master_send_remote_frame(cob_id, 8);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_ARG) {
+        ESP_LOGW(TAG_CAN, "Node %u info request failed: %s", (unsigned)node_id, esp_err_to_name(err));
+    } else if (err == ESP_OK) {
+        SemaphoreHandle_t lock = can_state_lock_get();
+        if (lock) {
+            xSemaphoreTake(lock, portMAX_DELAY);
+            s_can_nodes[node_id].last_info_request_ms = can_now_ms();
+            xSemaphoreGive(lock);
+        }
+    }
+    return err;
+}
+
 static esp_err_t can_master_send_nmt(uint8_t command, uint8_t target)
 {
     uint8_t payload[2] = { command, target };
@@ -551,6 +607,7 @@ static void can_master_send_discovery_commands(void)
     for (uint32_t node_id = 1; node_id <= CAN_MAX_NODE_ID; ++node_id) {
         uint32_t cob_id = COBID_HEARTBEAT(node_id);
         (void)can_master_send_remote_frame(cob_id, 1);
+        (void)can_master_request_node_info((uint8_t)node_id);
         if ((node_id % 8u) == 0u) {
             vTaskDelay(pdMS_TO_TICKS(1));
         }
