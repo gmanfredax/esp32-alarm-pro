@@ -631,7 +631,6 @@ static esp_err_t can_master_wait_until_running(TickType_t timeout_ticks)
     }
     return ESP_ERR_TIMEOUT;
 }
-
 #endif // CONFIG_APP_CAN_ENABLED
 
 static SemaphoreHandle_t s_scan_mutex = NULL;
