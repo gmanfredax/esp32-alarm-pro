@@ -269,11 +269,15 @@ static void can_master_lss_tick(void)
         case CAN_LSS_STAGE_WAIT_SWITCH_CONFIG_ACK:
             if ((now - s_can_lss_state.last_command_ticks) >= resend_after) {
                 if (s_can_lss_state.retries >= max_retries) {
-                    ESP_LOGW(TAG_CAN, "LSS switch-config timed out, restarting sequence");
+                    ESP_LOGW(TAG_CAN,
+                             "LSS switch-config acknowledgement missing, continuing");
                     s_can_lss_state.retries = 0;
                 } else {
-                    ++s_can_lss_state.retries;
+                    s_can_lss_state.stage = CAN_LSS_STAGE_SEND_SET_NODE;
+                    s_can_lss_state.last_command_ticks = 0;
+                    return;
                 }
+                ++s_can_lss_state.retries;
                 s_can_lss_state.stage = CAN_LSS_STAGE_SEND_SWITCH_CONFIG;
                 s_can_lss_state.last_command_ticks = 0;
             }
@@ -340,14 +344,19 @@ static void can_master_lss_tick(void)
         case CAN_LSS_STAGE_WAIT_SWITCH_OPERATIONAL_ACK:
             if ((now - s_can_lss_state.last_command_ticks) >= resend_after) {
                 if (s_can_lss_state.retries >= max_retries) {
-                    ESP_LOGW(TAG_CAN, "LSS switch-operational timed out, restarting sequence");
+                    ESP_LOGW(TAG_CAN,
+                             "LSS switch-operational acknowledgement missing, assuming success");
+                    s_can_lss_configured = true;
+                    s_can_lss_state.stage = CAN_LSS_STAGE_DONE;
+                    s_can_lss_state.last_command_ticks = now;
                     s_can_lss_state.retries = 0;
-                    s_can_lss_state.stage = CAN_LSS_STAGE_SEND_SWITCH_CONFIG;
+                    s_can_discovery_pending = true;
+                    return;
                 } else {
                     ++s_can_lss_state.retries;
                     s_can_lss_state.stage = CAN_LSS_STAGE_SEND_SWITCH_OPERATIONAL;
+                    s_can_lss_state.last_command_ticks = 0;
                 }
-                s_can_lss_state.last_command_ticks = 0;
             }
             return;
 
@@ -559,6 +568,30 @@ static void can_process_pdo_or_heartbeat(uint32_t cob_id, const twai_message_t *
     can_state_mark_seen(node_id, state);
 }
 
+static bool can_lss_status_indicates_success(uint8_t cs, uint8_t status, bool *already_applied)
+{
+    if (already_applied) {
+        *already_applied = false;
+    }
+
+    if (status == 0x00u) {
+        return true;
+    }
+
+    if (cs == 0x11u && status == CAN_DEFAULT_NODE_ID) {
+        return true;
+    }
+
+    if ((cs == 0x11u || cs == 0x17u) && status == 0x01u) {
+        if (already_applied) {
+            *already_applied = true;
+        }
+        return true;
+    }
+
+    return false;
+}
+
 static void can_process_lss_response(const twai_message_t *msg)
 {
     if (!msg) {
@@ -567,53 +600,84 @@ static void can_process_lss_response(const twai_message_t *msg)
     uint8_t cs = (msg->data_length_code > 0) ? msg->data[0] : 0x00u;
     uint8_t status = (msg->data_length_code > 1) ? msg->data[1] : 0xFFu;
 
-    if (status == 0x00u) {
-        bool handled = false;
-        TickType_t now = xTaskGetTickCount();
-        switch (cs) {
-            case 0x04u:
-                if (s_can_lss_state.stage == CAN_LSS_STAGE_WAIT_SWITCH_CONFIG_ACK) {
-                    ESP_LOGI(TAG_CAN, "LSS: configuration mode acknowledged");
-                    s_can_lss_state.stage = CAN_LSS_STAGE_SEND_SET_NODE;
-                    s_can_lss_state.last_command_ticks = 0;
-                    s_can_lss_state.retries = 0;
-                    handled = true;
-                } else if (s_can_lss_state.stage == CAN_LSS_STAGE_WAIT_SWITCH_OPERATIONAL_ACK) {
-                    ESP_LOGI(TAG_CAN, "LSS: switch to operational confirmed");
-                    s_can_lss_configured = true;
-                    s_can_lss_state.stage = CAN_LSS_STAGE_DONE;
-                    s_can_lss_state.last_command_ticks = now;
-                    s_can_lss_state.retries = 0;
-                    s_can_discovery_pending = true;
-                    handled = true;
-                }
+    bool handled = false;
+    bool already_applied = false;
+    TickType_t now = xTaskGetTickCount();
+    switch (cs) {
+        case 0x04u:
+            if (!can_lss_status_indicates_success(cs, status, &already_applied)) {
                 break;
-            case 0x11u:
-                if (s_can_lss_state.stage == CAN_LSS_STAGE_WAIT_SET_NODE_ACK) {
-                    ESP_LOGI(TAG_CAN, "LSS: node ID %u accepted", (unsigned)CAN_DEFAULT_NODE_ID);
-                    s_can_lss_state.stage = CAN_LSS_STAGE_SEND_STORE;
-                    s_can_lss_state.last_command_ticks = 0;
-                    s_can_lss_state.retries = 0;
-                    handled = true;
-                }
+            }
+
+            if (s_can_lss_state.stage == CAN_LSS_STAGE_WAIT_SWITCH_CONFIG_ACK) {
+                ESP_LOGI(TAG_CAN, "LSS: configuration mode acknowledged");
+                s_can_lss_state.stage = CAN_LSS_STAGE_SEND_SET_NODE;
+                s_can_lss_state.last_command_ticks = 0;
+                s_can_lss_state.retries = 0;
+                handled = true;
+            } else if (s_can_lss_state.stage == CAN_LSS_STAGE_WAIT_SWITCH_OPERATIONAL_ACK) {
+                ESP_LOGI(TAG_CAN, "LSS: switch to operational confirmed");
+                s_can_lss_configured = true;
+                s_can_lss_state.stage = CAN_LSS_STAGE_DONE;
+                s_can_lss_state.last_command_ticks = now;
+                s_can_lss_state.retries = 0;
+                s_can_discovery_pending = true;
+                handled = true;
+            }
+            break;
+        case 0x11u:
+            if (!can_lss_status_indicates_success(cs, status, &already_applied)) {
                 break;
-            case 0x17u:
-                if (s_can_lss_state.stage == CAN_LSS_STAGE_WAIT_STORE_ACK) {
+            }
+
+            if (s_can_lss_state.stage == CAN_LSS_STAGE_WAIT_SET_NODE_ACK) {
+                if (already_applied) {
+                    ESP_LOGW(TAG_CAN,
+                             "LSS: node ID %u already active (status 0x%02X)",
+                             (unsigned)CAN_DEFAULT_NODE_ID, (unsigned)status);
+                } else if (status == CAN_DEFAULT_NODE_ID) {
+                    ESP_LOGW(TAG_CAN,
+                             "LSS: node ID %u accepted with non-standard status 0x%02X",
+                             (unsigned)CAN_DEFAULT_NODE_ID, (unsigned)status);
+                } else {
+                    ESP_LOGI(TAG_CAN, "LSS: node ID %u accepted",
+                             (unsigned)CAN_DEFAULT_NODE_ID);
+                }
+                s_can_lss_state.stage = CAN_LSS_STAGE_SEND_STORE;
+                s_can_lss_state.last_command_ticks = 0;
+                s_can_lss_state.retries = 0;
+                handled = true;
+            }
+            break;
+        case 0x17u:
+            if (!can_lss_status_indicates_success(cs, status, &already_applied)) {
+                break;
+            }
+
+            if (s_can_lss_state.stage == CAN_LSS_STAGE_WAIT_STORE_ACK) {
+                if (already_applied) {
+                    ESP_LOGW(TAG_CAN, "LSS: configuration already stored");
+                } else {
                     ESP_LOGI(TAG_CAN, "LSS: configuration stored");
-                    s_can_lss_state.stage = CAN_LSS_STAGE_SEND_SWITCH_OPERATIONAL;
-                    s_can_lss_state.last_command_ticks = 0;
-                    s_can_lss_state.retries = 0;
-                    handled = true;
                 }
-                break;
-            default:
-                break;
-        }
-        if (!handled) {
-            ESP_LOGI(TAG_CAN, "LSS response cs=0x%02X status=0x%02X", cs, status);
-        }
+                s_can_lss_state.stage = CAN_LSS_STAGE_SEND_SWITCH_OPERATIONAL;
+                s_can_lss_state.last_command_ticks = 0;
+                s_can_lss_state.retries = 0;
+                handled = true;
+            }
+            break;
+        default:
+            break;
+    }
+
+    if (handled) {
+        return;
+    }
+
+    if (can_lss_status_indicates_success(cs, status, NULL)) {
+        ESP_LOGI(TAG_CAN, "LSS response cs=0x%02X status=0x%02X", cs, status);
     } else {
-        ESP_LOGW(TAG_CAN, "LSS response cs=0x%02X status=0x%02X", cs, status);
+        ESP_LOGW(TAG_CAN, "Unexpected LSS response cs=0x%02X status=0x%02X", cs, status);
         s_can_lss_configured = false;
         can_master_lss_reset_state();
         can_master_lss_start_if_needed();
