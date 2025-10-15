@@ -132,6 +132,14 @@ config APP_CAN_NODE_TIMEOUT_MS
         Time window without heartbeats or PDO frames after which a node is
         considered offline.
 
+config APP_CAN_DEFAULT_NODE_ID
+    int "Default node ID for new expansion boards"
+    default 1
+    range 1 127
+    help
+        Node ID assigned via Layer Setting Services (LSS) when discovering
+        expansion boards that do not yet have a stored CANopen node ID.
+
 config APP_CAN_RX_TASK_STACK
     int "CAN RX task stack size (bytes)"
     default 4096

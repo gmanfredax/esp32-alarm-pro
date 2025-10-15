@@ -93,6 +93,8 @@ static void can_master_process_restart(void);
 static void can_master_trigger_discovery(void);
 static esp_err_t can_master_request_node_info(uint8_t node_id);
 static esp_err_t can_master_wait_until_running(TickType_t timeout_ticks);
+static void can_master_lss_provision_if_needed(void);
+static void can_process_lss_response(const twai_message_t *msg);
 #endif
 
 #define SYSTEM_MAIN_TASK_STACK_BYTES      (16384)
@@ -116,6 +118,7 @@ _Static_assert((SYSTEM_MAIN_TASK_STACK_BYTES % sizeof(StackType_t)) == 0,
 
 #define CAN_MAX_NODE_ID         (127u)
 #define CAN_NODE_TIMEOUT_MS     ((uint32_t)CONFIG_APP_CAN_NODE_TIMEOUT_MS)
+#define CAN_DEFAULT_NODE_ID     ((uint8_t)CONFIG_APP_CAN_DEFAULT_NODE_ID)
 
 _Static_assert((CAN_RX_TASK_STACK_BYTES % sizeof(StackType_t)) == 0,
                "CAN_RX_TASK_STACK_BYTES must align to StackType_t size");
@@ -140,6 +143,8 @@ static can_node_state_t s_can_nodes[CAN_MAX_NODE_ID + 1];
 static char s_can_driver_stop_reason[64];
 static TickType_t s_can_last_driver_start_ticks = 0;
 static TickType_t s_can_last_restart_request_ticks = 0;
+static bool s_can_lss_configured = false;
+static TickType_t s_can_lss_last_attempt_ticks = 0;
 
 static inline uint64_t can_now_ms(void)
 {
@@ -291,6 +296,7 @@ static void can_state_mark_seen(uint8_t node_id, uint8_t state)
     became_online = !entry->online;
     entry->used = true;
     entry->online = true;
+    s_can_lss_configured = true;
     entry->last_state = state;
     entry->last_seen_ms = now_ms;
     already_info = entry->info_received;
@@ -353,6 +359,24 @@ static void can_process_pdo_or_heartbeat(uint32_t cob_id, const twai_message_t *
     can_state_mark_seen(node_id, state);
 }
 
+static void can_process_lss_response(const twai_message_t *msg)
+{
+    if (!msg) {
+        return;
+    }
+    uint8_t cs = (msg->data_length_code > 0) ? msg->data[0] : 0x00u;
+    uint8_t status = (msg->data_length_code > 1) ? msg->data[1] : 0xFFu;
+
+    if (status == 0x00u) {
+        if (cs == 0x11u || cs == 0x17u) {
+            s_can_lss_configured = true;
+        }
+        ESP_LOGI(TAG_CAN, "LSS response cs=0x%02X status=0x%02X", cs, status);
+    } else {
+        ESP_LOGW(TAG_CAN, "LSS response cs=0x%02X status=0x%02X", cs, status);
+    }
+}
+
 static void can_process_node_info(uint8_t node_id, const twai_message_t *msg)
 {
     if (!msg) {
@@ -389,6 +413,11 @@ static void can_process_frame(const twai_message_t *msg)
     }
     can_log_frame_debug(msg);
     uint32_t cob_id = msg->identifier & 0x7FFu;
+
+    if (cob_id == COBID_LSS_SLAVE) {
+        can_process_lss_response(msg);
+        return;
+    }
 
     if ((cob_id & 0x780u) == 0x700u) { // Heartbeat or boot-up
         can_process_pdo_or_heartbeat(cob_id, msg);
@@ -598,6 +627,61 @@ static inline bool can_driver_ready_for_discovery(void)
     return status.state == TWAI_STATE_RUNNING;
 }
 
+static void can_master_lss_provision_if_needed(void)
+{
+    if (s_can_lss_configured) {
+        return;
+    }
+
+    const TickType_t now = xTaskGetTickCount();
+    if (s_can_lss_last_attempt_ticks != 0 &&
+        (now - s_can_lss_last_attempt_ticks) < pdMS_TO_TICKS(1000)) {
+        return;
+    }
+
+    s_can_lss_last_attempt_ticks = now;
+    ESP_LOGI(TAG_CAN, "Attempting LSS provisioning (node %u)",
+             (unsigned)CAN_DEFAULT_NODE_ID);
+
+    uint8_t payload[8] = {0};
+    payload[0] = 0x04u; // Switch Mode Global -> configuration
+    payload[1] = 0x00u;
+    esp_err_t err = can_master_send_frame(COBID_LSS_MASTER, payload, sizeof(payload));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG_CAN, "LSS switch-config failed: %s", esp_err_to_name(err));
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    memset(payload, 0, sizeof(payload));
+    payload[0] = 0x11u; // Configure Node-ID
+    payload[1] = CAN_DEFAULT_NODE_ID;
+    err = can_master_send_frame(COBID_LSS_MASTER, payload, sizeof(payload));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG_CAN, "LSS set-node failed: %s", esp_err_to_name(err));
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    memset(payload, 0, sizeof(payload));
+    payload[0] = 0x17u; // Store configuration
+    payload[1] = 0x01u;
+    err = can_master_send_frame(COBID_LSS_MASTER, payload, sizeof(payload));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG_CAN, "LSS store failed: %s", esp_err_to_name(err));
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    memset(payload, 0, sizeof(payload));
+    payload[0] = 0x04u; // Switch Mode Global -> operational
+    payload[1] = 0x01u;
+    err = can_master_send_frame(COBID_LSS_MASTER, payload, sizeof(payload));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG_CAN, "LSS switch-oper failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void can_master_send_discovery_commands(void)
 {
     (void)can_master_send_nmt(0x82u, 0x00u); // Reset communication
@@ -620,6 +704,8 @@ static void can_master_trigger_discovery(void)
         s_can_discovery_pending = true;
         return;
     }
+
+    can_master_lss_provision_if_needed();
 
     s_can_discovery_pending = false;
     can_master_send_discovery_commands();
