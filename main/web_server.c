@@ -577,6 +577,31 @@ static bool parse_can_node_id(const char *uri, uint8_t *out_node)
     return true;
 }
 
+static bool parse_can_node_outputs_uri(const char *uri, uint8_t *out_node)
+{
+    const char *prefix = "/api/can/node/";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(uri, prefix, prefix_len) != 0) {
+        return false;
+    }
+    const char *p = uri + prefix_len;
+    if (!isdigit((unsigned char)*p)) {
+        return false;
+    }
+    char *end = NULL;
+    long node = strtol(p, &end, 10);
+    if (end == p || node < 0 || node > 255) {
+        return false;
+    }
+    if (strcmp(end, "/outputs") != 0) {
+        return false;
+    }
+    if (out_node) {
+        *out_node = (uint8_t)node;
+    }
+    return true;
+}
+
 static bool parse_can_nodes_uri(const char *uri, uint8_t *out_node)
 {
     const char *prefix = "/api/can/nodes/";
@@ -819,6 +844,163 @@ static esp_err_t api_can_node_delete(httpd_req_t *req)
 }
 
 static esp_err_t api_can_node_delete_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+
+static esp_err_t api_can_node_outputs_post(httpd_req_t *req)
+{
+    if (!check_bearer(req)) {
+        httpd_resp_send_err(req, 401, "token");
+        return ESP_FAIL;
+    }
+    uint8_t node_id = 0;
+    if (!parse_can_node_outputs_uri(req->uri, &node_id) || node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
+        return ESP_FAIL;
+    }
+
+    roster_io_state_t io_state = {0};
+    if (!roster_get_io_state(node_id, &io_state) || !io_state.exists) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
+        return ESP_FAIL;
+    }
+    if (io_state.state != ROSTER_NODE_STATE_OPERATIONAL) {
+        httpd_resp_send_err(req, 409, "node_offline");
+        return ESP_FAIL;
+    }
+
+    cors_apply(req);
+
+    char body[256];
+    size_t body_len = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &body_len) != ESP_OK) {
+        httpd_resp_send_err(req, 400, "body");
+        return ESP_FAIL;
+    }
+
+    cJSON *json = cJSON_ParseWithLength(body, body_len);
+    if (!json) {
+        httpd_resp_send_err(req, 400, "json");
+        return ESP_FAIL;
+    }
+
+    uint32_t desired = 0;
+    bool have_desired = false;
+    cJSON *jbitmap = cJSON_GetObjectItemCaseSensitive(json, "outputs_bitmap");
+    if (cJSON_IsNumber(jbitmap)) {
+        double val = jbitmap->valuedouble;
+        if (val < 0.0 || val > (double)UINT32_MAX) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, 400, "outputs_bitmap");
+            return ESP_FAIL;
+        }
+        desired = (uint32_t)val;
+        have_desired = true;
+    }
+
+    if (!have_desired) {
+        cJSON *jmask = cJSON_GetObjectItemCaseSensitive(json, "mask");
+        cJSON *jvalue = cJSON_GetObjectItemCaseSensitive(json, "value");
+        if (cJSON_IsNumber(jmask) && cJSON_IsNumber(jvalue)) {
+            if (!io_state.outputs_valid) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, 409, "outputs_unknown");
+                return ESP_FAIL;
+            }
+            double mask_val = jmask->valuedouble;
+            double value_val = jvalue->valuedouble;
+            if (mask_val < 0.0 || mask_val > (double)UINT32_MAX ||
+                value_val < 0.0 || value_val > (double)UINT32_MAX) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, 400, "mask_value");
+                return ESP_FAIL;
+            }
+            uint32_t mask = (uint32_t)mask_val;
+            uint32_t value = (uint32_t)value_val;
+            desired = (io_state.outputs_bitmap & ~mask) | (value & mask);
+            have_desired = true;
+        }
+    }
+
+    if (!have_desired) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, 400, "outputs_bitmap");
+        return ESP_FAIL;
+    }
+
+    uint8_t flags = 0;
+    cJSON *jflags = cJSON_GetObjectItemCaseSensitive(json, "flags");
+    if (cJSON_IsNumber(jflags)) {
+        double val = jflags->valuedouble;
+        if (val < 0.0 || val > (double)UINT8_MAX) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, 400, "flags");
+            return ESP_FAIL;
+        }
+        flags = (uint8_t)val;
+    }
+
+    uint8_t pwm_level = 0;
+    cJSON *jpwm = cJSON_GetObjectItemCaseSensitive(json, "pwm_level");
+    if (cJSON_IsNumber(jpwm)) {
+        double val = jpwm->valuedouble;
+        if (val < 0.0 || val > (double)UINT8_MAX) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, 400, "pwm_level");
+            return ESP_FAIL;
+        }
+        pwm_level = (uint8_t)val;
+    }
+
+    cJSON_Delete(json);
+
+    esp_err_t err = can_master_set_node_outputs(node_id, desired, flags, pwm_level);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        return json_error_reply(req, "503 Service Unavailable", "can_not_supported");
+    }
+    if (err == ESP_ERR_TIMEOUT || err == ESP_ERR_INVALID_STATE) {
+        return json_error_reply(req, "503 Service Unavailable", "can_not_ready");
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "can");
+        return ESP_FAIL;
+    }
+
+    roster_io_state_t updated_state = {0};
+    roster_get_io_state(node_id, &updated_state);
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+        return ESP_FAIL;
+    }
+
+    cJSON_AddNumberToObject(resp, "node_id", node_id);
+    cJSON_AddBoolToObject(resp, "outputs_known", updated_state.outputs_valid);
+    cJSON_AddNumberToObject(resp,
+                            "outputs_bitmap",
+                            (double)(updated_state.outputs_valid ?
+                                     updated_state.outputs_bitmap : desired));
+    cJSON_AddNumberToObject(resp,
+                            "outputs_flags",
+                            (double)(updated_state.outputs_valid ?
+                                     updated_state.outputs_flags : flags));
+    cJSON_AddNumberToObject(resp,
+                            "pwm_level",
+                            (double)(updated_state.outputs_valid ?
+                                     updated_state.outputs_pwm : pwm_level));
+    cJSON_AddBoolToObject(resp, "inputs_known", updated_state.inputs_valid);
+    if (updated_state.inputs_valid) {
+        cJSON_AddNumberToObject(resp, "inputs_bitmap", (double)updated_state.inputs_bitmap);
+        cJSON_AddNumberToObject(resp, "change_counter", updated_state.change_counter);
+        cJSON_AddNumberToObject(resp, "node_state_flags", updated_state.node_state_flags);
+    }
+
+    return json_reply_cjson(req, resp);
+}
+
+static esp_err_t api_can_node_outputs_options(httpd_req_t *req)
 {
     return cors_handle_options(req);
 }
@@ -4066,6 +4248,8 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/can/test/broadcast/on",     .method = HTTP_OPTIONS, .handler = api_can_test_broadcast_options },
     { .uri = "/api/can/test/broadcast/off",    .method = HTTP_POST,    .handler = api_can_test_broadcast_off_post },
     { .uri = "/api/can/test/broadcast/off",    .method = HTTP_OPTIONS, .handler = api_can_test_broadcast_options },
+    { .uri = "/api/can/node/*/outputs",   .method = HTTP_POST,    .handler = api_can_node_outputs_post },
+    { .uri = "/api/can/node/*/outputs",   .method = HTTP_OPTIONS, .handler = api_can_node_outputs_options },
     { .uri = "/api/can/node/*/identify", .method = HTTP_POST,    .handler = api_can_node_identify_post },
     { .uri = "/api/can/node/*/identify", .method = HTTP_OPTIONS, .handler = api_can_node_identify_options },
     { .uri = "/api/status",             .method = HTTP_GET,  .handler = status_get },

@@ -64,6 +64,14 @@ static void node_init_defaults(roster_node_t *node, uint8_t node_id)
     node->node_id = node_id;
     node->state = ROSTER_NODE_STATE_OFFLINE;
     node->identify_active = false;
+    node->inputs_valid = false;
+    node->outputs_valid = false;
+    node->inputs_bitmap = 0;
+    node->outputs_bitmap = 0;
+    node->change_counter = 0;
+    node->node_state_flags = 0;
+    node->outputs_flags = 0;
+    node->outputs_pwm = 0;
     snprintf(node->kind, sizeof(node->kind), "%s", "exp");
     snprintf(node->label, sizeof(node->label), "Exp %u", (unsigned)node_id);
 }
@@ -269,6 +277,53 @@ const roster_node_t *roster_get_node(uint8_t node_id)
     return &s_nodes[node_id];
 }
 
+esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uint8_t *out_node_id, bool *out_is_new)
+{
+    if (!uid || uid_len == 0 || uid_len > sizeof(((roster_node_t *)0)->uid) || !out_node_id) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+
+    for (uint32_t i = 1; i < ROSTER_MAX_NODES; ++i) {
+        roster_node_t *node = &s_nodes[i];
+        if (!node->used) {
+            continue;
+        }
+        if (memcmp(node->uid, uid, uid_len) == 0) {
+            *out_node_id = (uint8_t)i;
+            if (out_is_new) {
+                *out_is_new = false;
+            }
+            xSemaphoreGive(s_roster_lock);
+            return ESP_OK;
+        }
+    }
+
+    for (uint32_t i = 1; i < ROSTER_MAX_NODES; ++i) {
+        roster_node_t *node = &s_nodes[i];
+        if (node->used) {
+            continue;
+        }
+        node_init_defaults(node, (uint8_t)i);
+        memset(node->uid, 0, sizeof(node->uid));
+        memcpy(node->uid, uid, uid_len);
+        node->info_valid = true;
+        node->state = ROSTER_NODE_STATE_PREOP;
+        node->used = true;
+        *out_node_id = (uint8_t)i;
+        if (out_is_new) {
+            *out_is_new = true;
+        }
+        xSemaphoreGive(s_roster_lock);
+        return ESP_OK;
+    }
+
+    xSemaphoreGive(s_roster_lock);
+    return ESP_ERR_NO_MEM;
+}
+
 void roster_stats(size_t *out_total, size_t *out_online)
 {
     ensure_lock();
@@ -306,6 +361,18 @@ static void add_common_fields(cJSON *obj, const roster_node_t *node)
     cJSON_AddNumberToObject(obj, "caps", node->caps);
     cJSON_AddNumberToObject(obj, "inputs_count", node->inputs_count);
     cJSON_AddNumberToObject(obj, "outputs_count", node->outputs_count);
+    cJSON_AddBoolToObject(obj, "inputs_known", node->inputs_valid);
+    if (node->inputs_valid) {
+        cJSON_AddNumberToObject(obj, "inputs_bitmap", (double)node->inputs_bitmap);
+    }
+    cJSON_AddNumberToObject(obj, "change_counter", node->change_counter);
+    cJSON_AddNumberToObject(obj, "node_state_flags", node->node_state_flags);
+    cJSON_AddBoolToObject(obj, "outputs_known", node->outputs_valid);
+    if (node->outputs_valid) {
+        cJSON_AddNumberToObject(obj, "outputs_bitmap", (double)node->outputs_bitmap);
+    }
+    cJSON_AddNumberToObject(obj, "outputs_flags", node->outputs_flags);
+    cJSON_AddNumberToObject(obj, "outputs_pwm", node->outputs_pwm);
     cJSON_AddStringToObject(obj, "state", state_to_string(node->state));
     cJSON_AddNumberToObject(obj, "last_seen_ms", (double)node->last_seen_ms);
     cJSON_AddBoolToObject(obj, "identify_active", node->identify_active);
@@ -380,4 +447,91 @@ cJSON *roster_node_to_json(uint8_t node_id)
     }
     add_common_fields(obj, &snapshot);
     return obj;
+}
+
+esp_err_t roster_note_inputs(uint8_t node_id,
+                             uint32_t inputs_bitmap,
+                             uint8_t change_counter,
+                             uint8_t node_state_flags)
+{
+    if (node_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    if (!node) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!node->used) {
+        node_init_defaults(node, node_id);
+    }
+    node->inputs_valid = true;
+    node->inputs_bitmap = inputs_bitmap;
+    node->change_counter = change_counter;
+    node->node_state_flags = node_state_flags;
+    xSemaphoreGive(s_roster_lock);
+    return ESP_OK;
+}
+
+esp_err_t roster_note_outputs(uint8_t node_id,
+                              uint32_t outputs_bitmap,
+                              uint8_t flags,
+                              uint8_t pwm_level,
+                              bool known)
+{
+    if (node_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    if (!node || !node->used) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+    node->outputs_bitmap = outputs_bitmap;
+    node->outputs_flags = flags;
+    node->outputs_pwm = pwm_level;
+    node->outputs_valid = known;
+    xSemaphoreGive(s_roster_lock);
+    return ESP_OK;
+}
+
+bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state)
+{
+    if (!out_state) {
+        return false;
+    }
+    if (node_id == 0) {
+        memset(out_state, 0, sizeof(*out_state));
+        out_state->exists = false;
+        out_state->state = ROSTER_NODE_STATE_OFFLINE;
+        return false;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    bool ok = (node && node->used);
+    if (ok) {
+        out_state->exists = true;
+        out_state->state = node->state;
+        out_state->inputs_valid = node->inputs_valid;
+        out_state->inputs_bitmap = node->inputs_bitmap;
+        out_state->change_counter = node->change_counter;
+        out_state->node_state_flags = node->node_state_flags;
+        out_state->outputs_valid = node->outputs_valid;
+        out_state->outputs_bitmap = node->outputs_bitmap;
+        out_state->outputs_flags = node->outputs_flags;
+        out_state->outputs_pwm = node->outputs_pwm;
+    }
+    xSemaphoreGive(s_roster_lock);
+    if (!ok) {
+        memset(out_state, 0, sizeof(*out_state));
+        out_state->exists = false;
+        out_state->state = ROSTER_NODE_STATE_OFFLINE;
+    }
+    return ok;
 }

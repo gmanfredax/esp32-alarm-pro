@@ -40,7 +40,7 @@
 #include "pins.h"
 #include "i2c_bus.h"
 #include "scenes.h"
-//#include "can_proto.h"
+#include "can_proto.h"
 #include "can_master.h"
 
 #include "lwip/apps/sntp.h"

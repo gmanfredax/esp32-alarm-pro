@@ -32,6 +32,14 @@ esp_err_t can_master_request_scan(bool *started);
 esp_err_t can_master_send_test_toggle(bool enable);
 
 /**
+ * @brief Command the outputs of a specific CAN expansion node.
+ */
+esp_err_t can_master_set_node_outputs(uint8_t node_id,
+                                      uint32_t outputs_bitmap,
+                                      uint8_t flags,
+                                      uint8_t pwm_level);
+
+/**
  * @brief Transmit a raw CAN frame with the provided payload.
  */
 esp_err_t can_master_send_raw(uint32_t cob_id, const void *payload, uint8_t len);

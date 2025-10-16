@@ -38,6 +38,11 @@ typedef struct {
     uint32_t last_inputs;
     uint8_t last_state;
     uint8_t change_counter;
+    uint32_t outputs_bitmap;
+    uint8_t outputs_flags;
+    uint8_t outputs_pwm;
+    bool outputs_valid;
+    bool inputs_valid;
 } can_master_node_t;
 
 static const char *TAG = "can_master";
@@ -61,10 +66,21 @@ static void can_master_handle_info(uint8_t node_id, const can_proto_info_t *payl
 static void can_master_check_timeouts(void);
 static void can_master_notify_online(uint8_t node_id, bool is_new, uint64_t now_ms);
 static void can_master_notify_offline(uint8_t node_id, uint64_t now_ms);
+static void can_master_notify_io_state(uint8_t node_id,
+                                       uint32_t inputs_bitmap,
+                                       bool inputs_valid,
+                                       uint8_t change_counter,
+                                       uint8_t node_state_flags,
+                                       uint32_t outputs_bitmap,
+                                       bool outputs_valid,
+                                       uint8_t outputs_flags,
+                                       uint8_t outputs_pwm,
+                                       uint64_t timestamp_ms);
 static void can_scan_note_new_node(void);
 static esp_err_t can_master_driver_start_internal(void);
 static void scan_timer_cb(void *arg);
 static twai_timing_config_t can_timing_config(void);
+static void can_master_handle_addr_request(const twai_message_t *msg);
 
 static inline uint64_t now_ms(void)
 {
@@ -252,6 +268,38 @@ static void can_master_notify_offline(uint8_t node_id, uint64_t now_ms)
     }
 }
 
+static void can_master_notify_io_state(uint8_t node_id,
+                                       uint32_t inputs_bitmap,
+                                       bool inputs_valid,
+                                       uint8_t change_counter,
+                                       uint8_t node_state_flags,
+                                       uint32_t outputs_bitmap,
+                                       bool outputs_valid,
+                                       uint8_t outputs_flags,
+                                       uint8_t outputs_pwm,
+                                       uint64_t timestamp_ms)
+{
+    cJSON *evt = cJSON_CreateObject();
+    if (!evt) {
+        return;
+    }
+    cJSON_AddNumberToObject(evt, "node_id", node_id);
+    cJSON_AddNumberToObject(evt, "ts_ms", (double)timestamp_ms);
+    cJSON_AddBoolToObject(evt, "inputs_known", inputs_valid);
+    if (inputs_valid) {
+        cJSON_AddNumberToObject(evt, "inputs_bitmap", (double)inputs_bitmap);
+        cJSON_AddNumberToObject(evt, "change_counter", change_counter);
+        cJSON_AddNumberToObject(evt, "node_state_flags", node_state_flags);
+    }
+    cJSON_AddBoolToObject(evt, "outputs_known", outputs_valid);
+    if (outputs_valid) {
+        cJSON_AddNumberToObject(evt, "outputs_bitmap", (double)outputs_bitmap);
+        cJSON_AddNumberToObject(evt, "outputs_flags", outputs_flags);
+        cJSON_AddNumberToObject(evt, "outputs_pwm", outputs_pwm);
+    }
+    web_server_ws_broadcast_event("node_io_state", evt);
+}
+
 static void can_master_check_timeouts(void)
 {
     uint64_t now = now_ms();
@@ -291,6 +339,11 @@ static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbe
     }
     uint64_t now = now_ms();
     bool was_online = false;
+    bool notify_io = false;
+    uint32_t outputs_bitmap = 0;
+    uint8_t outputs_flags = 0;
+    uint8_t outputs_pwm = 0;
+    bool outputs_valid = false;
 
     SemaphoreHandle_t lock = state_lock_get();
     if (!lock) {
@@ -300,13 +353,32 @@ static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbe
     xSemaphoreTake(lock, portMAX_DELAY);
     can_master_node_t *node = &s_nodes[node_id];
     was_online = node->online;
+    notify_io = (!node->inputs_valid) ||
+                (node->last_inputs != payload->inputs_bitmap) ||
+                (node->change_counter != payload->change_counter) ||
+                (node->last_state != payload->node_state);
     node->used = true;
     node->online = true;
     node->last_seen_ms = now;
     node->last_inputs = payload->inputs_bitmap;
     node->last_state = payload->node_state;
     node->change_counter = payload->change_counter;
+    node->inputs_valid = true;
+    outputs_bitmap = node->outputs_bitmap;
+    outputs_flags = node->outputs_flags;
+    outputs_pwm = node->outputs_pwm;
+    outputs_valid = node->outputs_valid;
     xSemaphoreGive(lock);
+
+    esp_err_t roster_err = roster_note_inputs(node_id,
+                                              payload->inputs_bitmap,
+                                              payload->change_counter,
+                                              payload->node_state);
+    if (roster_err != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to store inputs for node %u (err=%s)",
+                 (unsigned)node_id,
+                 esp_err_to_name(roster_err));
+    }
 
     bool is_new = false;
     if (roster_mark_online(node_id, now, &is_new) == ESP_OK) {
@@ -316,6 +388,19 @@ static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbe
         if (!was_online || is_new) {
             can_master_notify_online(node_id, is_new, now);
         }
+    }
+
+    if (notify_io) {
+        can_master_notify_io_state(node_id,
+                                   payload->inputs_bitmap,
+                                   true,
+                                   payload->change_counter,
+                                   payload->node_state,
+                                   outputs_bitmap,
+                                   outputs_valid,
+                                   outputs_flags,
+                                   outputs_pwm,
+                                   now);
     }
 }
 
@@ -392,6 +477,80 @@ static void can_master_handle_scan_response(const twai_message_t *msg)
     ESP_LOGI(TAG, "Received CAN scan response frame");
 }
 
+static void can_master_handle_addr_request(const twai_message_t *msg)
+{
+    if (!msg || msg->data_length_code < sizeof(can_proto_addr_request_t)) {
+        return;
+    }
+
+    const can_proto_addr_request_t *req = (const can_proto_addr_request_t *)msg->data;
+    if (req->protocol != CAN_PROTO_PROTOCOL_VERSION) {
+        ESP_LOGW(TAG,
+                 "Ignoring address request with protocol %u",
+                 (unsigned)req->protocol);
+        return;
+    }
+
+    uint8_t node_id = 0;
+    bool is_new = false;
+    esp_err_t err = roster_assign_node_id_from_uid(req->uid,
+                                                   CAN_PROTO_UID_LENGTH,
+                                                   &node_id,
+                                                   &is_new);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Unable to allocate node id for request (err=%s)", esp_err_to_name(err));
+        return;
+    }
+
+    can_proto_addr_assign_t payload = {
+        .node_id = node_id,
+    };
+    memcpy(payload.uid, req->uid, sizeof(payload.uid));
+
+    err = can_master_send_raw(CAN_PROTO_ID_BROADCAST_ADDR_ASSIGN,
+                              &payload,
+                              sizeof(payload));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG,
+                 "Failed to reply to address request for UID %02X:%02X:%02X:%02X:%02X:%02X:%02X",
+                 req->uid[0],
+                 req->uid[1],
+                 req->uid[2],
+                 req->uid[3],
+                 req->uid[4],
+                 req->uid[5],
+                 req->uid[6]);
+        return;
+    }
+
+    SemaphoreHandle_t lock = state_lock_get();
+    if (lock && node_id > 0 && node_id <= CAN_MAX_NODE_ID) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        can_master_node_t *node = &s_nodes[node_id];
+        node->used = true;
+        node->online = false;
+        node->last_seen_ms = now_ms();
+        node->inputs_valid = false;
+        node->outputs_valid = false;
+        node->outputs_bitmap = 0;
+        node->outputs_flags = 0;
+        node->outputs_pwm = 0;
+        node->last_inputs = 0;
+        node->last_state = 0;
+        node->change_counter = 0;
+        xSemaphoreGive(lock);
+    }
+
+    if (is_new) {
+        cJSON *evt = cJSON_CreateObject();
+        if (evt) {
+            cJSON_AddNumberToObject(evt, "node_id", node_id);
+            cJSON_AddBoolToObject(evt, "allocated", true);
+            web_server_ws_broadcast_event("node_id_assigned", evt);
+        }
+    }
+}
+
 static void can_master_handle_frame(const twai_message_t *msg)
 {
     if (!msg || msg->extd) {
@@ -402,6 +561,15 @@ static void can_master_handle_frame(const twai_message_t *msg)
 
     if (cob_id == CAN_PROTO_ID_BROADCAST_SCAN) {
         can_master_handle_scan_response(msg);
+        return;
+    }
+
+    if (cob_id == CAN_PROTO_ID_BROADCAST_ADDR_REQ) {
+        can_master_handle_addr_request(msg);
+        return;
+    }
+
+    if (cob_id == CAN_PROTO_ID_BROADCAST_ADDR_ASSIGN) {
         return;
     }
 
@@ -492,6 +660,77 @@ esp_err_t can_master_send_test_toggle(bool enable)
         .reserved = {0},
     };
     return can_master_send_raw(CAN_PROTO_ID_BROADCAST_TEST, &payload, sizeof(payload));
+}
+
+esp_err_t can_master_set_node_outputs(uint8_t node_id,
+                                      uint32_t outputs_bitmap,
+                                      uint8_t flags,
+                                      uint8_t pwm_level)
+{
+    if (node_id == 0 || node_id > CAN_MAX_NODE_ID) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    can_proto_output_cmd_t payload = {
+        .msg_type = CAN_PROTO_MSG_OUTPUT_COMMAND,
+        .flags = flags,
+        .outputs_bitmap = outputs_bitmap,
+        .pwm_level = pwm_level,
+        .reserved = 0,
+    };
+
+    esp_err_t err = can_master_send_raw(CAN_PROTO_ID_COMMAND(node_id),
+                                        &payload,
+                                        sizeof(payload));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    uint32_t inputs_bitmap = 0;
+    uint8_t change_counter = 0;
+    uint8_t node_state_flags = 0;
+    bool inputs_valid = false;
+    uint64_t timestamp = now_ms();
+
+    SemaphoreHandle_t lock = state_lock_get();
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        can_master_node_t *node = &s_nodes[node_id];
+        node->used = true;
+        node->outputs_bitmap = outputs_bitmap;
+        node->outputs_flags = flags;
+        node->outputs_pwm = pwm_level;
+        node->outputs_valid = true;
+        inputs_bitmap = node->last_inputs;
+        change_counter = node->change_counter;
+        node_state_flags = node->last_state;
+        inputs_valid = node->inputs_valid;
+        xSemaphoreGive(lock);
+    }
+
+    esp_err_t roster_err = roster_note_outputs(node_id,
+                                               outputs_bitmap,
+                                               flags,
+                                               pwm_level,
+                                               true);
+    if (roster_err != ESP_OK && roster_err != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Unable to store outputs for node %u (err=%s)",
+                 (unsigned)node_id,
+                 esp_err_to_name(roster_err));
+    }
+
+    can_master_notify_io_state(node_id,
+                               inputs_bitmap,
+                               inputs_valid,
+                               change_counter,
+                               node_state_flags,
+                               outputs_bitmap,
+                               true,
+                               flags,
+                               pwm_level,
+                               timestamp);
+
+    return ESP_OK;
 }
 
 esp_err_t can_master_request_scan(bool *started)
@@ -612,6 +851,18 @@ esp_err_t can_master_request_scan(bool *started)
     if (started) {
         *started = false;
     }
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t can_master_set_node_outputs(uint8_t node_id,
+                                      uint32_t outputs_bitmap,
+                                      uint8_t flags,
+                                      uint8_t pwm_level)
+{
+    (void)node_id;
+    (void)outputs_bitmap;
+    (void)flags;
+    (void)pwm_level;
     return ESP_ERR_NOT_SUPPORTED;
 }
 

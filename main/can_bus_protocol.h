@@ -25,8 +25,12 @@ extern "C" {
 #define CAN_PROTO_ID_COMMAND(node_id) (CAN_PROTO_ID_COMMAND_BASE + (node_id))
 #define CAN_PROTO_ID_DIAG(node_id)    (CAN_PROTO_ID_DIAG_BASE + (node_id))
 
-#define CAN_PROTO_ID_BROADCAST_SCAN   0x070u
-#define CAN_PROTO_ID_BROADCAST_TEST   0x071u
+#define CAN_PROTO_ID_BROADCAST_SCAN        0x070u
+#define CAN_PROTO_ID_BROADCAST_TEST        0x071u
+#define CAN_PROTO_ID_BROADCAST_ADDR_REQ    0x072u
+#define CAN_PROTO_ID_BROADCAST_ADDR_ASSIGN 0x073u
+
+#define CAN_PROTO_UID_LENGTH 7u
 
 typedef enum {
     CAN_PROTO_MSG_HEARTBEAT      = 0x01u,
@@ -81,6 +85,16 @@ typedef struct __attribute__((packed)) {
     uint8_t enable;    /**< 1 => enable, 0 => disable */
     uint8_t reserved[6];
 } can_proto_test_toggle_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t protocol;                /**< CAN protocol version requested */
+    uint8_t uid[CAN_PROTO_UID_LENGTH]; /**< Board hardware identifier (LSB first) */
+} can_proto_addr_request_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t node_id;                 /**< Assigned CAN node id */
+    uint8_t uid[CAN_PROTO_UID_LENGTH]; /**< Board hardware identifier (LSB first) */
+} can_proto_addr_assign_t;
 
 #ifdef __cplusplus
 }
