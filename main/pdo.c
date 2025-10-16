@@ -6,14 +6,16 @@
 
 #include "freertos/FreeRTOS.h"
 #include "esp_log.h"
-#include "driver/twai.h"
+// #include "driver/twai.h"
+#include "esp_err.h"
 
 #include "can_proto.h"
+#include "can_master.h"
 #include "roster.h"
 
-#ifndef TWAI_FRAME_MAX_DLC
-#define TWAI_FRAME_MAX_DLC 8
-#endif
+// #ifndef TWAI_FRAME_MAX_DLC
+// #define TWAI_FRAME_MAX_DLC 8
+// #endif
 
 #define PDO_LED_CMD_BLINK_ONESHOT  0x01u
 #define PDO_LED_CMD_IDENTIFY_TOGGLE 0x02u
@@ -44,22 +46,25 @@ static const char *TAG = "pdo";
 
 static esp_err_t send_pdo(uint32_t cob_id, const void *payload, size_t len)
 {
-    if (!payload || len > TWAI_FRAME_MAX_DLC) {
+    // if (!payload || len > TWAI_FRAME_MAX_DLC) {
+    if (!payload || len == 0 || len > UINT8_MAX) {
         return ESP_ERR_INVALID_ARG;
     }
-    twai_message_t msg = {
-        .identifier = cob_id,
-        .extd = 0,
-        .rtr = 0,
-        .ss = 0,
-        .dlc_non_comp = 0,
-        .data_length_code = len,
-    };
-    memset(msg.data, 0, sizeof(msg.data));
-    memcpy(msg.data, payload, len);
-    esp_err_t err = twai_transmit(&msg, pdMS_TO_TICKS(50));
+    // twai_message_t msg = {
+    //     .identifier = cob_id,
+    //     .extd = 0,
+    //     .rtr = 0,
+    //     .ss = 0,
+    //     .dlc_non_comp = 0,
+    //     .data_length_code = len,
+    // };
+    // memset(msg.data, 0, sizeof(msg.data));
+    // memcpy(msg.data, payload, len);
+    // esp_err_t err = twai_transmit(&msg, pdMS_TO_TICKS(50));
+    esp_err_t err = can_master_send_raw(cob_id, payload, (uint8_t)len);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "twai_transmit 0x%03" PRIx32 " failed: %s", cob_id, esp_err_to_name(err));
+        // ESP_LOGW(TAG, "twai_transmit 0x%03" PRIx32 " failed: %s", cob_id, esp_err_to_name(err));
+        ESP_LOGW(TAG, "PDO 0x%03" PRIx32 " transmit failed: %s", cob_id, esp_err_to_name(err));
     }
     return err;
 }

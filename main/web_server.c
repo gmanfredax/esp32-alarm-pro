@@ -59,6 +59,7 @@
 #include "pdo.h"
 #include "mqtt_client.h"
 #include "app_mqtt.h"
+#include "can_master.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -85,8 +86,8 @@ extern const unsigned char certs_server_key_pem_end[]    asm("_binary_server_key
 extern const uint8_t certs_broker_ca_pem_start[] asm("_binary_broker_ca_pem_start");
 extern const uint8_t certs_broker_ca_pem_end[]   asm("_binary_broker_ca_pem_end");
 
-extern esp_err_t can_master_request_scan(bool *started);
-extern esp_err_t can_master_send_test_toggle(bool enable);
+// extern esp_err_t can_master_request_scan(bool *started);
+// extern esp_err_t can_master_send_test_toggle(bool enable);
 
 static void web_server_restart_async(void);
 
