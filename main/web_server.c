@@ -3121,11 +3121,27 @@ typedef struct {
     char     name[24];
 } zone_cfg_t;
 
-static zone_cfg_t s_zone_cfg[INPUT_ZONES_COUNT];
-static uint8_t    s_zone_board_map[INPUT_ZONES_COUNT];
+#define ZONE_CONFIG_CAPACITY ALARM_MAX_ZONES
+
+typedef struct {
+    bool known;
+    bool active;
+    uint8_t board;
+    uint8_t board_input;
+    bool board_online;
+} zone_state_entry_t;
+
+typedef struct {
+    int total;
+    int master_total;
+    zone_state_entry_t entries[ZONE_CONFIG_CAPACITY];
+} zones_snapshot_t;
+
+static zone_cfg_t s_zone_cfg[ZONE_CONFIG_CAPACITY];
+static uint8_t    s_zone_board_map[ZONE_CONFIG_CAPACITY];
 
 static uint8_t zone_board_for_index(int zone_1_based){
-    if (zone_1_based < 1 || zone_1_based > INPUT_ZONES_COUNT) {
+    if (zone_1_based < 1 || zone_1_based > ZONE_CONFIG_CAPACITY) {
         return 0;
     }
     return s_zone_board_map[zone_1_based - 1];
@@ -3133,27 +3149,129 @@ static uint8_t zone_board_for_index(int zone_1_based){
 
 static void zones_apply_to_alarm(void){
      // Invia le opzioni zona ad alarm_core
-    for(int i=1;i<=INPUT_ZONES_COUNT;i++){
+    for(int i=1;i<=ALARM_MAX_ZONES;i++){
         zone_cfg_t *c = &s_zone_cfg[i-1];
         zone_opts_t o = { .entry_delay = c->zone_delay, .entry_time_ms = (uint16_t)(c->zone_time * 1000u), .exit_delay = c->zone_delay, .exit_time_ms = (uint16_t)(c->zone_time * 1000u), .auto_exclude = c->auto_exclude };
         alarm_set_zone_opts(i, &o);
     }
 }
 
+static void zones_snapshot_build(zones_snapshot_t *snap)
+{
+    if (!snap) {
+        return;
+    }
+    memset(snap, 0, sizeof(*snap));
+
+    snap->master_total = INPUT_ZONES_COUNT;
+    if (snap->master_total > ZONE_CONFIG_CAPACITY) {
+        snap->master_total = ZONE_CONFIG_CAPACITY;
+    }
+
+    uint16_t gpioab = 0;
+    bool gpio_ok = (inputs_read_all(&gpioab) == ESP_OK);
+    for (int i = 0; i < snap->master_total; ++i) {
+        zone_state_entry_t *entry = &snap->entries[i];
+        entry->board = 0;
+        entry->board_input = (uint8_t)i;
+        entry->board_online = gpio_ok;
+        entry->known = gpio_ok;
+        entry->active = gpio_ok ? inputs_zone_bit(gpioab, i + 1) : false;
+        s_zone_board_map[i] = 0;
+        snap->total++;
+    }
+
+    roster_node_inputs_t nodes[32];
+    size_t node_count = roster_collect_nodes(nodes, sizeof(nodes) / sizeof(nodes[0]));
+    for (size_t idx = 0; idx < node_count; ++idx) {
+        const roster_node_inputs_t *node = &nodes[idx];
+        if (node->inputs_count == 0) {
+            continue;
+        }
+        for (uint8_t bit = 0; bit < node->inputs_count; ++bit) {
+            if (snap->total >= ZONE_CONFIG_CAPACITY) {
+                break;
+            }
+            zone_state_entry_t *entry = &snap->entries[snap->total];
+            entry->board = node->node_id;
+            entry->board_input = bit;
+            entry->board_online = (node->state == ROSTER_NODE_STATE_OPERATIONAL);
+            entry->known = entry->board_online && node->inputs_valid;
+            entry->active = entry->known ? ((node->inputs_bitmap & (1u << bit)) != 0u) : false;
+            s_zone_board_map[snap->total] = entry->board;
+            snap->total++;
+        }
+        if (snap->total >= ZONE_CONFIG_CAPACITY) {
+            break;
+        }
+    }
+
+    for (int i = snap->total; i < ZONE_CONFIG_CAPACITY; ++i) {
+        s_zone_board_map[i] = 0;
+        snap->entries[i].known = false;
+        snap->entries[i].active = false;
+        snap->entries[i].board = 0;
+        snap->entries[i].board_input = 0;
+        snap->entries[i].board_online = false;
+    }
+}
+
+static int zones_snapshot_total(const zones_snapshot_t *snap)
+{
+    if (!snap) {
+        return INPUT_ZONES_COUNT;
+    }
+    if (snap->total <= 0) {
+        return snap->master_total;
+    }
+    return snap->total;
+}
+
+static int zones_effective_total(void)
+{
+    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    if (total > ZONE_CONFIG_CAPACITY) {
+        total = ZONE_CONFIG_CAPACITY;
+    }
+    return (int)total;
+}
+
 static void zones_load_from_nvs(void){
+    memset(s_zone_cfg, 0, sizeof(s_zone_cfg));
     memset(s_zone_board_map, 0, sizeof(s_zone_board_map));
 
     nvs_handle_t h;
     if (nvs_open("zones", NVS_READONLY, &h) == ESP_OK){
-        size_t cfg_sz = sizeof(s_zone_cfg);
-        if (nvs_get_blob(h, "cfg", s_zone_cfg, &cfg_sz) != ESP_OK) {
-            /* default vuoti */
+        size_t cfg_sz = 0;
+        if (nvs_get_blob(h, "cfg", NULL, &cfg_sz) == ESP_OK && cfg_sz > 0) {
+            uint8_t *buf = malloc(cfg_sz);
+            if (buf) {
+                size_t read_len = cfg_sz;
+                if (nvs_get_blob(h, "cfg", buf, &read_len) == ESP_OK) {
+                    size_t copy = read_len;
+                    if (copy > sizeof(s_zone_cfg)) {
+                        copy = sizeof(s_zone_cfg);
+                    }
+                    memcpy(s_zone_cfg, buf, copy);
+                }
+                free(buf);
+            }
         }
 
-        size_t map_sz = sizeof(s_zone_board_map);
-        esp_err_t map_res = nvs_get_blob(h, "map", s_zone_board_map, &map_sz);
-        if (map_res != ESP_OK || map_sz != sizeof(s_zone_board_map)) {
-            memset(s_zone_board_map, 0, sizeof(s_zone_board_map));
+        size_t map_sz = 0;
+        if (nvs_get_blob(h, "map", NULL, &map_sz) == ESP_OK && map_sz > 0) {
+            uint8_t *buf = malloc(map_sz);
+            if (buf) {
+                size_t read_len = map_sz;
+                if (nvs_get_blob(h, "map", buf, &read_len) == ESP_OK) {
+                    size_t copy = read_len;
+                    if (copy > sizeof(s_zone_board_map)) {
+                        copy = sizeof(s_zone_board_map);
+                    }
+                    memcpy(s_zone_board_map, buf, copy);
+                }
+                free(buf);
+            }
         }
         nvs_close(h);
     }
@@ -3761,6 +3879,9 @@ static esp_err_t status_get(httpd_req_t* req){
     // for (int z=1; z<=INPUT_ZONES_COUNT; ++z){
     //     bool on = inputs_zone_bit(gpioab, z);
     //     off += snprintf(zones+off, sizeof(zones)-off, "%s%s", (z>1?",":""), on?"true":"false");
+    zones_snapshot_t snapshot;
+    zones_snapshot_build(&snapshot);
+    const int zones_total = zones_snapshot_total(&snapshot);
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
@@ -3778,17 +3899,23 @@ static esp_err_t status_get(httpd_req_t* req){
  
     // return json_reply(req, buf);
     cJSON_AddStringToObject(root, "state", state);
-    cJSON_AddNumberToObject(root, "zones_count", INPUT_ZONES_COUNT);
+    cJSON_AddNumberToObject(root, "zones_count", zones_total);
 
     cJSON *zones = cJSON_CreateArray();
-    if (zones) {
-        for (int z=1; z<=INPUT_ZONES_COUNT; ++z){
-            bool on = inputs_zone_bit(gpioab, z);
-            cJSON_AddItemToArray(zones, cJSON_CreateBool(on));
+    cJSON *zones_known = cJSON_CreateArray();
+    if (zones && zones_known) {
+        for (int idx = 0; idx < zones_total; ++idx) {
+            const zone_state_entry_t *entry = &snapshot.entries[idx];
+            cJSON_AddItemToArray(zones, cJSON_CreateBool(entry->active));
+            cJSON_AddItemToArray(zones_known, cJSON_CreateBool(entry->known));
         }
         cJSON_AddItemToObject(root, "zones_active", zones);
+        cJSON_AddItemToObject(root, "zones_known", zones_known);
     } else {
+        if (zones) cJSON_Delete(zones);
+        if (zones_known) cJSON_Delete(zones_known);
         cJSON_AddNullToObject(root, "zones_active");
+        cJSON_AddNullToObject(root, "zones_known");
     }
 
     cJSON_AddBoolToObject(root, "tamper", tamper);
@@ -3815,21 +3942,60 @@ static esp_err_t status_get(httpd_req_t* req){
 
 static esp_err_t zones_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
-    uint16_t gpioab=0; inputs_read_all(&gpioab);
+    zones_snapshot_t snapshot;
+    zones_snapshot_build(&snapshot);
+    const int total = zones_snapshot_total(&snapshot);
+
     cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+
     cJSON *arr  = cJSON_CreateArray();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+
     cJSON_AddItemToObject(root, "zones", arr);
-    for(int z=1; z<=INPUT_ZONES_COUNT; ++z){
-        bool on = inputs_zone_bit(gpioab, z);
+    cJSON_AddNumberToObject(root, "total", total);
+
+    for(int idx = 0; idx < total; ++idx){
+        const int zone_id = idx + 1;
+        const zone_state_entry_t *entry = &snapshot.entries[idx];
         cJSON *it = cJSON_CreateObject();
-        cJSON_AddNumberToObject(it, "id", z);
-        zone_cfg_t *cfg = &s_zone_cfg[z-1];
-        const char* zname = cfg->name[0] ? cfg->name : "";        cJSON_AddStringToObject(it, "name", zname);
-        cJSON_AddBoolToObject(it, "active", on);
-        cJSON_AddBoolToObject(it, "auto_exclude", cfg->auto_exclude);
-        cJSON_AddBoolToObject(it, "zone_delay", cfg->zone_delay);
-        cJSON_AddNumberToObject(it, "zone_time", (double)cfg->zone_time);
-        cJSON_AddNumberToObject(it, "board", (double)zone_board_for_index(z));
+        if (!it) {
+            continue;
+        }
+        zone_cfg_t *cfg = &s_zone_cfg[idx];
+        const char *zname = NULL;
+        char tmp[48];
+        if (cfg && cfg->name[0]) {
+            zname = cfg->name;
+        } else if (entry->board != 0) {
+            snprintf(tmp, sizeof(tmp), "Exp %u Z%u", (unsigned)entry->board, (unsigned)(entry->board_input + 1));
+            zname = tmp;
+        } else {
+            snprintf(tmp, sizeof(tmp), "Z%d", zone_id);
+            zname = tmp;
+        }
+        cJSON_AddNumberToObject(it, "id", zone_id);
+        cJSON_AddStringToObject(it, "name", zname ? zname : "");
+        cJSON_AddBoolToObject(it, "known", entry->known);
+        cJSON_AddBoolToObject(it, "active", entry->known ? entry->active : false);
+        cJSON_AddBoolToObject(it, "board_online", entry->board_online);
+        cJSON_AddNumberToObject(it, "board", (double)entry->board);
+        cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
+        if (cfg) {
+            cJSON_AddBoolToObject(it, "auto_exclude", cfg->auto_exclude);
+            cJSON_AddBoolToObject(it, "zone_delay", cfg->zone_delay);
+            cJSON_AddNumberToObject(it, "zone_time", (double)cfg->zone_time);
+        } else {
+            cJSON_AddBoolToObject(it, "auto_exclude", false);
+            cJSON_AddBoolToObject(it, "zone_delay", false);
+            cJSON_AddNumberToObject(it, "zone_time", 0);
+        }
         cJSON_AddItemToArray(arr, it);
     }
     char *out = cJSON_PrintUnformatted(root);
@@ -3841,17 +4007,59 @@ static esp_err_t zones_get(httpd_req_t* req){
 
 static esp_err_t scenes_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
-    uint16_t h=0,n=0,c=0,a=0;
+    uint32_t h=0,n=0,c=0,a=0;
     scenes_get_mask(SCENE_HOME,  &h);
     scenes_get_mask(SCENE_NIGHT, &n);
     scenes_get_mask(SCENE_CUSTOM,&c);
     a = scenes_get_active_mask();
 
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-        "{\"zones\":%d,\"home\":%u,\"night\":%u,\"custom\":%u,\"active\":%u}",
-        INPUT_ZONES_COUNT, (unsigned)h,(unsigned)n,(unsigned)c,(unsigned)a);
-    return json_reply(req, buf);
+    int zones_total = zones_effective_total();
+    if (zones_total > SCENES_MAX_ZONES) {
+        zones_total = SCENES_MAX_ZONES;
+    }
+
+    int ids[SCENES_MAX_ZONES];
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddNumberToObject(root, "zones", zones_total);
+    cJSON_AddNumberToObject(root, "home", (double)h);
+    cJSON_AddNumberToObject(root, "night", (double)n);
+    cJSON_AddNumberToObject(root, "custom", (double)c);
+    cJSON_AddNumberToObject(root, "active", (double)a);
+
+    cJSON *home_ids = cJSON_CreateArray();
+    cJSON *night_ids = cJSON_CreateArray();
+    cJSON *custom_ids = cJSON_CreateArray();
+    if (!home_ids || !night_ids || !custom_ids) {
+        if (home_ids) cJSON_Delete(home_ids);
+        if (night_ids) cJSON_Delete(night_ids);
+        if (custom_ids) cJSON_Delete(custom_ids);
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+
+    int cnt = scenes_mask_to_ids(h, ids, zones_total);
+    for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(home_ids, cJSON_CreateNumber(ids[i]));
+    cnt = scenes_mask_to_ids(n, ids, zones_total);
+    for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(night_ids, cJSON_CreateNumber(ids[i]));
+    cnt = scenes_mask_to_ids(c, ids, zones_total);
+    for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(custom_ids, cJSON_CreateNumber(ids[i]));
+
+    cJSON_AddItemToObject(root, "home_ids", home_ids);
+    cJSON_AddItemToObject(root, "night_ids", night_ids);
+    cJSON_AddItemToObject(root, "custom_ids", custom_ids);
+
+    char *out = cJSON_PrintUnformatted(root);
+    esp_err_t res = json_reply(req, out);
+    cJSON_free(out);
+    cJSON_Delete(root);
+    return res;
 }
 
 static esp_err_t scenes_post(httpd_req_t* req){
@@ -3882,6 +4090,11 @@ static esp_err_t scenes_post(httpd_req_t* req){
     else if (strcmp(jscene->valuestring,"custom")==0) s = SCENE_CUSTOM;
     else { cJSON_Delete(json); httpd_resp_send_err(req, 400, "scene"); return ESP_FAIL; }
 
+    int zones_total = zones_effective_total();
+    if (zones_total > SCENES_MAX_ZONES) {
+        zones_total = SCENES_MAX_ZONES;
+    }
+
     // mask o ids[]
     uint32_t mask = 0u;
     const cJSON *jmask = cJSON_GetObjectItemCaseSensitive(json, "mask");
@@ -3894,7 +4107,7 @@ static esp_err_t scenes_post(httpd_req_t* req){
             cJSON_ArrayForEach(it, ids){
                 if(cJSON_IsNumber(it)){
                     int id = it->valueint;
-                    if(id>=1 && id<=INPUT_ZONES_COUNT) mask |= (1u << (id-1));
+                    if(id>=1 && id<=zones_total) mask |= (1u << (id-1));
                 }
             }
         } else {
@@ -3905,7 +4118,7 @@ static esp_err_t scenes_post(httpd_req_t* req){
     }
     cJSON_Delete(json);
 
-    if (scenes_set_mask(s, (uint16_t)mask)!=ESP_OK){
+    if (scenes_set_mask(s, mask)!=ESP_OK){
         httpd_resp_send_err(req, 500, "nvs");
         return ESP_FAIL;
     }
@@ -3916,16 +4129,49 @@ static esp_err_t scenes_post(httpd_req_t* req){
 // GET /api/zones/config
 static esp_err_t zones_config_get(httpd_req_t* req){
     if(!check_bearer(req)) return httpd_resp_send_err(req,401,"token"), ESP_FAIL;
-    char buf[INPUT_ZONES_COUNT*128]; size_t off=0;
-    off += snprintf(buf+off,sizeof(buf)-off,"{\"items\":[");
-    for(int z=1; z<=INPUT_ZONES_COUNT; ++z){
-        zone_cfg_t *c=&s_zone_cfg[z-1];
-        off += snprintf(buf+off,sizeof(buf)-off,
-          "%s{\"id\":%d,\"name\":\"%s\",\"zone_delay\":%s,\"zone_time\":%u,\"auto_exclude\":%s,\"board\":%u}",
-          (z>1?",":""), z, (c->name[0]?c->name:""), c->zone_delay?"true":"false", c->zone_time, c->auto_exclude?"true":"false", (unsigned)zone_board_for_index(z));
+
+    zones_snapshot_t snapshot;
+    zones_snapshot_build(&snapshot);
+    const int total = zones_snapshot_total(&snapshot);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
     }
-    off += snprintf(buf+off,sizeof(buf)-off,"]}");
-    return json_reply(req, buf);
+
+    cJSON *items = cJSON_CreateArray();
+    if (!items) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddItemToObject(root, "items", items);
+
+    for (int idx = 0; idx < total; ++idx) {
+        const int zone_id = idx + 1;
+        zone_cfg_t *cfg = &s_zone_cfg[idx];
+        const zone_state_entry_t *entry = &snapshot.entries[idx];
+        cJSON *it = cJSON_CreateObject();
+        if (!it) {
+            continue;
+        }
+        cJSON_AddNumberToObject(it, "id", zone_id);
+        cJSON_AddStringToObject(it, "name", cfg->name);
+        cJSON_AddBoolToObject(it, "zone_delay", cfg->zone_delay);
+        cJSON_AddNumberToObject(it, "zone_time", (double)cfg->zone_time);
+        cJSON_AddBoolToObject(it, "auto_exclude", cfg->auto_exclude);
+        cJSON_AddNumberToObject(it, "board", (double)(entry->board ? entry->board : zone_board_for_index(zone_id)));
+        cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
+        cJSON_AddBoolToObject(it, "board_online", entry->board_online);
+        cJSON_AddItemToArray(items, it);
+    }
+
+    char *out = cJSON_PrintUnformatted(root);
+    esp_err_t res = json_reply(req, out);
+    cJSON_free(out);
+    cJSON_Delete(root);
+    return res;
 }
 
 // POST /api/zones/config
@@ -3942,7 +4188,7 @@ static esp_err_t zones_config_post(httpd_req_t* req){
         cJSON *jid = cJSON_GetObjectItemCaseSensitive(it, "id");
         if(!cJSON_IsNumber(jid)) continue;
         int id = jid->valueint;
-        if(id<1 || id>INPUT_ZONES_COUNT) continue;
+        if(id<1 || id>ZONE_CONFIG_CAPACITY) continue;
         zone_cfg_t *c = &s_zone_cfg[id-1];
         cJSON *jn=NULL;
         jn = cJSON_GetObjectItemCaseSensitive(it, "name");
@@ -4445,8 +4691,13 @@ static esp_err_t arm_post(httpd_req_t* req)
 
     // 1) Determina stato target e maschera scena
     alarm_state_t target = ALARM_DISARMED;
-    uint16_t scene_mask = 0;
-    if      (strcasecmp(mode, "away")==0)   { target = ALARM_ARMED_AWAY;  scene_mask = scenes_mask_all(INPUT_ZONES_COUNT); }
+    int zones_total = zones_effective_total();
+    if (zones_total > SCENES_MAX_ZONES) {
+        zones_total = SCENES_MAX_ZONES;
+    }
+
+    uint32_t scene_mask = 0;
+    if      (strcasecmp(mode, "away")==0)   { target = ALARM_ARMED_AWAY;  scene_mask = scenes_mask_all(zones_total); }
     else if (strcasecmp(mode, "home")==0)   { target = ALARM_ARMED_HOME;  scenes_get_mask(SCENE_HOME,  &scene_mask); }
     else if (strcasecmp(mode, "night")==0)  { target = ALARM_ARMED_NIGHT; scenes_get_mask(SCENE_NIGHT, &scene_mask); }
     else if (strcasecmp(mode, "custom")==0) { target = ALARM_ARMED_CUSTOM;scenes_get_mask(SCENE_CUSTOM,&scene_mask); }
@@ -4454,21 +4705,26 @@ static esp_err_t arm_post(httpd_req_t* req)
 
     // 2) Calcola effettiva maschera attiva (profilo ∧ scena)
     profile_t prof = alarm_get_profile(target);
-    uint16_t eff_mask = prof.active_mask & scene_mask;
+    uint32_t eff_mask = prof.active_mask & scene_mask;
 
     // 3) Costruisci elenco zone aperte e bypass automatico (auto_exclude)
-    uint16_t ab=0; (void)inputs_read_all(&ab);
-    uint16_t open_mask = 0;
-    for (int z=1; z<=INPUT_ZONES_COUNT; ++z){
-        if (inputs_zone_bit(ab, z)) open_mask |= (1u << (z-1));
+    zones_snapshot_t snapshot;
+    zones_snapshot_build(&snapshot);
+    int snapshot_total = zones_snapshot_total(&snapshot);
+    if (snapshot_total > zones_total) {
+        snapshot_total = zones_total;
     }
-    uint16_t blocking = 0, bypass = 0;
-    for (int i=0; i<INPUT_ZONES_COUNT; ++i){
-        uint16_t bit = (1u<<i);
+
+    uint32_t open_mask = 0;
+    for (int idx = 0; idx < snapshot_total; ++idx){
+        const zone_state_entry_t *entry = &snapshot.entries[idx];
+        if (entry->known && entry->active) open_mask |= (1u << idx);
+    }
+    uint32_t blocking = 0, bypass = 0;
+    for (int i=0; i<zones_total; ++i){
+        uint32_t bit = (1u<<i);
         if ( (eff_mask & bit) && (open_mask & bit) ){
-            /* RITARDO UNICO: se la zona ha un ritardo ingresso configurato (>0),
-               consentiamo l’ARM e NON la mettiamo in bypass: partirà il countdown. */
-            bool has_delay = (s_zone_cfg[i].zone_delay && s_zone_cfg[i].zone_time > 0);   // se nel tuo struct è _ms, adatta!
+            bool has_delay = (s_zone_cfg[i].zone_delay && s_zone_cfg[i].zone_time > 0);
             if (has_delay){
                 continue;  // né blocking, né bypass
             }
@@ -4482,8 +4738,9 @@ static esp_err_t arm_post(httpd_req_t* req)
         char buf[512]; size_t off=0;
         off += snprintf(buf+off,sizeof(buf)-off,"{\"open_blocking\":[");
         bool first=true;
-        for (int i=0;i<INPUT_ZONES_COUNT;i++){
-            if (blocking & (1u<<i)){
+        for (int i=0;i<zones_total;i++){
+            uint32_t bit = (1u<<i);
+            if (blocking & bit){
                 zone_cfg_t *c=&s_zone_cfg[i];
                 off += snprintf(buf+off,sizeof(buf)-off, "%s{\"id\":%d", first?"":",", i+1);
                 if (c->name[0]) off += snprintf(buf+off,sizeof(buf)-off, ",\"name\":\"%s\"", c->name);
@@ -4514,8 +4771,8 @@ static esp_err_t arm_post(httpd_req_t* req)
     uint32_t exit_ms = prof.exit_delay_ms;
     {
         uint32_t min_s = 0; bool found=false;
-        for (int i=0;i<INPUT_ZONES_COUNT;i++){
-            uint16_t bit = (1u<<i);
+        for (int i=0;i<zones_total;i++){
+            uint32_t bit = (1u<<i);
             if ( (eff_mask & bit) && (open_mask & bit) && s_zone_cfg[i].zone_delay && s_zone_cfg[i].zone_time>0 ){
                 if (!found || (uint32_t)s_zone_cfg[i].zone_time < min_s){ min_s = (uint32_t)s_zone_cfg[i].zone_time; }
                 found = true;

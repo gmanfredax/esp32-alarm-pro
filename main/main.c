@@ -1374,6 +1374,53 @@ static void nvs_init_safe(void)
     }
 }
 
+static uint32_t compose_zone_mask(uint16_t master_gpio, uint16_t zones_total)
+{
+    if (zones_total > ALARM_MAX_ZONES) {
+        zones_total = ALARM_MAX_ZONES;
+    }
+
+    uint32_t mask = 0;
+    uint16_t master_limit = INPUT_ZONES_COUNT;
+    if (master_limit > zones_total) {
+        master_limit = zones_total;
+    }
+
+    for (uint16_t i = 1; i <= master_limit; ++i) {
+        if (inputs_zone_bit(master_gpio, i)) {
+            mask |= (1u << (i - 1));
+        }
+    }
+
+    if (zones_total <= INPUT_ZONES_COUNT) {
+        uint32_t keep = scenes_mask_all(zones_total);
+        mask &= keep;
+        return mask;
+    }
+
+    roster_node_inputs_t nodes[32];
+    size_t node_count = roster_collect_nodes(nodes, sizeof(nodes) / sizeof(nodes[0]));
+    uint16_t offset = INPUT_ZONES_COUNT;
+    if (offset > zones_total) {
+        offset = zones_total;
+    }
+
+    for (size_t idx = 0; idx < node_count && offset < zones_total && offset < ALARM_MAX_ZONES; ++idx) {
+        const roster_node_inputs_t *node = &nodes[idx];
+        const uint8_t inputs = node->inputs_count;
+        for (uint8_t bit = 0; bit < inputs && offset < zones_total && offset < ALARM_MAX_ZONES; ++bit, ++offset) {
+            bool active = node->inputs_valid && ((node->inputs_bitmap & (1u << bit)) != 0u);
+            if (active) {
+                mask |= (1u << offset);
+            }
+        }
+    }
+
+    uint32_t keep = scenes_mask_all(zones_total);
+    mask &= keep;
+    return mask;
+}
+
 // static void reset_buttons_init(void)
 // {
 //     gpio_reset_pin(PIN_HW_RESET_BTN_A);
@@ -1432,7 +1479,7 @@ static void system_main_task(void *arg)
 // [debug disattivato] loop dump link rimosso per build pulita
 
     ESP_ERROR_CHECK(inputs_init());
-    ESP_ERROR_CHECK(scenes_init(INPUT_ZONES_COUNT));
+    ESP_ERROR_CHECK(scenes_init(ALARM_MAX_ZONES));
     ESP_ERROR_CHECK(outputs_init());
     ESP_ERROR_CHECK(pn532_init());
     ESP_ERROR_CHECK(ds18b20_init());
@@ -1480,14 +1527,16 @@ static void system_main_task(void *arg)
     mqtt_publish_scenes();
 
     uint16_t initial_gpio = 0;
+    uint16_t last_zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint32_t last_mask = 0;
+    bool first_cycle = true;
     if (inputs_read_all(&initial_gpio) == ESP_OK) {
-        uint16_t init_mask = 0;
-        for (int i = 1; i <= INPUT_ZONES_COUNT; ++i) {
-            if (inputs_zone_bit(initial_gpio, i)) {
-                init_mask |= (1u << (i - 1));
-            }
-        }
+        uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
+        uint32_t init_mask = compose_zone_mask(initial_gpio, zones_total);
         mqtt_publish_zones(init_mask);
+        last_mask = init_mask;
+        last_zones_total = zones_total;
+        first_cycle = false;
     }
 
     // Avvia web server (serve i file SPIFFS)
@@ -1511,26 +1560,21 @@ static void system_main_task(void *arg)
              (unsigned)CONFIG_ESP_MAIN_TASK_STACK_SIZE);
 
     // Main loop: leggi ingressi e alimenta la logica d’allarme
-    uint16_t last_mask = 0xFFFFu;
-    bool first_cycle = true;
-
+    
     while (true) {
         uint16_t ab = 0;
         inputs_read_all(&ab);
 
-        uint16_t zmask = 0;
-        for (int i = 1; i <= INPUT_ZONES_COUNT; i++) {
-            if (inputs_zone_bit(ab, i)) {
-                zmask |= (1u << (i - 1));
-            }
-        }
+        uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
+        uint32_t zmask = compose_zone_mask(ab, zones_total);
 
         // esempio: tamper su bit (8+4) come da tuo codice
         bool tamper = inputs_tamper(ab);
 
-        if (first_cycle || zmask != last_mask) {
+        if (first_cycle || zmask != last_mask || zones_total != last_zones_total) {
             mqtt_publish_zones(zmask);
             last_mask = zmask;
+            last_zones_total = zones_total;
             first_cycle = false;
         }
 

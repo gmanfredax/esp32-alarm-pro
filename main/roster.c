@@ -1,7 +1,9 @@
 #include "roster.h"
+#include "alarm_core.h"
 
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -534,4 +536,61 @@ bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state)
         out_state->state = ROSTER_NODE_STATE_OFFLINE;
     }
     return ok;
+}
+
+size_t roster_collect_nodes(roster_node_inputs_t *out_nodes, size_t max_nodes)
+{
+    if (!out_nodes || max_nodes == 0) {
+        return 0;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+
+    size_t count = 0;
+    for (uint32_t i = 1; i < ROSTER_MAX_NODES && count < max_nodes; ++i) {
+        const roster_node_t *node = &s_nodes[i];
+        if (!node->used) {
+            continue;
+        }
+        roster_node_inputs_t *dst = &out_nodes[count++];
+        dst->node_id = node->node_id;
+        dst->inputs_count = node->inputs_count;
+        dst->outputs_count = node->outputs_count;
+        dst->inputs_valid = node->inputs_valid;
+        dst->inputs_bitmap = node->inputs_bitmap;
+        dst->state = node->state;
+    }
+
+    xSemaphoreGive(s_roster_lock);
+    return count;
+}
+
+uint16_t roster_total_inputs(void)
+{
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    uint32_t total = 0;
+    for (uint32_t i = 1; i < ROSTER_MAX_NODES; ++i) {
+        const roster_node_t *node = &s_nodes[i];
+        if (!node->used) {
+            continue;
+        }
+        total += node->inputs_count;
+    }
+    xSemaphoreGive(s_roster_lock);
+    if (total > UINT16_MAX) {
+        total = UINT16_MAX;
+    }
+    return (uint16_t)total;
+}
+
+uint16_t roster_effective_zones(uint8_t master_inputs)
+{
+    uint32_t total = (uint32_t)master_inputs;
+    total += (uint32_t)roster_total_inputs();
+    if (total > ALARM_MAX_ZONES) {
+        total = ALARM_MAX_ZONES;
+    }
+    return (uint16_t)total;
 }

@@ -19,21 +19,21 @@ static profile_t     profiles[7];
 static bool          s_alarm_from_tamper = false;
 
 // Bypass dinamico valido per la singola sessione ARM (auto-exclude)
-static uint16_t      s_bypass_mask = 0;
+static uint32_t      s_bypass_mask = 0;
 
 // Opzioni per-zona (ritardi, auto_esclude)
-static zone_opts_t   s_zone_opts[16];  // fino a 16 zone supportate
+static zone_opts_t   s_zone_opts[ALARM_MAX_ZONES];
 
 // Finestra di uscita (exit delay)
 static uint64_t      s_exit_deadline_us = 0;
 // "Ritardo unico": se armo con una o più zone a ritardo già aperte,
 // usiamo il loro tempo come exit e, alla scadenza, se restano aperte -> ALLARME.
-static uint16_t      s_exit_guard_mask  = 0;   // zone aperte al momento dell'ARM con ritardo ingresso>0
+static uint32_t      s_exit_guard_mask  = 0;   // zone aperte al momento dell'ARM con ritardo ingresso>0
 static bool          s_exit_unified     = false;
 
 // Gestione ritardo di ingresso (entry delay)
 static bool          s_entry_pending     = false;
-static uint16_t      s_entry_zmask       = 0;
+static uint32_t      s_entry_zmask       = 0;
 static uint64_t      s_entry_deadline_us = 0;
 static int           s_entry_zone        = -1;   // indice 0-based di una zona coinvolta
 
@@ -51,7 +51,7 @@ void alarm_init(void)
     s_alarm_from_tamper = false;
     memset(s_zone_opts, 0, sizeof(s_zone_opts));
 
-    const uint16_t ALL = scenes_mask_all(INPUT_ZONES_COUNT);
+    const uint32_t ALL = scenes_mask_all(ALARM_MAX_ZONES);
 
     // Profili di default (12 zone): AWAY = tutte, HOME/NIGHT = perimetrali, CUSTOM = nessuna
     // profiles[ALARM_ARMED_AWAY]  = (profile_t){ .active_mask = 0x0FFF, .entry_delay_ms = 30000, .exit_delay_ms = 30000 };
@@ -64,9 +64,9 @@ void alarm_init(void)
     profiles[ALARM_ARMED_NIGHT] = (profile_t){ .active_mask = ALL,    .entry_delay_ms =  1500, .exit_delay_ms =  1500 };
     profiles[ALARM_ARMED_CUSTOM]= (profile_t){ .active_mask = ALL,    .entry_delay_ms =     0, .exit_delay_ms =     0 };
 
-    profiles[ALARM_DISARMED]    = (profile_t){ .active_mask = 0x0000, .entry_delay_ms =     0, .exit_delay_ms =     0 };
-    profiles[ALARM_ALARM]       = (profile_t){ .active_mask = 0x0000, .entry_delay_ms =     0, .exit_delay_ms =     0 };
-    profiles[ALARM_MAINTENANCE] = (profile_t){ .active_mask = 0x0000, .entry_delay_ms =     0, .exit_delay_ms =     0 };
+    profiles[ALARM_DISARMED]    = (profile_t){ .active_mask = 0x00000000u, .entry_delay_ms =     0, .exit_delay_ms =     0 };
+    profiles[ALARM_ALARM]       = (profile_t){ .active_mask = 0x00000000u, .entry_delay_ms =     0, .exit_delay_ms =     0 };
+    profiles[ALARM_MAINTENANCE] = (profile_t){ .active_mask = 0x00000000u, .entry_delay_ms =     0, .exit_delay_ms =     0 };
 
     outputs_led_state(false);
     outputs_led_maint(false);
@@ -108,13 +108,13 @@ bool alarm_entry_pending(int* zone_1_based, uint32_t* remain_ms){
 void alarm_set_zone_opts(int zone_index_1_based, const zone_opts_t* opts)
 {
     int i = zone_index_1_based - 1;
-    if (i < 0 || i >= 16 || !opts) return;
+    if (i < 0 || i >= ALARM_MAX_ZONES || !opts) return;
     s_zone_opts[i] = *opts;
 }
 
-void alarm_set_bypass_mask(uint16_t mask) { s_bypass_mask = mask; }
+void alarm_set_bypass_mask(uint32_t mask) { s_bypass_mask = mask; }
 
-uint16_t alarm_get_bypass_mask(void) { return s_bypass_mask; }
+uint32_t alarm_get_bypass_mask(void) { return s_bypass_mask; }
 
 void alarm_begin_exit(uint32_t duration_ms)
 {
@@ -127,7 +127,7 @@ void alarm_begin_exit(uint32_t duration_ms)
     ESP_LOGI(TAG, "Exit delay avviato: %u ms", (unsigned)duration_ms);
 }
 
-void alarm_set_exit_guard(uint16_t mask, bool use_unified)
+void alarm_set_exit_guard(uint32_t mask, bool use_unified)
 {
     s_exit_guard_mask = mask;
     s_exit_unified    = use_unified && (mask != 0);
@@ -199,10 +199,10 @@ void alarm_set_led_maint(bool on)  { outputs_led_maint(on); }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Ciclo logico
-//  - zmask: bitfield Z1..Z16 -> bit0..bit15
+//  - zmask: bitfield Z1..Z32 -> bit0..bit31
 //  - tamper: TRUE se tamper attivo
 // ─────────────────────────────────────────────────────────────────────────────
-void alarm_tick(uint16_t zmask, bool tamper)
+void alarm_tick(uint32_t zmask, bool tamper)
 {
     // Tamper ha priorità (eccetto manutenzione)
     if (tamper) {
@@ -222,7 +222,7 @@ void alarm_tick(uint16_t zmask, bool tamper)
     if (s_state == ALARM_ARMED_HOME || s_state == ALARM_ARMED_AWAY || s_state == ALARM_ARMED_NIGHT || s_state == ALARM_ARMED_CUSTOM)
     {
         const profile_t p = profiles[s_state];
-        uint16_t eff_mask = p.active_mask & scenes_get_active_mask(); // scenari
+        uint32_t eff_mask = p.active_mask & scenes_get_active_mask(); // scenari
         eff_mask &= ~s_bypass_mask;                                   // bypass sessione
 
         const uint64_t now = esp_timer_get_time();
@@ -273,13 +273,13 @@ void alarm_tick(uint16_t zmask, bool tamper)
         }
 
         // Trigger effettivi sulle zone attive (profilo + scenari − bypass)
-        uint16_t trig = zmask & eff_mask;
+        uint32_t trig = zmask & eff_mask;
         if (!trig) return;
 
         // Durante exit window: ignora i trigger di sole zone marcate exit_delay
         if (in_exit) {
-            uint16_t masked = 0;
-            for (int z = 0; z < 16; ++z) {
+            uint32_t masked = 0;
+            for (int z = 0; z < ALARM_MAX_ZONES; ++z) {
                 if (trig & (1u << z)) {
                     if (s_zone_opts[z].exit_delay || (s_exit_unified && (s_exit_guard_mask & (1u << z)))) masked |= (1u << z);
                 }
@@ -291,7 +291,7 @@ void alarm_tick(uint16_t zmask, bool tamper)
 
         // Se esiste una zona senza entry_delay -> ALARM immediato
         bool any_instant = false;
-        for (int z = 0; z < 16; ++z) {
+        for (int z = 0; z < ALARM_MAX_ZONES; ++z) {
             if (trig & (1u << z)) {
                 if (!s_zone_opts[z].entry_delay) {
                     any_instant = true;
@@ -314,7 +314,7 @@ void alarm_tick(uint16_t zmask, bool tamper)
         // Regola richiesta: usare il tempo MINIMO tra quelle violate (non estendere).
         uint32_t min_ms = 0xFFFFFFFFu;
         int      min_z  = -1;
-        for (int z = 0; z < 16; ++z) {
+        for (int z = 0; z < ALARM_MAX_ZONES; ++z) {
             if (trig & (1u << z)) {
                 const uint32_t ms = s_zone_opts[z].entry_time_ms;
                 if (ms < min_ms) { min_ms = ms; min_z = z; }

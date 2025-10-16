@@ -25,8 +25,10 @@ typedef enum {
 //  - active_mask: bitfield zone attive (bit0 → Z1, bit1 → Z2, ...)
 //  - *_delay_ms:  ritardi globali (se vuoi usarli come default di profilo)
 // ─────────────────────────────────────────────────────────────────────────────
+#define ALARM_MAX_ZONES 32
+
 typedef struct {
-    uint16_t active_mask;     // bit0..bit15 → Z1..Z16
+    uint32_t active_mask;     // bit0..bit15 → Z1..Z32
     uint32_t entry_delay_ms;  // opzionale fallback (non necessario se usi per-zona)
     uint32_t exit_delay_ms;   // opzionale fallback (non necessario se usi per-zona)
 } profile_t;
@@ -60,12 +62,12 @@ profile_t      alarm_get_profile(alarm_state_t st);
 
 // Config per-zona / bypass / finestra di uscita (chiamate tipicamente da web_server.c)
 void           alarm_set_zone_opts(int zone_index_1_based, const zone_opts_t* opts);
-void           alarm_set_bypass_mask(uint16_t mask);     // bitfield zone bypassate in questa sessione
-uint16_t       alarm_get_bypass_mask(void);
+void           alarm_set_bypass_mask(uint32_t mask);     // bitfield zone bypassate in questa sessione
+uint32_t       alarm_get_bypass_mask(void);
 void           alarm_begin_exit(uint32_t duration_ms);   // imposta exit-window (ms) a partire da “ora”
 
 // Tick di valutazione (chiamalo ciclicamente; zmask: bit0→Z1,...; tamper: true se attivo)
-void           alarm_tick(uint16_t zmask, bool tamper);
+void           alarm_tick(uint32_t zmask, bool tamper);
 
 // Comandi
 void           alarm_arm_home(void);

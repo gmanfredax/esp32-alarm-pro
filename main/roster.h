@@ -67,6 +67,15 @@ typedef struct {
     uint8_t outputs_pwm;
 } roster_io_state_t;
 
+typedef struct {
+    uint8_t node_id;
+    uint8_t inputs_count;
+    uint8_t outputs_count;
+    bool inputs_valid;
+    uint32_t inputs_bitmap;
+    roster_node_state_t state;
+} roster_node_inputs_t;
+
 void roster_init(uint8_t master_inputs, uint8_t master_outputs, uint16_t master_caps);
 esp_err_t roster_reset(void);
 
@@ -89,6 +98,10 @@ esp_err_t roster_note_outputs(uint8_t node_id,
                               uint8_t pwm_level,
                               bool known);
 bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state);
+
+size_t roster_collect_nodes(roster_node_inputs_t *out_nodes, size_t max_nodes);
+uint16_t roster_total_inputs(void);
+uint16_t roster_effective_zones(uint8_t master_inputs);
 
 void roster_stats(size_t *out_total, size_t *out_online);
 void roster_to_json(cJSON *out_array);
