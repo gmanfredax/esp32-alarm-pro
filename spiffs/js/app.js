@@ -457,6 +457,27 @@ async function refreshZones(){
   }
 }
 
+function renderBoardSelectField(selectedId){
+  const boards = boardsCache.list.length
+    ? [...boardsCache.list]
+    : [{ node_id: 0, label: 'Centrale', state: 'ONLINE', kind: 'master', inputs_count: 0 }];
+  boards.sort((a, b) => sortBoardIds(Number(a?.node_id) || 0, Number(b?.node_id) || 0));
+  const options = boards.map((board) => {
+    const rawId = Number(board?.node_id);
+    const boardId = Number.isFinite(rawId) ? rawId : 0;
+    const selected = boardId === selectedId ? ' selected' : '';
+    const label = escapeHtml(boardLabel(board, boardId));
+    return `<option value="${boardId}"${selected}>${label}</option>`;
+  }).join('');
+  return `
+    <label class="field">
+      <span>Scheda</span>
+      <select data-field="board">
+        ${options}
+      </select>
+    </label>`;
+}
+
 function renderZoneConfigCard(zone){
   const id = Number(zone?.id);
   const boardId = Number(zone?.board);
@@ -466,12 +487,14 @@ function renderZoneConfigCard(zone){
   const timeValue = Number(zone?.zone_time);
   const safeTime = Number.isFinite(timeValue) && timeValue > 0 ? timeValue : 0;
   const badges = buildZoneBadge(zone);
+  const boardField = renderBoardSelectField(Number.isFinite(boardId) ? boardId : 0);
   return `
     <div class="zone-config-card" data-zone-id="${Number.isFinite(id) ? id : ''}" data-board-id="${Number.isFinite(boardId) ? boardId : 0}">
       <div class="zone-config-card-head">
         <strong>Z${Number.isFinite(id) ? id : '?'}</strong>
         ${badges ? `<span class="badges">${badges}</span>` : ''}
       </div>
+      ${boardField}
       <label class="field"><span>Nome</span><input type="text" data-field="name" value="${nameValue}" placeholder="Z${Number.isFinite(id) ? id : ''}"></label>
       <div class="zone-config-options">
         <label class="chk compact"><input type="checkbox" data-field="zone_delay" ${delayChecked}> Ritardo ingresso/uscita</label>
@@ -559,6 +582,18 @@ async function openZonesConfig(){
     $('#zonesCfgClose', modal)?.addEventListener('click', closeModal);
     $('#zonesCfgCancel', modal)?.addEventListener('click', closeModal);
 
+    const zoneCards = $$('.zone-config-card', modal);
+    zoneCards.forEach((card) => {
+      const select = $('[data-field="board"]', card);
+      if (!select) return;
+      const initial = Number(card.dataset.boardId);
+      select.value = Number.isFinite(initial) ? String(initial) : '0';
+      select.addEventListener('change', () => {
+        const value = Number.parseInt(select.value, 10);
+        card.dataset.boardId = Number.isFinite(value) ? String(value) : '0';
+      });
+    });
+
     $('#zonesCfgSave', modal)?.addEventListener('click', async () => {
       const cards = $$('.zone-config-card', modal);
       const itemsPayload = cards.map((card) => {
@@ -568,14 +603,17 @@ async function openZonesConfig(){
         const delayInput = $('[data-field="zone_delay"]', card);
         const timeInput = $('[data-field="zone_time"]', card);
         const autoInput = $('[data-field="auto_exclude"]', card);
-        const boardId = Number(card.dataset.boardId);
+        // const boardId = Number(card.dataset.boardId);
+        const boardSelect = $('[data-field="board"]', card);
+        const boardValue = Number.parseInt(boardSelect?.value ?? '', 10);
         return {
           id,
           name: nameInput?.value?.trim() || '',
           zone_delay: !!(delayInput && delayInput.checked),
           zone_time: Math.max(0, Number.parseInt(timeInput?.value ?? '0', 10) || 0),
           auto_exclude: !!(autoInput && autoInput.checked),
-          board: Number.isFinite(boardId) ? boardId : 0
+          // board: Number.isFinite(boardId) ? boardId : 0
+          board: Number.isFinite(boardValue) ? boardValue : 0
         };
       }).filter(Boolean);
 
