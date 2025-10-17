@@ -129,6 +129,7 @@
     error: "",
     lastScan: null,
   };
+  const CAN_MAX_NODE_ID = 127;
 
   const canTestBroadcastState = {
     sending: false,
@@ -257,6 +258,32 @@
     return "Nodo CAN";
   }
 
+  function formatNodeStateLabel(node){
+    const raw = (node?.state || "").toString().toUpperCase();
+    switch (raw) {
+      case "ONLINE": return "Online";
+      case "OFFLINE": return "Offline";
+      case "PREOP":
+      case "PRE-OP": return "Pre-operativa";
+      case "UNKNOWN":
+      case "": return "Sconosciuto";
+      default: return raw;
+    }
+  }
+
+  function formatUid(value){
+    if (value == null) return "—";
+    const cleaned = String(value).replace(/[^0-9a-fA-F]/g, "").toUpperCase();
+    if (!cleaned) return "—";
+    return cleaned.replace(/(.{2})/g, "$1 ").trim();
+  }
+
+  function formatNodeLastSeen(node){
+    const raw = Number(node?.last_seen_ms ?? node?.last_seen);
+    if (!Number.isFinite(raw) || raw <= 0) return "—";
+    return formatDateTime(raw);
+  }
+
   function renderExpansionsSection(){
     const nodes = getExpansionItems();
     const list = $("#adminExpansionList");
@@ -265,14 +292,19 @@
         if (!node) return "";
         const nodeId = Number(node.node_id ?? -1);
         const title = escapeHtml(nodeTitle(node));
+        const stateLabel = formatNodeStateLabel(node);
+        const uidDisplay = formatUid(node?.uid);
+        const lastSeen = formatNodeLastSeen(node);
         const metaParts = [];
         if (nodeId >= 0) metaParts.push(`ID ${nodeId}`);
+        if (stateLabel) metaParts.push(`Stato: ${stateLabel}`);
         if (node.kind) metaParts.push(String(node.kind));
-        if (node.state) metaParts.push(String(node.state));
         const ioParts = [];
         if (node.inputs_count != null) ioParts.push(`${node.inputs_count} ingressi`);
         if (node.outputs_count != null) ioParts.push(`${node.outputs_count} uscite`);
         if (ioParts.length) metaParts.push(ioParts.join(' · '));
+        if (uidDisplay !== '—') metaParts.push(`UID ${uidDisplay}`);
+        if (lastSeen !== '—') metaParts.push(`Ultimo contatto: ${lastSeen}`);
         const meta = metaParts.filter(Boolean).map((part)=>escapeHtml(String(part))).join(' · ');
         const actions = nodeId === 0
           ? '<span class="muted">Master</span>'
@@ -432,17 +464,41 @@
       return;
     }
     const title = escapeHtml(nodeTitle(node));
+    const stateLabel = escapeHtml(formatNodeStateLabel(node));
+    const uidDisplay = escapeHtml(formatUid(node?.uid));
+    const lastSeen = escapeHtml(formatNodeLastSeen(node));
+    const inputsCount = Number.isFinite(Number(node?.inputs_count)) ? Number(node.inputs_count) : "—";
+    const outputsCount = Number.isFinite(Number(node?.outputs_count)) ? Number(node.outputs_count) : "—";
+    const assignDefault = nodeId > 0 ? nodeId : "";
     modal(`
       <div class="card-head row" style="justify-content:space-between;align-items:center">
         <h3>Gestisci nodo CAN</h3>
         <button class="btn" id="mClose">Chiudi</button>
       </div>
       <div class="form" style="padding-bottom:.5rem">
-        <p class="muted">Seleziona l'azione da eseguire su <strong>${title}</strong> (ID ${nodeId}).</p>
-        <div class="row" style="gap:.5rem;flex-wrap:wrap">
+        <p class="muted">Dettagli per <strong>${title}</strong>.</p>
+        <div class="meta-grid" style="display:grid;grid-template-columns:160px 1fr;gap:.35rem .75rem;margin-bottom:1rem;">
+          <span class="muted">ID nodo</span><span>${escapeHtml(String(nodeId))}</span>
+          <span class="muted">UID</span><span>${uidDisplay}</span>
+          <span class="muted">Stato</span><span>${stateLabel}</span>
+          <span class="muted">Ingressi</span><span>${escapeHtml(String(inputsCount))}</span>
+          <span class="muted">Uscite</span><span>${escapeHtml(String(outputsCount))}</span>
+          <span class="muted">Ultimo contatto</span><span>${lastSeen}</span>
+        </div>
+        <div class="row" style="gap:.5rem;flex-wrap:wrap;margin-bottom:1rem;">
           <button class="btn outline" type="button" data-exp-action="offline" data-node-id="${nodeId}">Segna offline</button>
           <button class="btn btn-danger" type="button" data-exp-action="forget" data-node-id="${nodeId}">Dimentica nodo</button>
         </div>
+        <form id="expAssignForm" class="form" style="border-top:1px solid var(--border);padding-top:1rem;margin-top:1rem;">
+          <div class="row" style="gap:1rem;flex-wrap:wrap;align-items:flex-end;">
+            <label class="field" style="min-width:160px;max-width:220px;">
+              <span>Nuovo ID nodo</span>
+              <input id="expAssignInput" type="number" min="1" max="${CAN_MAX_NODE_ID}" value="${assignDefault}" required />
+            </label>
+            <button class="btn primary" type="submit">Riassegna ID</button>
+          </div>
+          <p class="muted small" style="margin-top:.4rem;">Assegna questo nodo a un ID specifico, utile quando sostituisci una scheda mantenendo la configurazione.</p>
+        </form>
       </div>
     `);
     $("#mClose")?.addEventListener("click", () => closeModal());
@@ -454,6 +510,24 @@
         await handleExpansionAction(id, mode);
       });
     });
+    const assignForm = $("#expAssignForm");
+    if (assignForm){
+      const input = assignForm.querySelector("#expAssignInput");
+      const submitBtn = assignForm.querySelector('button[type="submit"]');
+      assignForm.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const newId = Number(input?.value);
+        if (!Number.isFinite(newId) || newId <= 0 || newId > CAN_MAX_NODE_ID){
+          toast(`Inserisci un ID tra 1 e ${CAN_MAX_NODE_ID}`, false);
+          return;
+        }
+        if (submitBtn) submitBtn.disabled = true;
+        await assignExpansionNode(nodeId, newId);
+        if (submitBtn && document.body.contains(submitBtn)) {
+          submitBtn.disabled = false;
+        }
+      });
+    }
   }
 
   async function handleExpansionAction(nodeId, mode){
@@ -473,6 +547,43 @@
     } catch(err){
       expansionsState.loading = false;
       const message = err?.message || "Operazione CAN fallita";
+      expansionsState.error = message;
+      renderExpansionsSection();
+      toast(`Nodo CAN: ${message}`, false);
+    }
+  }
+
+  async function assignExpansionNode(nodeId, newId){
+    if (!Number.isFinite(nodeId) || nodeId <= 0){
+      toast("Operazione non valida", false);
+      return;
+    }
+    if (!Number.isFinite(newId) || newId <= 0 || newId > CAN_MAX_NODE_ID){
+      toast(`ID valido tra 1 e ${CAN_MAX_NODE_ID}`, false);
+      return;
+    }
+    expansionsState.loading = true;
+    expansionsState.error = "";
+    renderExpansionsSection();
+    try {
+      const resp = await apiPost(`/api/can/node/${nodeId}/assign`, { new_id: newId });
+      const assignedId = Number.isFinite(Number(resp?.node_id)) ? Number(resp.node_id) : newId;
+      toast(`Nodo CAN assegnato all'ID ${assignedId}`);
+      closeModal();
+      await loadExpansionNodes();
+    } catch(err){
+      let message = err?.message || "Operazione CAN fallita";
+      if (typeof message === "string"){
+        const normalized = message.trim().toLowerCase();
+        if (normalized === "uid"){
+          message = "UID non disponibile. Accendi la scheda o attendi che invii le informazioni.";
+        } else if (normalized === "busy"){
+          message = "ID già assegnato ad un'altra scheda. Dimentica o riassegna prima quel nodo.";
+        } else if (normalized === "can"){
+          message = "Errore CAN durante l'invio del comando.";
+        }
+      }
+      expansionsState.loading = false;
       expansionsState.error = message;
       renderExpansionsSection();
       toast(`Nodo CAN: ${message}`, false);

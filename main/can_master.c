@@ -644,6 +644,32 @@ esp_err_t can_master_send_raw(uint32_t cob_id, const void *payload, uint8_t len)
     }
 
     err = twai_transmit(&msg, pdMS_TO_TICKS(50));
+    if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG,
+                 "twai_transmit 0x%03" PRIx32 " failed (invalid state), attempting recovery",
+                 cob_id & 0x7FFu);
+        esp_err_t restart_err = twai_start();
+        if (restart_err != ESP_OK) {
+            (void)twai_stop();
+            (void)twai_driver_uninstall();
+            s_driver_started = false;
+            if (can_master_driver_start_internal() == ESP_OK) {
+                err = twai_transmit(&msg, pdMS_TO_TICKS(50));
+            } else {
+                err = restart_err;
+            }
+        } else {
+            err = twai_transmit(&msg, pdMS_TO_TICKS(50));
+            if (err == ESP_ERR_INVALID_STATE) {
+                (void)twai_stop();
+                (void)twai_driver_uninstall();
+                s_driver_started = false;
+                if (can_master_driver_start_internal() == ESP_OK) {
+                    err = twai_transmit(&msg, pdMS_TO_TICKS(50));
+                }
+            }
+        }
+    }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "twai_transmit 0x%03" PRIx32 " failed: %s",
                  cob_id & 0x7FFu,
@@ -660,6 +686,21 @@ esp_err_t can_master_send_test_toggle(bool enable)
         .reserved = {0},
     };
     return can_master_send_raw(CAN_PROTO_ID_BROADCAST_TEST, &payload, sizeof(payload));
+}
+
+esp_err_t can_master_assign_address(uint8_t node_id, const uint8_t uid[CAN_PROTO_UID_LENGTH])
+{
+    if (!uid) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    can_proto_addr_assign_t payload = {
+        .node_id = node_id,
+    };
+    memcpy(payload.uid, uid, sizeof(payload.uid));
+    return can_master_send_raw(CAN_PROTO_ID_BROADCAST_ADDR_ASSIGN,
+                               &payload,
+                               sizeof(payload));
 }
 
 esp_err_t can_master_set_node_outputs(uint8_t node_id,

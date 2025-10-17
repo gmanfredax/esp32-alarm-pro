@@ -60,6 +60,7 @@
 #include "mqtt_client.h"
 #include "app_mqtt.h"
 #include "can_master.h"
+#include "can_bus_protocol.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -602,6 +603,31 @@ static bool parse_can_node_outputs_uri(const char *uri, uint8_t *out_node)
     return true;
 }
 
+static bool parse_can_node_assign_uri(const char *uri, uint8_t *out_node)
+{
+    const char *prefix = "/api/can/node/";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(uri, prefix, prefix_len) != 0) {
+        return false;
+    }
+    const char *p = uri + prefix_len;
+    if (!isdigit((unsigned char)*p)) {
+        return false;
+    }
+    char *end = NULL;
+    long node = strtol(p, &end, 10);
+    if (end == p || node < 0 || node > 255) {
+        return false;
+    }
+    if (strcmp(end, "/assign") != 0) {
+        return false;
+    }
+    if (out_node) {
+        *out_node = (uint8_t)node;
+    }
+    return true;
+}
+
 static bool parse_can_nodes_uri(const char *uri, uint8_t *out_node)
 {
     const char *prefix = "/api/can/nodes/";
@@ -824,6 +850,18 @@ static esp_err_t api_can_node_delete(httpd_req_t *req)
             free(query);
         }
     }
+    roster_node_t snapshot = {0};
+    if (hard) {
+        bool have_uid = roster_get_node_snapshot(node_id, &snapshot) && snapshot.info_valid;
+        if (have_uid) {
+            esp_err_t can_err = can_master_assign_address(0, snapshot.uid);
+            if (can_err != ESP_OK) {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "can");
+                return ESP_FAIL;
+            }
+        }
+    }
+
     esp_err_t err = hard ? roster_forget_node(node_id) : roster_mark_offline(node_id, 0);
     if (err == ESP_ERR_NOT_FOUND) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
@@ -1001,6 +1039,106 @@ static esp_err_t api_can_node_outputs_post(httpd_req_t *req)
 }
 
 static esp_err_t api_can_node_outputs_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+
+static esp_err_t api_can_node_assign_post(httpd_req_t *req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    uint8_t current_id = 0;
+    if (!parse_can_node_assign_uri(req->uri, &current_id) || current_id == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
+        return ESP_FAIL;
+    }
+
+    cors_apply(req);
+
+    char body[128];
+    size_t body_len = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &body_len) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body");
+        return ESP_FAIL;
+    }
+
+    cJSON *json = cJSON_ParseWithLength(body, body_len);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json");
+        return ESP_FAIL;
+    }
+
+    int new_id = -1;
+    cJSON *jnew = cJSON_GetObjectItemCaseSensitive(json, "new_id");
+    if (cJSON_IsNumber(jnew)) {
+        new_id = (int)jnew->valuedouble;
+    } else if (cJSON_IsString(jnew) && jnew->valuestring) {
+        char *end = NULL;
+        long parsed = strtol(jnew->valuestring, &end, 10);
+        if (end && *end == '\0') {
+            new_id = (int)parsed;
+        }
+    }
+
+    if (new_id < 1 || new_id > CAN_MAX_NODE_ID) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "new_id");
+        return ESP_FAIL;
+    }
+
+    roster_node_t snapshot = {0};
+    if (!roster_get_node_snapshot(current_id, &snapshot) || !snapshot.used) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
+        return ESP_FAIL;
+    }
+    if (!snapshot.info_valid) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, 409, "uid");
+        return ESP_FAIL;
+    }
+
+    if (new_id != current_id) {
+        roster_node_t target_snapshot = {0};
+        if (roster_get_node_snapshot((uint8_t)new_id, &target_snapshot) && target_snapshot.used) {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, 409, "busy");
+            return ESP_FAIL;
+        }
+    }
+
+    esp_err_t assign_err = can_master_assign_address((uint8_t)new_id, snapshot.uid);
+    cJSON_Delete(json);
+    if (assign_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "can");
+        return ESP_FAIL;
+    }
+
+    if (new_id != current_id) {
+        esp_err_t move_err = roster_reassign_node_id(current_id, (uint8_t)new_id);
+        if (move_err != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "roster");
+            return ESP_FAIL;
+        }
+    }
+
+    cJSON *resp = roster_node_to_json((uint8_t)new_id);
+    if (!resp) {
+        resp = cJSON_CreateObject();
+        if (resp) {
+            cJSON_AddNumberToObject(resp, "node_id", new_id);
+        } else {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+            return ESP_FAIL;
+        }
+    }
+    return json_reply_cjson(req, resp);
+}
+
+static esp_err_t api_can_node_assign_options(httpd_req_t *req)
 {
     return cors_handle_options(req);
 }
@@ -3621,6 +3759,64 @@ static void audit_format_message(const audit_entry_t* ent, char* out, size_t cap
     }
 }
 
+static size_t json_escape_string(const char *src, char *dst, size_t dst_cap)
+{
+    if (!dst || dst_cap == 0) {
+        return 0;
+    }
+    size_t out = 0;
+    const char *input = src ? src : "";
+    const char hex[] = "0123456789ABCDEF";
+    while (*input) {
+        unsigned char c = (unsigned char)(*input++);
+        const char *esc = NULL;
+        switch (c) {
+            case '\"': esc = "\\\""; break;
+            case '\\': esc = "\\\\"; break;
+            case '\b': esc = "\\b"; break;
+            case '\f': esc = "\\f"; break;
+            case '\n': esc = "\\n"; break;
+            case '\r': esc = "\\r"; break;
+            case '\t': esc = "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    if (out + 6 >= dst_cap) {
+                        dst_cap = out + 1;
+                        break;
+                    }
+                    dst[out++] = '\\';
+                    dst[out++] = 'u';
+                    dst[out++] = '0';
+                    dst[out++] = '0';
+                    dst[out++] = hex[(c >> 4) & 0xF];
+                    dst[out++] = hex[c & 0xF];
+                    continue;
+                }
+                if (out + 1 >= dst_cap) {
+                    dst_cap = out + 1;
+                    break;
+                }
+                dst[out++] = (char)c;
+                continue;
+        }
+        if (esc) {
+            size_t len = strlen(esc);
+            if (out + len >= dst_cap) {
+                dst_cap = out + 1;
+                break;
+            }
+            memcpy(dst + out, esc, len);
+            out += len;
+        }
+    }
+    if (out >= dst_cap) {
+        dst[dst_cap - 1] = '\0';
+        return dst_cap - 1;
+    }
+    dst[out] = '\0';
+    return out;
+}
+
 static esp_err_t logs_get(httpd_req_t* req){
     if (!check_bearer(req)) {
         httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token");
@@ -3747,76 +3943,156 @@ static esp_err_t logs_get(httpd_req_t* req){
         returned = 0;
     }
 
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+    set_https_security_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    esp_err_t send_err = httpd_resp_sendstr_chunk(req, "{\"entries\":[");
+    if (send_err != ESP_OK) {
         free(entries_buf);
-        return ESP_ERR_NO_MEM;
+        return send_err;
     }
 
-    cJSON *entries = cJSON_CreateArray();
-    if (!entries) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        free(entries_buf);
-        return ESP_ERR_NO_MEM;
-    }
+    bool first = true;
 
     for (int j = match_count - 1; j >= start; --j) {
         int idx = match_indexes[j];
         audit_entry_t *ent = &entries_buf[idx];
         int64_t wall_ts = resolved_wall_ts[j];
 
-        cJSON *entry = cJSON_CreateObject();
-        if (!entry) {
-            cJSON_Delete(entries);
-            cJSON_Delete(root);
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-            free(entries_buf);
-            return ESP_ERR_NO_MEM;
-        }
-
         char message[160];
         audit_format_message(ent, message, sizeof(message));
 
+        char message_json[640];
+        char event_json[128];
+        char user_json[192];
+        char note_json[256];
+        json_escape_string(message, message_json, sizeof(message_json));
+        json_escape_string(ent->event, event_json, sizeof(event_json));
+        json_escape_string(ent->username, user_json, sizeof(user_json));
+        json_escape_string(ent->note, note_json, sizeof(note_json));
+
+        const bool otp_pending = strcmp(ent->note, "otp required") == 0;
+        const char *level = (ent->result > 0 || otp_pending) ? "INFO" : "WARN";
+
+        char iso[32] = {0};
         if (wall_ts > 0) {
-            double epoch_seconds = (double)wall_ts / 1000000.0;
-            cJSON_AddNumberToObject(entry, "ts", epoch_seconds);
-            cJSON_AddNumberToObject(entry, "ts_epoch", epoch_seconds);
-            cJSON_AddNumberToObject(entry, "ts_ms", epoch_seconds * 1000.0);
-            cJSON_AddNumberToObject(entry, "wall_ts_us", (double)wall_ts);
-            char iso[32];
-            if (logs_format_iso8601(wall_ts, iso, sizeof(iso))) {
-                cJSON_AddStringToObject(entry, "ts_iso", iso);
+            logs_format_iso8601(wall_ts, iso, sizeof(iso));
+        }
+
+        if (!first) {
+            send_err = httpd_resp_sendstr_chunk(req, ",");
+            if (send_err != ESP_OK) {
+                free(entries_buf);
+                return send_err;
             }
         }
 
-        cJSON_AddNumberToObject(entry, "ts_us", (double)ent->ts_us);
-        cJSON_AddNumberToObject(entry, "uptime_s", (double)ent->ts_us / 1000000.0);
-        cJSON_AddNumberToObject(entry, "result", ent->result);
-        cJSON_AddStringToObject(entry, "event", ent->event);
-        cJSON_AddStringToObject(entry, "user", ent->username);
-        cJSON_AddStringToObject(entry, "note", ent->note);
-        cJSON_AddStringToObject(entry, "message", message);
-        const bool otp_pending = ent && strcmp(ent->note, "otp required") == 0;
-        cJSON_AddStringToObject(entry, "level", (ent->result > 0 || otp_pending) ? "INFO" : "WARN");
-        cJSON_AddItemToArray(entries, entry);
+        char entry_buf[768];
+        int offset = 0;
+        if (offset < (int)sizeof(entry_buf)) {
+            entry_buf[offset++] = '{';
+        }
+        if (offset < (int)sizeof(entry_buf)) {
+            entry_buf[offset] = '\0';
+        } else {
+            entry_buf[sizeof(entry_buf) - 1] = '\0';
+        }
+
+        if (wall_ts > 0) {
+            double epoch_seconds = (double)wall_ts / 1000000.0;
+            offset += snprintf(entry_buf + offset,
+                               sizeof(entry_buf) - (size_t)offset,
+                               "\"ts\":%.6f,\"ts_epoch\":%.6f,\"ts_ms\":%.3f,\"wall_ts_us\":%.0f",
+                               epoch_seconds,
+                               epoch_seconds,
+                               epoch_seconds * 1000.0,
+                               (double)wall_ts);
+            if (iso[0] != '\0') {
+                offset += snprintf(entry_buf + offset,
+                                   sizeof(entry_buf) - (size_t)offset,
+                                   ",\"ts_iso\":\"%s\"",
+                                   iso);
+            }
+            offset += snprintf(entry_buf + offset,
+                               sizeof(entry_buf) - (size_t)offset,
+                               ",");
+        }
+        offset += snprintf(entry_buf + offset,
+                           sizeof(entry_buf) - (size_t)offset,
+                           "\"ts_us\":%.0f,\"uptime_s\":%.6f,\"result\":%d,"
+                           "\"event\":\"%s\",\"user\":\"%s\",\"note\":\"%s\","
+                           "\"message\":\"%s\",\"level\":\"%s\"}",
+                           (double)ent->ts_us,
+                           (double)ent->ts_us / 1000000.0,
+                           ent->result,
+                           event_json,
+                           user_json,
+                           note_json,
+                           message_json,
+                           level);
+        if (offset < 0 || offset >= (int)sizeof(entry_buf)) {
+            entry_buf[sizeof(entry_buf) - 1] = '\0';
+        }
+
+        send_err = httpd_resp_sendstr_chunk(req, entry_buf);
+        if (send_err != ESP_OK) {
+            free(entries_buf);
+            return send_err;
+        }
+        first = false;
     }
 
-    cJSON_AddItemToObject(root, "entries", entries);
-    cJSON_AddNumberToObject(root, "count", returned);
-    cJSON_AddNumberToObject(root, "total", match_count);
-    cJSON_AddNumberToObject(root, "limit", filter.limit);
-    if (filter.has_since) {
-        cJSON_AddNumberToObject(root, "since", (double)filter.since_us / 1000000.0);
+    char meta[256];
+    size_t used = 0;
+    int written = snprintf(meta + used, sizeof(meta) - used,
+                           "],\"count\":%d,\"total\":%d,\"limit\":%d",
+                           returned,
+                           match_count,
+                           filter.limit);
+    if (written < 0) {
+        written = 0;
     }
-    if (filter.has_until) {
-        cJSON_AddNumberToObject(root, "until", (double)filter.until_us / 1000000.0);
+    if ((size_t)written >= sizeof(meta) - used) {
+        used = sizeof(meta) - 1;
+    } else {
+        used += (size_t)written;
+    }
+    if (filter.has_since && used < sizeof(meta) - 1) {
+        double since = (double)filter.since_us / 1000000.0;
+        written = snprintf(meta + used, sizeof(meta) - used, ",\"since\":%.6f", since);
+        if (written < 0) written = 0;
+        if ((size_t)written >= sizeof(meta) - used) {
+            used = sizeof(meta) - 1;
+        } else {
+            used += (size_t)written;
+        }
+    }
+    if (filter.has_until && used < sizeof(meta) - 1) {
+        double until = (double)filter.until_us / 1000000.0;
+        written = snprintf(meta + used, sizeof(meta) - used, ",\"until\":%.6f", until);
+        if (written < 0) written = 0;
+        if ((size_t)written >= sizeof(meta) - used) {
+            used = sizeof(meta) - 1;
+        } else {
+            used += (size_t)written;
+        }
+    }
+    if (used < sizeof(meta) - 1) {
+        meta[used++] = '}';
+        meta[used] = '\0';
+    } else {
+        meta[sizeof(meta) - 2] = '}';
+        meta[sizeof(meta) - 1] = '\0';
+    }
+    send_err = httpd_resp_sendstr_chunk(req, meta);
+    if (send_err != ESP_OK) {
+        free(entries_buf);
+        return send_err;
     }
 
-    esp_err_t res = json_reply_cjson(req, root);
+    send_err = httpd_resp_sendstr_chunk(req, NULL);
     free(entries_buf);
-    return res;
+    return send_err;
 }
 
 static esp_err_t logs_clear_post(httpd_req_t* req){
@@ -4496,6 +4772,8 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/can/test/broadcast/off",    .method = HTTP_OPTIONS, .handler = api_can_test_broadcast_options },
     { .uri = "/api/can/node/*/outputs",   .method = HTTP_POST,    .handler = api_can_node_outputs_post },
     { .uri = "/api/can/node/*/outputs",   .method = HTTP_OPTIONS, .handler = api_can_node_outputs_options },
+    { .uri = "/api/can/node/*/assign",    .method = HTTP_POST,    .handler = api_can_node_assign_post },
+    { .uri = "/api/can/node/*/assign",    .method = HTTP_OPTIONS, .handler = api_can_node_assign_options },
     { .uri = "/api/can/node/*/identify", .method = HTTP_POST,    .handler = api_can_node_identify_post },
     { .uri = "/api/can/node/*/identify", .method = HTTP_OPTIONS, .handler = api_can_node_identify_options },
     { .uri = "/api/status",             .method = HTTP_GET,  .handler = status_get },
@@ -4873,7 +5151,6 @@ static esp_err_t user_post_pin(httpd_req_t* req)
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
-
 
     char body[WEB_MAX_BODY_LEN]; size_t blen = 0;
     if(read_body_to_buf(req, body, sizeof(body), &blen)!=ESP_OK) return httpd_resp_send_err(req, 400, "body"), ESP_FAIL;

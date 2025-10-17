@@ -4,10 +4,13 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "can_bus_protocol.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#define CAN_MAX_NODE_ID          (127u)
 
 /**
  * @brief Initialize CAN master subsystem.
@@ -43,6 +46,11 @@ esp_err_t can_master_set_node_outputs(uint8_t node_id,
  * @brief Transmit a raw CAN frame with the provided payload.
  */
 esp_err_t can_master_send_raw(uint32_t cob_id, const void *payload, uint8_t len);
+
+/**
+ * @brief Send an address assignment frame to the specified expansion node UID.
+ */
+esp_err_t can_master_assign_address(uint8_t node_id, const uint8_t uid[CAN_PROTO_UID_LENGTH]);
 
 #ifdef __cplusplus
 }

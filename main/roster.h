@@ -87,6 +87,7 @@ esp_err_t roster_set_identify(uint8_t node_id, bool active, bool *out_changed);
 bool roster_get_identify(uint8_t node_id, bool *out_active);
 bool roster_node_exists(uint8_t node_id);
 const roster_node_t *roster_get_node(uint8_t node_id);
+bool roster_get_node_snapshot(uint8_t node_id, roster_node_t *out_snapshot);
 esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uint8_t *out_node_id, bool *out_is_new);
 esp_err_t roster_note_inputs(uint8_t node_id,
                              uint32_t inputs_bitmap,
@@ -98,6 +99,7 @@ esp_err_t roster_note_outputs(uint8_t node_id,
                               uint8_t pwm_level,
                               bool known);
 bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state);
+esp_err_t roster_reassign_node_id(uint8_t current_id, uint8_t new_id);
 
 size_t roster_collect_nodes(roster_node_inputs_t *out_nodes, size_t max_nodes);
 uint16_t roster_total_inputs(void);

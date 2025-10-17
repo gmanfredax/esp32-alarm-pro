@@ -374,6 +374,82 @@ const roster_node_t *roster_get_node(uint8_t node_id)
     return &s_nodes[node_id];
 }
 
+bool roster_get_node_snapshot(uint8_t node_id, roster_node_t *out_snapshot)
+{
+    if (!out_snapshot || node_id >= ROSTER_MAX_NODES) {
+        return false;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    bool ok = (node && node->used);
+    if (ok) {
+        *out_snapshot = *node;
+    }
+    xSemaphoreGive(s_roster_lock);
+    return ok;
+}
+
+esp_err_t roster_reassign_node_id(uint8_t current_id, uint8_t new_id)
+{
+    if (current_id == 0 || new_id == 0 ||
+        current_id >= ROSTER_MAX_NODES || new_id >= ROSTER_MAX_NODES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (current_id == new_id) {
+        roster_node_t snapshot;
+        return roster_get_node_snapshot(current_id, &snapshot) ? ESP_OK : ESP_ERR_NOT_FOUND;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+
+    roster_node_t *src = node_slot(current_id);
+    roster_node_t *dst = node_slot(new_id);
+    if (!src || !src->used) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (!dst) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (dst->used) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    roster_node_t snapshot = *src;
+    memset(src, 0, sizeof(*src));
+    src->node_id = current_id;
+    src->used = false;
+
+    *dst = snapshot;
+    dst->node_id = new_id;
+    dst->used = true;
+    dst->state = ROSTER_NODE_STATE_PREOP;
+    dst->inputs_valid = false;
+    dst->outputs_valid = false;
+    dst->inputs_bitmap = 0;
+    dst->outputs_bitmap = 0;
+    dst->outputs_flags = 0;
+    dst->outputs_pwm = 0;
+    dst->change_counter = 0;
+    dst->node_state_flags = 0;
+    dst->identify_active = false;
+    dst->last_seen_ms = 0;
+
+    uid_map_clear(current_id);
+    uid_map_clear(new_id);
+    if (snapshot.info_valid) {
+        uid_map_set(new_id, snapshot.uid);
+    }
+
+    xSemaphoreGive(s_roster_lock);
+    return ESP_OK;
+}
+
 esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uint8_t *out_node_id, bool *out_is_new)
 {
     if (!uid || uid_len == 0 || uid_len > sizeof(((roster_node_t *)0)->uid) || !out_node_id) {
