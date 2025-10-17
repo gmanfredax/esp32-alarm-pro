@@ -12,6 +12,12 @@
 #define ROSTER_MAX_NODES 128u
 
 typedef struct {
+    bool used;
+    uint8_t node_id;
+    uint8_t uid[sizeof(((roster_node_t *)0)->uid)];
+} roster_uid_entry_t;
+
+typedef struct {
     char label[32];
     char kind[16];
     uint16_t caps;
@@ -30,6 +36,7 @@ static roster_master_info_t s_master = {
 };
 
 static roster_node_t s_nodes[ROSTER_MAX_NODES];
+static roster_uid_entry_t s_uid_map[ROSTER_MAX_NODES];
 static SemaphoreHandle_t s_roster_lock = NULL;
 
 static SemaphoreHandle_t ensure_lock(void)
@@ -38,6 +45,90 @@ static SemaphoreHandle_t ensure_lock(void)
         s_roster_lock = xSemaphoreCreateMutex();
     }
     return s_roster_lock;
+}
+
+static void uid_normalize(uint8_t *dst, size_t dst_len, const uint8_t *src, size_t src_len)
+{
+    if (!dst || dst_len == 0) {
+        return;
+    }
+    memset(dst, 0, dst_len);
+    if (!src || src_len == 0) {
+        return;
+    }
+    if (src_len > dst_len) {
+        src_len = dst_len;
+    }
+    memcpy(dst, src, src_len);
+}
+
+static bool uid_equals(const uint8_t *a, const uint8_t *b)
+{
+    if (!a || !b) {
+        return false;
+    }
+    return memcmp(a, b, sizeof(((roster_node_t *)0)->uid)) == 0;
+}
+
+static bool uid_map_lookup(const uint8_t *uid, uint8_t *out_node_id)
+{
+    if (!uid) {
+        return false;
+    }
+    for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
+        const roster_uid_entry_t *entry = &s_uid_map[i];
+        if (!entry->used) {
+            continue;
+        }
+        if (uid_equals(entry->uid, uid)) {
+            if (out_node_id) {
+                *out_node_id = entry->node_id;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void uid_map_set(uint8_t node_id, const uint8_t *uid)
+{
+    if (node_id == 0 || !uid) {
+        return;
+    }
+    for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
+        roster_uid_entry_t *entry = &s_uid_map[i];
+        if (entry->used && entry->node_id == node_id) {
+            memcpy(entry->uid, uid, sizeof(entry->uid));
+            return;
+        }
+    }
+    for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
+        roster_uid_entry_t *entry = &s_uid_map[i];
+        if (entry->used) {
+            continue;
+        }
+        entry->used = true;
+        entry->node_id = node_id;
+        memcpy(entry->uid, uid, sizeof(entry->uid));
+        return;
+    }
+}
+
+static void uid_map_clear(uint8_t node_id)
+{
+    if (node_id == 0) {
+        return;
+    }
+    for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
+        roster_uid_entry_t *entry = &s_uid_map[i];
+        if (!entry->used) {
+            continue;
+        }
+        if (entry->node_id == node_id) {
+            memset(entry, 0, sizeof(*entry));
+            return;
+        }
+    }
 }
 
 static const char *state_to_string(roster_node_state_t state)
@@ -83,6 +174,7 @@ void roster_init(uint8_t master_inputs, uint8_t master_outputs, uint16_t master_
     ensure_lock();
     xSemaphoreTake(s_roster_lock, portMAX_DELAY);
     memset(s_nodes, 0, sizeof(s_nodes));
+    memset(s_uid_map, 0, sizeof(s_uid_map));
     strncpy(s_master.label, "Centrale", sizeof(s_master.label) - 1);
     strncpy(s_master.kind, "master", sizeof(s_master.kind) - 1);
     s_master.caps = master_caps;
@@ -97,6 +189,7 @@ esp_err_t roster_reset(void)
     ensure_lock();
     xSemaphoreTake(s_roster_lock, portMAX_DELAY);
     memset(s_nodes, 0, sizeof(s_nodes));
+    memset(s_uid_map, 0, sizeof(s_uid_map));
     xSemaphoreGive(s_roster_lock);
     return ESP_OK;
 }
@@ -129,6 +222,7 @@ esp_err_t roster_update_node(uint8_t node_id, const roster_node_info_t *info, bo
     if (info->has_uid && info->uid) {
         memcpy(node->uid, info->uid, sizeof(node->uid));
         node->info_valid = true;
+        uid_map_set(node_id, node->uid);
     }
     node->model = info->model;
     node->fw = info->fw;
@@ -207,6 +301,7 @@ esp_err_t roster_forget_node(uint8_t node_id)
     }
     ensure_lock();
     xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    uid_map_clear(node_id);
     roster_node_t *node = node_slot(node_id);
     if (!node || !node->used) {
         xSemaphoreGive(s_roster_lock);
@@ -288,19 +383,42 @@ esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uin
     ensure_lock();
     xSemaphoreTake(s_roster_lock, portMAX_DELAY);
 
+    uint8_t normalized_uid[sizeof(((roster_node_t *)0)->uid)];
+    uid_normalize(normalized_uid, sizeof(normalized_uid), uid, uid_len);
+
     for (uint32_t i = 1; i < ROSTER_MAX_NODES; ++i) {
         roster_node_t *node = &s_nodes[i];
         if (!node->used) {
             continue;
         }
-        if (memcmp(node->uid, uid, uid_len) == 0) {
+        if (uid_equals(node->uid, normalized_uid)) {
             *out_node_id = (uint8_t)i;
             if (out_is_new) {
                 *out_is_new = false;
             }
+            uid_map_set(*out_node_id, normalized_uid);
             xSemaphoreGive(s_roster_lock);
             return ESP_OK;
         }
+    }
+
+    uint8_t mapped_id = 0;
+    if (uid_map_lookup(normalized_uid, &mapped_id) && mapped_id > 0 && mapped_id < ROSTER_MAX_NODES) {
+        roster_node_t *node = &s_nodes[mapped_id];
+        if (!node->used) {
+            node_init_defaults(node, mapped_id);
+        }
+        memcpy(node->uid, normalized_uid, sizeof(node->uid));
+        node->info_valid = true;
+        node->used = true;
+        node->state = ROSTER_NODE_STATE_PREOP;
+        *out_node_id = mapped_id;
+        if (out_is_new) {
+            *out_is_new = false;
+        }
+        uid_map_set(mapped_id, normalized_uid);
+        xSemaphoreGive(s_roster_lock);
+        return ESP_OK;
     }
 
     for (uint32_t i = 1; i < ROSTER_MAX_NODES; ++i) {
@@ -309,8 +427,7 @@ esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uin
             continue;
         }
         node_init_defaults(node, (uint8_t)i);
-        memset(node->uid, 0, sizeof(node->uid));
-        memcpy(node->uid, uid, uid_len);
+        memcpy(node->uid, normalized_uid, sizeof(node->uid));
         node->info_valid = true;
         node->state = ROSTER_NODE_STATE_PREOP;
         node->used = true;
@@ -318,6 +435,7 @@ esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uin
         if (out_is_new) {
             *out_is_new = true;
         }
+        uid_map_set(*out_node_id, normalized_uid);
         xSemaphoreGive(s_roster_lock);
         return ESP_OK;
     }
