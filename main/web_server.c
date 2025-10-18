@@ -87,9 +87,6 @@ extern const unsigned char certs_server_key_pem_end[]    asm("_binary_server_key
 extern const uint8_t certs_broker_ca_pem_start[] asm("_binary_broker_ca_pem_start");
 extern const uint8_t certs_broker_ca_pem_end[]   asm("_binary_broker_ca_pem_end");
 
-// extern esp_err_t can_master_request_scan(bool *started);
-// extern esp_err_t can_master_send_test_toggle(bool enable);
-
 static void web_server_restart_async(void);
 
 static const char *TAG = "web";
@@ -1339,25 +1336,6 @@ static void web_tls_state_set_custom_from_crt(const mbedtls_x509_crt* crt, uint6
     format_time_iso(installed_at, s_web_tls_state.custom_installed_iso);
 }
 
-// ----- Utilizzo certificati EXAMPLE --------------------------------
-// static void web_tls_use_builtin(void){
-//     web_tls_clear_dynamic();
-//     s_tls_material.cert = (const uint8_t*)builtin_cert_pem;
-//     s_tls_material.cert_len = sizeof(builtin_cert_pem);
-//     s_tls_material.key = (const uint8_t*)builtin_key_pem;
-//     s_tls_material.key_len = sizeof(builtin_key_pem);
-//     s_tls_material.source = WEB_TLS_SRC_BUILTIN;
-
-//     mbedtls_x509_crt crt; mbedtls_x509_crt_init(&crt);
-//     if (mbedtls_x509_crt_parse(&crt, (const unsigned char*)builtin_cert_pem, sizeof(builtin_cert_pem)) == 0){
-//         web_tls_state_set_active_from_crt(&crt, WEB_TLS_SRC_BUILTIN);
-//         if (!s_web_tls_state.custom_available){
-//             web_tls_state_reset_custom();
-//         }
-//     }
-//     mbedtls_x509_crt_free(&crt);
-// }
-
 // ----- Utilizzo certificati REALI ----------------------------------
 static void web_tls_use_builtin(void){
     web_tls_clear_dynamic();
@@ -2545,11 +2523,6 @@ static esp_err_t provision_finish_post(httpd_req_t* req){
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mqtt"), ESP_FAIL;
     }
 
-    // cJSON* root = cJSON_CreateObject();
-    // if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
-    // cJSON_AddBoolToObject(root, "ok", true);
-    // cJSON_AddStringToObject(root, "redirect", s_cloudflare_ui_url);
-    // return json_reply_cjson(req, root);
     return send_https_redirect(req, "/login.html", "302 Found");
 }
 
@@ -4150,11 +4123,6 @@ static esp_err_t status_get(httpd_req_t* req){
     uint16_t outmask = 0;
     outputs_get_mask(&outmask);
 
-    // char zones[256]; size_t off=0;
-    // off += snprintf(zones+off, sizeof(zones)-off, "[");
-    // for (int z=1; z<=INPUT_ZONES_COUNT; ++z){
-    //     bool on = inputs_zone_bit(gpioab, z);
-    //     off += snprintf(zones+off, sizeof(zones)-off, "%s%s", (z>1?",":""), on?"true":"false");
     zones_snapshot_t snapshot;
     zones_snapshot_build(&snapshot);
     const int zones_total = zones_snapshot_total(&snapshot);
@@ -4163,17 +4131,7 @@ static esp_err_t status_get(httpd_req_t* req){
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
-    // off += snprintf(zones+off, sizeof(zones)-off, "]");
 
-    // char buf[512];
-    // snprintf(buf, sizeof(buf),
-    //     "{\"state\":\"%s\",\"zones_count\":%d,\"zones_active\":%s,\"tamper\":%s,\"outputs_mask\":%u,\"bypass_mask\":%u,\"exit_pending_ms\":%u,\"entry_pending_ms\":%u,\"entry_zone\":%d}",
-    //     state, INPUT_ZONES_COUNT, zones, tamper?"true":"false", (unsigned)outmask, (unsigned)alarm_get_bypass_mask(), (unsigned)exit_ms, (unsigned)entry_ms, entry_zone);
-    // // snprintf(buf, sizeof(buf),
-    // //     "{\"state\":\"%s\",\"zones_count\":%d,\"zones_active\":%s,\"tamper\":%s,\"outputs_mask\":%u,\"bypass_mask\":%u}",
-    // //     state, INPUT_ZONES_COUNT, zones, tamper?"true":"false", (unsigned)outmask, (unsigned)alarm_get_bypass_mask());
- 
-    // return json_reply(req, buf);
     cJSON_AddStringToObject(root, "state", state);
     cJSON_AddNumberToObject(root, "zones_count", zones_total);
 
@@ -4399,7 +4357,6 @@ static esp_err_t scenes_post(httpd_req_t* req){
         return ESP_FAIL;
     }
     return json_bool(req, true);
-//    return json_reply(req, "{\"ok\":true}");
 }
 
 // GET /api/zones/config
@@ -4536,7 +4493,6 @@ static esp_err_t send_file(httpd_req_t* req, const char* fname){
         else if (!strcmp(ext,".ico")) ct = "image/x-icon";
     }
     httpd_resp_set_type(req, ct);
-    // auth_set_security_headers(req);
     set_https_security_headers(req);
     char buf[1024];
     size_t r;
@@ -4615,14 +4571,8 @@ static esp_err_t start_http_redirect_server(void){
 
 static esp_err_t root_get(httpd_req_t* req){
     if (!s_provisioned){
-        // auth_set_security_headers(req);
-        // return send_file(req, "index.html");
         return send_file(req, "wizard.html");
     }
-    // auth_set_security_headers(req);
-    // httpd_resp_set_status(req, "302 Found");
-    // httpd_resp_set_hdr(req, "Location", s_cloudflare_ui_url);
-    // return httpd_resp_send(req, NULL, 0);
     user_info_t user;
     if (!auth_check_cookie(req, &user)){
         return send_file(req, "login.html");
@@ -4634,10 +4584,6 @@ static esp_err_t login_html_get(httpd_req_t* req){
     // If already logged, go to index
     user_info_t u;
     if (auth_check_cookie(req,&u)){
-        // httpd_resp_set_status(req,"302 Found");
-        // httpd_resp_set_hdr(req,"Location","/");
-        // auth_set_security_headers(req);
-        // return httpd_resp_send(req,NULL,0);
         return send_https_redirect(req, "/", "302 Found");
     }
     return send_file(req,"login.html");
@@ -4645,14 +4591,8 @@ static esp_err_t login_html_get(httpd_req_t* req){
 
 static esp_err_t index_html_get(httpd_req_t* req){
     if (!s_provisioned){
-        // auth_set_security_headers(req);
-        // return send_file(req, "index.html");
         return send_file(req, "wizard.html");
     }
-    // auth_set_security_headers(req);
-    // httpd_resp_set_status(req, "302 Found");
-    // httpd_resp_set_hdr(req, "Location", s_cloudflare_ui_url);
-    // return httpd_resp_send(req, NULL, 0);
     user_info_t u;
     if (!auth_check_cookie(req,&u)){
         return send_https_redirect(req, "/login.html", "302 Found");
@@ -4680,8 +4620,6 @@ static esp_err_t js_get(httpd_req_t* req){
     if (strstr(uri,"qrcode.min.js")) return send_file(req,"js/qrcode.min.js");
     if (strstr(uri,"bootstrap.bundle.min.js")) return send_file(req,"js/bootstrap.bundle.min.js");
     if (strstr(uri,"bootstrap.bundle.min.js.map")) return send_file(req,"js/bootstrap.bundle.min.js.map");
-    // if (strstr(uri,"login.js")) return send_file(req,"js/login.js");
-    // if (strstr(uri,"app.js"))   return send_file(req,"js/app.js");
     if (strstr(uri,"/js/api.js")) return send_file(req,"js/api.js");
     if (strstr(uri,"/js/login.js")) return send_file(req,"js/login.js");
     if (strstr(uri,"/js/app.js"))   return send_file(req,"js/app.js");
@@ -4830,7 +4768,7 @@ static void register_uri_set(httpd_handle_t srv, const httpd_uri_t *routes, size
 static esp_err_t start_web(void){
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 12288;
-    cfg.max_uri_handlers = 80;
+    cfg.max_uri_handlers = 150;
     cfg.lru_purge_enable = true;
     cfg.server_port = 443;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
@@ -4875,13 +4813,6 @@ esp_err_t web_server_start(void){
 }
 
 esp_err_t web_server_stop(void){
-    // if (!s_server) return ESP_OK;
-    // httpd_handle_t handle = s_server;
-    // s_server = NULL;
-    // ws_clients_reset();
-    // esp_err_t err = httpd_ssl_stop(handle);
-    // if (err != ESP_OK){
-    //     ESP_LOGE(TAG, "httpd_ssl_stop failed: %s", esp_err_to_name(err));
     esp_err_t first_err = ESP_OK;
     if (s_https_server){
         httpd_handle_t handle = s_https_server;
@@ -4960,12 +4891,6 @@ static esp_err_t arm_post(httpd_req_t* req)
 
     if(!mode[0] || !pin[0]) return httpd_resp_send_err(req, 400, "mode/pin"), ESP_FAIL;
     if(!auth_verify_pin(user, pin)) return httpd_resp_send_err(req, 401, "bad pin"), ESP_FAIL;
-
-    // if      (strcasecmp(mode, "away")==0)   alarm_arm_away();
-    // else if (strcasecmp(mode, "home")==0)   alarm_arm_home();
-    // else if (strcasecmp(mode, "night")==0)  alarm_arm_night();
-    // else if (strcasecmp(mode, "custom")==0) alarm_arm_custom();
-    // else return httpd_resp_send_err(req, 400, "bad mode"), ESP_FAIL;
 
     // 1) Determina stato target e maschera scena
     alarm_state_t target = ALARM_DISARMED;
