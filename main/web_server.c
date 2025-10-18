@@ -95,6 +95,7 @@ static const char *TAG_ADMIN __attribute__((unused)) = "admin_html";
 static bool parse_can_node_id(const char *uri, uint8_t *out_node);
 static bool parse_can_node_outputs_uri(const char *uri, uint8_t *out_node);
 static bool parse_can_node_assign_uri(const char *uri, uint8_t *out_node);
+static bool parse_can_node_label_uri(const char *uri, uint8_t *out_node);
 static bool web_uri_match(const char *reference_uri,
                           const char *uri_to_match,
                           size_t match_upto);
@@ -632,6 +633,35 @@ static bool parse_can_node_assign_uri(const char *uri, uint8_t *out_node)
     return true;
 }
 
+static bool parse_can_node_label_uri(const char *uri, uint8_t *out_node)
+{
+    const char *prefix = "/api/can/node/";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(uri, prefix, prefix_len) != 0) {
+        return false;
+    }
+    const char *p = uri + prefix_len;
+    if (!isdigit((unsigned char)*p)) {
+        return false;
+    }
+    char *end = NULL;
+    long node = strtol(p, &end, 10);
+    if (end == p || node < 0 || node > 255) {
+        return false;
+    }
+    if (strncmp(end, "/label", 6) != 0) {
+        return false;
+    }
+    end += 6;
+    if (*end != '\0' && *end != '?') {
+        return false;
+    }
+    if (out_node) {
+        *out_node = (uint8_t)node;
+    }
+    return true;
+}
+
 static bool parse_can_nodes_uri(const char *uri, uint8_t *out_node)
 {
     const char *prefix = "/api/can/nodes/";
@@ -676,6 +706,8 @@ static bool web_uri_match(const char *reference_uri,
         can_match_kind = 2;
     } else if (strcmp(reference_uri, "/api/can/node/*/identify") == 0) {
         can_match_kind = 3;
+    } else if (strcmp(reference_uri, "/api/can/node/*/label") == 0) {
+        can_match_kind = 4;
     } else {
         return false;
     }
@@ -708,6 +740,9 @@ static bool web_uri_match(const char *reference_uri,
             break;
         case 3:
             matched = parse_can_node_id(path, NULL);
+            break;
+        case 4:
+            matched = parse_can_node_label_uri(path, NULL);
             break;
         default:
             matched = false;
@@ -1204,6 +1239,84 @@ static esp_err_t api_can_node_assign_post(httpd_req_t *req)
 }
 
 static esp_err_t api_can_node_assign_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+
+static esp_err_t api_can_node_label_post(httpd_req_t *req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    uint8_t node_id = 0;
+    if (!parse_can_node_label_uri(req->uri, &node_id) || node_id == 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
+        return ESP_FAIL;
+    }
+
+    cors_apply(req);
+
+    char body[128];
+    size_t body_len = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &body_len) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body");
+        return ESP_FAIL;
+    }
+
+    cJSON *json = cJSON_ParseWithLength(body, body_len);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json");
+        return ESP_FAIL;
+    }
+
+    bool has_label = false;
+    const char *label_value = NULL;
+    cJSON *jlabel = cJSON_GetObjectItemCaseSensitive(json, "label");
+    if (cJSON_IsString(jlabel)) {
+        has_label = true;
+        label_value = jlabel->valuestring ? jlabel->valuestring : "";
+    } else if (cJSON_IsNull(jlabel)) {
+        has_label = true;
+        label_value = NULL;
+    }
+
+    if (!has_label) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "label");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = roster_set_node_label(node_id, label_value);
+    cJSON_Delete(json);
+    if (err == ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
+        return ESP_FAIL;
+    }
+    if (err == ESP_ERR_INVALID_ARG) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "label");
+        return ESP_FAIL;
+    }
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "roster");
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = roster_node_to_json(node_id);
+    if (!resp) {
+        resp = cJSON_CreateObject();
+        if (resp) {
+            cJSON_AddNumberToObject(resp, "node_id", node_id);
+        } else {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+            return ESP_FAIL;
+        }
+    }
+    return json_reply_cjson(req, resp);
+}
+
+static esp_err_t api_can_node_label_options(httpd_req_t *req)
 {
     return cors_handle_options(req);
 }
@@ -3319,6 +3432,24 @@ typedef struct {
 static zone_cfg_t s_zone_cfg[ZONE_CONFIG_CAPACITY];
 static uint8_t    s_zone_board_map[ZONE_CONFIG_CAPACITY];
 
+static void zone_board_label_copy(uint8_t board_id, char *out, size_t cap)
+{
+    if (!out || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+
+    if (board_id == 0) {
+        snprintf(out, cap, "%s", "Centrale");
+        return;
+    }
+
+    roster_node_t snapshot;
+    if (roster_get_node_snapshot(board_id, &snapshot)) {
+        snprintf(out, cap, "%s", snapshot.label);
+    }
+}
+
 static uint8_t zone_board_for_index(int zone_1_based){
     if (zone_1_based < 1 || zone_1_based > ZONE_CONFIG_CAPACITY) {
         return 0;
@@ -4289,6 +4420,9 @@ static esp_err_t zones_get(httpd_req_t* req){
         cJSON_AddBoolToObject(it, "board_online", entry->board_online);
         cJSON_AddNumberToObject(it, "board", (double)entry->board);
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
+        char board_label[sizeof(((roster_node_t *)0)->label)];
+        zone_board_label_copy(entry->board, board_label, sizeof(board_label));
+        cJSON_AddStringToObject(it, "board_label", board_label);
         if (cfg) {
             cJSON_AddBoolToObject(it, "auto_exclude", cfg->auto_exclude);
             cJSON_AddBoolToObject(it, "zone_delay", cfg->zone_delay);
@@ -4465,6 +4599,11 @@ static esp_err_t zones_config_get(httpd_req_t* req){
         cJSON_AddNumberToObject(it, "board", (double)(entry->board ? entry->board : zone_board_for_index(zone_id)));
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
         cJSON_AddBoolToObject(it, "board_online", entry->board_online);
+        char board_label[sizeof(((roster_node_t *)0)->label)];
+        zone_board_label_copy(entry->board ? entry->board : zone_board_for_index(zone_id),
+                              board_label,
+                              sizeof(board_label));
+        cJSON_AddStringToObject(it, "board_label", board_label);
         cJSON_AddItemToArray(items, it);
     }
 
@@ -4780,6 +4919,8 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/can/node/*/outputs",   .method = HTTP_OPTIONS, .handler = api_can_node_outputs_options },
     { .uri = "/api/can/node/*/assign",    .method = HTTP_POST,    .handler = api_can_node_assign_post },
     { .uri = "/api/can/node/*/assign",    .method = HTTP_OPTIONS, .handler = api_can_node_assign_options },
+    { .uri = "/api/can/node/*/label",     .method = HTTP_POST,    .handler = api_can_node_label_post },
+    { .uri = "/api/can/node/*/label",     .method = HTTP_OPTIONS, .handler = api_can_node_label_options },
     { .uri = "/api/can/node/*/identify", .method = HTTP_POST,    .handler = api_can_node_identify_post },
     { .uri = "/api/can/node/*/identify", .method = HTTP_OPTIONS, .handler = api_can_node_identify_options },
     { .uri = "/api/status",             .method = HTTP_GET,  .handler = status_get },

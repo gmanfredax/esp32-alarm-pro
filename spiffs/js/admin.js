@@ -130,6 +130,7 @@
     lastScan: null,
   };
   const CAN_MAX_NODE_ID = 127;
+  const CAN_NODE_LABEL_MAX = 31;
 
   const canTestBroadcastState = {
     sending: false,
@@ -248,6 +249,29 @@
     });
   }
 
+    function upsertExpansionNode(updated){
+    if (!updated || typeof updated !== "object") return;
+    const nodeId = Number(updated?.node_id ?? updated?.nodeId);
+    if (!Number.isFinite(nodeId) || nodeId <= 0) return;
+    const current = Array.isArray(expansionsState.items) ? expansionsState.items.slice() : [];
+    let replaced = false;
+    for (let idx = 0; idx < current.length; ++idx){
+      const itemId = Number(current[idx]?.node_id);
+      if (itemId === nodeId){
+        current[idx] = { ...current[idx], ...updated };
+        replaced = true;
+        break;
+      }
+    }
+    if (!replaced){
+      current.push(updated);
+    }
+    expansionsState.items = current;
+    expansionsState.lastScan = Date.now();
+    expansionsState.error = "";
+    renderExpansionsSection();
+  }
+
   function nodeTitle(node){
     if (!node) return "Nodo CAN";
     const label = (node.label && String(node.label).trim()) || "";
@@ -291,7 +315,8 @@
       list.innerHTML = nodes.map((node) => {
         if (!node) return "";
         const nodeId = Number(node.node_id ?? -1);
-        const title = escapeHtml(nodeTitle(node));
+        const title = [];
+        title.push(escapeHtml(nodeTitle(node)));
         const stateLabel = formatNodeStateLabel(node);
         const uidDisplay = formatUid(node?.uid);
         const lastSeen = formatNodeLastSeen(node);
@@ -303,7 +328,8 @@
         if (node.inputs_count != null) ioParts.push(`${node.inputs_count} ingressi`);
         if (node.outputs_count != null) ioParts.push(`${node.outputs_count} uscite`);
         if (ioParts.length) metaParts.push(ioParts.join(' · '));
-        if (uidDisplay !== '—') metaParts.push(`UID ${uidDisplay}`);
+        //if (uidDisplay !== '—') metaParts.push(`UID ${uidDisplay}`);
+        if (uidDisplay !== '—') title.push(` - UID ${uidDisplay}`);
         if (lastSeen !== '—') metaParts.push(`Ultimo contatto: ${lastSeen}`);
         const meta = metaParts.filter(Boolean).map((part)=>escapeHtml(String(part))).join(' · ');
         const actions = nodeId === 0
@@ -457,6 +483,37 @@
     await loadExpansionNodes();
   }
 
+    async function updateExpansionLabel(nodeId, nextLabel, options = {}){
+    if (!Number.isFinite(nodeId) || nodeId <= 0){
+      toast("Operazione non valida", false);
+      throw new Error("invalid_node");
+    }
+    const { reset = false } = options;
+    let labelPayload = "";
+    if (typeof nextLabel === "string") {
+      labelPayload = nextLabel.trim();
+    }
+    if (labelPayload.length > CAN_NODE_LABEL_MAX) {
+      labelPayload = labelPayload.slice(0, CAN_NODE_LABEL_MAX);
+    }
+
+    try {
+      const resp = await apiPost(`/api/can/node/${nodeId}/label`, { label: labelPayload });
+      const updatedLabel = (resp && typeof resp.label === "string") ? resp.label : labelPayload;
+      if (resp && typeof resp === "object") {
+        upsertExpansionNode(resp);
+      } else {
+        await loadExpansionNodes();
+      }
+      toast(reset ? "Nome scheda ripristinato" : "Nome scheda aggiornato");
+      return { label: updatedLabel, node: resp };
+    } catch (err){
+      const message = err?.message || "Impossibile aggiornare il nome della scheda.";
+      toast(`Nodo CAN: ${message}`, false);
+      throw err;
+    }
+  }
+
   function openExpansionActions(nodeId){
     const node = getExpansionItems().find((item) => Number(item?.node_id) === nodeId);
     if (!node){
@@ -464,6 +521,7 @@
       return;
     }
     const title = escapeHtml(nodeTitle(node));
+    const labelValue = typeof node?.label === "string" ? node.label : "";
     const stateLabel = escapeHtml(formatNodeStateLabel(node));
     const uidDisplay = escapeHtml(formatUid(node?.uid));
     const lastSeen = escapeHtml(formatNodeLastSeen(node));
@@ -476,7 +534,18 @@
         <button class="btn" id="mClose">Chiudi</button>
       </div>
       <div class="form" style="padding-bottom:.5rem">
-        <p class="muted">Dettagli per <strong>${title}</strong>.</p>
+        <p class="muted">Dettagli per <strong id="expModalName">${title}</strong>.</p>
+        <form id="expLabelForm" class="form" style="margin:1rem 0;">
+          <label class="field" style="width:100%;max-width:360px;">
+            <span>Nome scheda</span>
+            <input id="expLabelInput" type="text" maxlength="${CAN_NODE_LABEL_MAX}" value="${escapeHtml(labelValue)}" placeholder="Nome descrittivo" />
+          </label>
+          <div class="row" style="gap:.5rem;flex-wrap:wrap;margin-top:.5rem;">
+            <button class="btn primary" type="submit">Salva nome</button>
+            <button class="btn outline" type="button" id="expLabelResetBtn">Ripristina predefinito</button>
+          </div>
+          <p class="muted small" style="margin-top:.4rem;">Personalizza il nome visualizzato nelle dashboard.</p>
+        </form>
         <div class="meta-grid" style="display:grid;grid-template-columns:160px 1fr;gap:.35rem .75rem;margin-bottom:1rem;">
           <span class="muted">ID nodo</span><span>${escapeHtml(String(nodeId))}</span>
           <span class="muted">UID</span><span>${uidDisplay}</span>
@@ -527,6 +596,56 @@
           submitBtn.disabled = false;
         }
       });
+    }
+
+    const labelForm = $("#expLabelForm");
+    if (labelForm){
+      const labelInput = labelForm.querySelector("#expLabelInput");
+      const saveBtn = labelForm.querySelector('button[type="submit"]');
+      const resetBtn = labelForm.querySelector("#expLabelResetBtn");
+      labelForm.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        if (!labelInput) return;
+        const raw = String(labelInput.value ?? "");
+        const trimmed = raw.trim();
+        if (!trimmed){
+          toast("Inserisci un nome valido", false);
+          return;
+        }
+        if (saveBtn) saveBtn.disabled = true;
+        if (resetBtn) resetBtn.disabled = true;
+        try {
+          const { label } = await updateExpansionLabel(nodeId, trimmed);
+          const finalLabel = (typeof label === "string" && label) ? label : trimmed.slice(0, CAN_NODE_LABEL_MAX);
+          if (labelInput) labelInput.value = finalLabel;
+          const nameEl = $("#expModalName");
+          if (nameEl) nameEl.textContent = finalLabel;
+        } catch (_) {
+          // errore già mostrato da updateExpansionLabel
+        } finally {
+          if (saveBtn) saveBtn.disabled = false;
+          if (resetBtn) resetBtn.disabled = false;
+        }
+      });
+      if (resetBtn){
+        resetBtn.addEventListener("click", async (ev) => {
+          ev.preventDefault();
+          if (saveBtn) saveBtn.disabled = true;
+          resetBtn.disabled = true;
+          try {
+            const { label } = await updateExpansionLabel(nodeId, "", { reset: true });
+            const fallback = (typeof label === "string" && label) ? label : `Exp ${nodeId}`;
+            if (labelInput) labelInput.value = fallback;
+            const nameEl = $("#expModalName");
+            if (nameEl) nameEl.textContent = fallback;
+          } catch (_) {
+            // errore già notificato
+          } finally {
+            if (saveBtn) saveBtn.disabled = false;
+            resetBtn.disabled = false;
+          }
+        });
+      }
     }
   }
 

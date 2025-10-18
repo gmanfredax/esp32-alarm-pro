@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <ctype.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -15,6 +16,8 @@
 #define ROSTER_NVS_NAMESPACE "roster"
 #define ROSTER_NVS_KEY_UID_MAP "uid_map"
 #define ROSTER_UID_MAP_VERSION 1u
+#define ROSTER_NVS_KEY_LABEL_MAP "label_map"
+#define ROSTER_LABEL_MAP_VERSION 1u
 
 static const char *TAG = "roster";
 
@@ -44,6 +47,13 @@ static roster_master_info_t s_master = {
 
 static roster_node_t s_nodes[ROSTER_MAX_NODES];
 static roster_uid_entry_t s_uid_map[ROSTER_MAX_NODES];
+
+typedef struct {
+    bool used;
+    char label[sizeof(((roster_node_t *)0)->label)];
+} roster_label_entry_t;
+
+static roster_label_entry_t s_label_map[ROSTER_MAX_NODES];
 static SemaphoreHandle_t s_roster_lock = NULL;
 
 static bool uid_map_set_internal(uint8_t node_id, const uint8_t *uid);
@@ -170,6 +180,269 @@ static void uid_map_load_locked(void)
     if (rewrite) {
         uid_map_save_locked();
     }
+}
+
+typedef struct {
+    uint8_t node_id;
+    char label[sizeof(((roster_node_t *)0)->label)];
+} roster_label_record_t;
+
+static size_t label_trim_copy(char *dst, size_t dst_len, const char *src)
+{
+    if (!dst || dst_len == 0) {
+        return 0;
+    }
+    dst[0] = '\0';
+    if (!src) {
+        return 0;
+    }
+
+    const char *start = src;
+    while (*start && isspace((unsigned char)*start)) {
+        ++start;
+    }
+
+    const char *cursor = start;
+    const char *last_non_space = NULL;
+    size_t processed = 0;
+    while (*cursor && processed < 255) {
+        if (!isspace((unsigned char)*cursor)) {
+            last_non_space = cursor;
+        }
+        ++cursor;
+        ++processed;
+    }
+
+    size_t length = 0;
+    if (last_non_space) {
+        length = (size_t)(last_non_space - start + 1);
+    }
+    if (length == 0) {
+        dst[0] = '\0';
+        return 0;
+    }
+    if (length >= dst_len) {
+        length = dst_len - 1;
+    }
+    memcpy(dst, start, length);
+    dst[length] = '\0';
+    return length;
+}
+
+static bool label_map_set_internal(uint8_t node_id, const char *label)
+{
+    if (node_id == 0 || node_id >= ROSTER_MAX_NODES) {
+        return false;
+    }
+    roster_label_entry_t *entry = &s_label_map[node_id];
+    char normalized[sizeof(entry->label)];
+    size_t len = label_trim_copy(normalized, sizeof(normalized), label);
+    if (len == 0) {
+        if (!entry->used) {
+            return false;
+        }
+        entry->used = false;
+        memset(entry->label, 0, sizeof(entry->label));
+        return true;
+    }
+
+    if (entry->used && strncmp(entry->label, normalized, sizeof(entry->label)) == 0) {
+        return false;
+    }
+
+    entry->used = true;
+    memset(entry->label, 0, sizeof(entry->label));
+    snprintf(entry->label, sizeof(entry->label), "%s", normalized);
+    return true;
+}
+
+static bool label_map_clear_internal(uint8_t node_id)
+{
+    if (node_id == 0 || node_id >= ROSTER_MAX_NODES) {
+        return false;
+    }
+    roster_label_entry_t *entry = &s_label_map[node_id];
+    if (!entry->used) {
+        return false;
+    }
+    entry->used = false;
+    memset(entry->label, 0, sizeof(entry->label));
+    return true;
+}
+
+static bool label_map_move_internal(uint8_t from_id, uint8_t to_id)
+{
+    if (from_id == 0 || to_id == 0 ||
+        from_id >= ROSTER_MAX_NODES || to_id >= ROSTER_MAX_NODES) {
+        return false;
+    }
+    if (from_id == to_id) {
+        return false;
+    }
+
+    roster_label_entry_t from_entry = s_label_map[from_id];
+    if (!from_entry.used) {
+        return label_map_clear_internal(to_id);
+    }
+
+    bool changed = true;
+    roster_label_entry_t *dst = &s_label_map[to_id];
+    *dst = from_entry;
+    roster_label_entry_t *src = &s_label_map[from_id];
+    src->used = false;
+    memset(src->label, 0, sizeof(src->label));
+    return changed;
+}
+
+static esp_err_t label_map_save_locked(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(ROSTER_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open(%s) failed: %s", ROSTER_NVS_NAMESPACE, esp_err_to_name(err));
+        return err;
+    }
+
+    roster_label_record_t records[ROSTER_MAX_NODES];
+    uint8_t count = 0;
+    for (size_t i = 1; i < ROSTER_MAX_NODES; ++i) {
+        const roster_label_entry_t *entry = &s_label_map[i];
+        if (!entry->used) {
+            continue;
+        }
+        if (count >= ROSTER_MAX_NODES) {
+            break;
+        }
+        records[count].node_id = (uint8_t)i;
+        snprintf(records[count].label, sizeof(records[count].label), "%s", entry->label);
+        ++count;
+    }
+
+    uint8_t blob[2 + sizeof(records)];
+    blob[0] = ROSTER_LABEL_MAP_VERSION;
+    blob[1] = count;
+    size_t blob_size = 2 + ((size_t)count) * sizeof(roster_label_record_t);
+    if (count > 0) {
+        memcpy(blob + 2, records, ((size_t)count) * sizeof(roster_label_record_t));
+    }
+
+    err = nvs_set_blob(handle, ROSTER_NVS_KEY_LABEL_MAP, blob, blob_size);
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        esp_err_t erase_err = nvs_erase_key(handle, ROSTER_NVS_KEY_LABEL_MAP);
+        if (erase_err != ESP_OK && erase_err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "Failed to erase label map blob before retry: %s", esp_err_to_name(erase_err));
+        } else {
+            err = nvs_set_blob(handle, ROSTER_NVS_KEY_LABEL_MAP, blob, blob_size);
+        }
+    }
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to persist CAN label map: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
+    return err;
+}
+
+static void label_map_load_locked(void)
+{
+    memset(s_label_map, 0, sizeof(s_label_map));
+
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(ROSTER_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "nvs_open(%s) for read failed: %s", ROSTER_NVS_NAMESPACE, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    uint8_t blob[2 + ROSTER_MAX_NODES * sizeof(roster_label_record_t)];
+    size_t required = sizeof(blob);
+    err = nvs_get_blob(handle, ROSTER_NVS_KEY_LABEL_MAP, blob, &required);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to load CAN label map: %s", esp_err_to_name(err));
+        nvs_close(handle);
+        return;
+    }
+    if (required < 2) {
+        nvs_close(handle);
+        return;
+    }
+
+    uint8_t version = blob[0];
+    if (version != ROSTER_LABEL_MAP_VERSION) {
+        ESP_LOGW(TAG, "Unknown CAN label map version %u", (unsigned)version);
+        nvs_close(handle);
+        return;
+    }
+
+    uint8_t count = blob[1];
+    size_t expected = 2 + ((size_t)count) * sizeof(roster_label_record_t);
+    if (count > ROSTER_MAX_NODES || required < expected) {
+        ESP_LOGW(TAG, "Invalid CAN label map blob (count=%u size=%zu)", (unsigned)count, required);
+        nvs_close(handle);
+        return;
+    }
+
+    const roster_label_record_t *records = (const roster_label_record_t *)(blob + 2);
+    for (size_t i = 0; i < count; ++i) {
+        uint8_t node_id = records[i].node_id;
+        if (node_id == 0 || node_id >= ROSTER_MAX_NODES) {
+            continue;
+        }
+        label_map_set_internal(node_id, records[i].label);
+    }
+
+    nvs_close(handle);
+}
+
+static bool label_map_set(uint8_t node_id, const char *label)
+{
+    if (!label_map_set_internal(node_id, label)) {
+        return false;
+    }
+    label_map_save_locked();
+    return true;
+}
+
+static bool label_map_clear(uint8_t node_id)
+{
+    if (!label_map_clear_internal(node_id)) {
+        return false;
+    }
+    label_map_save_locked();
+    return true;
+}
+
+static void label_map_apply(roster_node_t *node)
+{
+    if (!node) {
+        return;
+    }
+    uint8_t node_id = node->node_id;
+    if (node_id == 0 || node_id >= ROSTER_MAX_NODES) {
+        return;
+    }
+    const roster_label_entry_t *entry = &s_label_map[node_id];
+    if (!entry->used) {
+        return;
+    }
+    snprintf(node->label, sizeof(node->label), "%s", entry->label);
+}
+
+static void node_set_default_label(roster_node_t *node)
+{
+    if (!node) {
+        return;
+    }
+    snprintf(node->label, sizeof(node->label), "Exp %u", (unsigned)node->node_id);
 }
 
 static SemaphoreHandle_t ensure_lock(void)
@@ -324,8 +597,8 @@ static void node_init_defaults(roster_node_t *node, uint8_t node_id)
     node->node_state_flags = 0;
     node->outputs_flags = 0;
     node->outputs_pwm = 0;
-    snprintf(node->kind, sizeof(node->kind), "%s", "exp");
-    snprintf(node->label, sizeof(node->label), "Exp %u", (unsigned)node_id);
+    node_set_default_label(node);
+    label_map_apply(node);
 }
 
 void roster_init(uint8_t master_inputs, uint8_t master_outputs, uint16_t master_caps)
@@ -335,6 +608,8 @@ void roster_init(uint8_t master_inputs, uint8_t master_outputs, uint16_t master_
     memset(s_nodes, 0, sizeof(s_nodes));
     memset(s_uid_map, 0, sizeof(s_uid_map));
     uid_map_load_locked();
+    memset(s_label_map, 0, sizeof(s_label_map));
+    label_map_load_locked();
     strncpy(s_master.label, "Centrale", sizeof(s_master.label) - 1);
     strncpy(s_master.kind, "master", sizeof(s_master.kind) - 1);
     s_master.caps = master_caps;
@@ -351,6 +626,8 @@ esp_err_t roster_reset(void)
     memset(s_nodes, 0, sizeof(s_nodes));
     memset(s_uid_map, 0, sizeof(s_uid_map));
     uid_map_save_locked();
+    memset(s_label_map, 0, sizeof(s_label_map));
+    label_map_save_locked();
     xSemaphoreGive(s_roster_lock);
     return ESP_OK;
 }
@@ -395,6 +672,7 @@ esp_err_t roster_update_node(uint8_t node_id, const roster_node_info_t *info, bo
     }
     bool is_new = !was_used;
     node->used = true;
+    label_map_apply(node);
     xSemaphoreGive(s_roster_lock);
     if (out_is_new) {
         *out_is_new = is_new;
@@ -462,12 +740,13 @@ esp_err_t roster_forget_node(uint8_t node_id)
     }
     ensure_lock();
     xSemaphoreTake(s_roster_lock, portMAX_DELAY);
-    uid_map_clear(node_id);
     roster_node_t *node = node_slot(node_id);
     if (!node || !node->used) {
         xSemaphoreGive(s_roster_lock);
         return ESP_ERR_NOT_FOUND;
     }
+    uid_map_clear(node_id);
+    label_map_clear(node_id);
     memset(node, 0, sizeof(*node));
     xSemaphoreGive(s_roster_lock);
     return ESP_OK;
@@ -614,6 +893,42 @@ esp_err_t roster_reassign_node_id(uint8_t current_id, uint8_t new_id)
     if (map_changed) {
         uid_map_save_locked();
     }
+
+    if (label_map_move_internal(current_id, new_id)) {
+        label_map_save_locked();
+        label_map_apply(dst);
+    }
+
+    xSemaphoreGive(s_roster_lock);
+    return ESP_OK;
+}
+
+esp_err_t roster_set_node_label(uint8_t node_id, const char *label)
+{
+    if (node_id == 0 || node_id >= ROSTER_MAX_NODES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+
+    roster_node_t *node = node_slot(node_id);
+    if (!node || !node->used) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    char normalized[sizeof(node->label)];
+    size_t len = label_trim_copy(normalized, sizeof(normalized), label);
+    if (len == 0) {
+        node_set_default_label(node);
+        label_map_clear(node_id);
+        xSemaphoreGive(s_roster_lock);
+        return ESP_OK;
+    }
+
+    snprintf(node->label, sizeof(node->label), "%s", normalized);
+    label_map_set(node_id, normalized);
 
     xSemaphoreGive(s_roster_lock);
     return ESP_OK;

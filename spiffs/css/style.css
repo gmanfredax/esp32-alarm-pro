@@ -226,6 +226,8 @@ body.modal-open{overflow:hidden;}
 
 .chip{display:inline-block;border:1px solid var(--border);padding:.4rem .7rem;border-radius:12px}
 .chip.on{background:var(--accent);color:#00152a;border-color:var(--accent)}
+.chip.offline{background:rgba(239,68,68,.18);border-color:var(--danger);color:#fecaca}
+.chip.on.offline{background:rgba(239,68,68,.35);color:#fff;border-color:var(--danger)}
 
 .log-empty.small{font-size:.85rem;padding:1rem 0;}
 

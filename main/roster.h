@@ -100,6 +100,7 @@ esp_err_t roster_note_outputs(uint8_t node_id,
                               bool known);
 bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state);
 esp_err_t roster_reassign_node_id(uint8_t current_id, uint8_t new_id);
+esp_err_t roster_set_node_label(uint8_t node_id, const char *label);
 
 size_t roster_collect_nodes(roster_node_inputs_t *out_nodes, size_t max_nodes);
 uint16_t roster_total_inputs(void);

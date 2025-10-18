@@ -128,7 +128,13 @@ function getBoardMeta(boardId){
   return boardsCache.map.get(safeId) || null;
 }
 
-function boardLabel(meta, boardId){
+function boardLabel(meta, boardId, zoneList){
+  if (Array.isArray(zoneList)) {
+    for (const zone of zoneList) {
+      const zoneLabel = typeof zone?.board_label === 'string' ? zone.board_label.trim() : '';
+      if (zoneLabel) return zoneLabel;
+    }
+  }
   if (meta?.label) return meta.label;
   return boardId === 0 ? 'Centrale' : `Scheda ${boardId}`;
 }
@@ -148,9 +154,52 @@ function boardStatusDetails(meta){
   }
 }
 
-function renderBoardStatus(meta){
-  const info = boardStatusDetails(meta);
-  return `<span class="board-status ${info.className}">${escapeHtml(info.label)}</span>`;
+function resolveBoardStatus(meta, zones = []){
+  const zoneFlags = Array.isArray(zones)
+    ? zones
+      .map((zone) => zone?.board_online)
+      .filter((value) => typeof value === 'boolean')
+    : [];
+
+  if (zoneFlags.length) {
+    const allOnline = zoneFlags.every((value) => value === true);
+    const allOffline = zoneFlags.every((value) => value === false);
+    if (allOnline) {
+      return { className: 'online', label: 'Online', isOffline: false };
+    }
+    if (allOffline) {
+      return { className: 'offline', label: 'Offline', isOffline: true };
+    }
+    if (zoneFlags.some((value) => value === false)) {
+      return { className: 'offline', label: 'Offline', isOffline: true };
+    }
+    return { className: 'online', label: 'Online', isOffline: false };
+  }
+
+  const raw = (meta?.state || '').toString().toUpperCase();
+  if (raw === 'ONLINE') {
+    return { className: 'online', label: 'Online', isOffline: false };
+  }
+  if (raw === 'OFFLINE') {
+    return { className: 'offline', label: 'Offline', isOffline: true };
+  }
+
+  const fallback = boardStatusDetails(meta);
+  return {
+    className: fallback.className,
+    label: fallback.label,
+    isOffline: fallback.className === 'offline'
+  };
+}
+
+function renderBoardStatus(meta, zones = []){
+  const info = resolveBoardStatus(meta, zones);
+  const className = info?.className || 'unknown';
+  const label = info?.label || 'Sconosciuto';
+  return {
+    info,
+    html: `<span class="board-status ${className}">${escapeHtml(label)}</span>`
+  };
 }
 
 function formatZoneCount(value){
@@ -368,13 +417,17 @@ function buildZoneBadge(zone){
   return badges.join('');
 }
 
-function renderZoneChip(zone){
+function renderZoneChip(zone, options = {}){
+  const offline = Boolean(options?.offline);
   const id = Number(zone?.id);
   const boardId = Number(zone?.board);
   const zoneIdLabel = Number.isFinite(id) ? `Z${id}` : 'Z?';
   const nameSuffix = zone?.name ? ` – ${escapeHtml(zone.name)}` : '';
   const display = `${escapeHtml(zoneIdLabel)}${nameSuffix}`;
-  const cls = zone?.active ? 'chip on' : 'chip';
+  const classes = ['chip'];
+  if (zone?.active) classes.push('on');
+  if (offline) classes.push('offline');
+  const cls = classes.join(' ');
   const badges = buildZoneBadge(zone);
   const titleParts = [zoneIdLabel];
   if (zone?.name) titleParts.push(zone.name);
@@ -389,11 +442,12 @@ function renderZoneChip(zone){
 
 function renderBoardSection(boardId, zones){
   const meta = getBoardMeta(boardId);
-  const label = escapeHtml(boardLabel(meta, boardId));
-  const statusHtml = renderBoardStatus(meta);
+  const label = escapeHtml(boardLabel(meta, boardId, zones));
+  const { html: statusHtml, info: statusInfo } = renderBoardStatus(meta, zones);
   const zoneCount = escapeHtml(formatZoneCount(zones.length));
+  const offline = statusInfo?.isOffline === true;
   const content = zones.length
-    ? `<div class="zones-grid">${zones.map((zone) => renderZoneChip(zone)).join('')}</div>`
+    ? `<div class="zones-grid">${zones.map((zone) => renderZoneChip(zone, { offline })).join('')}</div>`
     : '<div class="log-empty small">Nessuna zona associata.</div>';
   return `
     <section class="board-section" data-board="${boardId}">
@@ -484,8 +538,8 @@ function renderZoneConfigCard(zone){
 
 function renderZonesConfigSection(boardId, zones){
   const meta = getBoardMeta(boardId);
-  const label = escapeHtml(boardLabel(meta, boardId));
-  const statusHtml = renderBoardStatus(meta);
+  const label = escapeHtml(boardLabel(meta, boardId, zones));
+  const { html: statusHtml } = renderBoardStatus(meta, zones);
   const zoneCount = escapeHtml(formatZoneCount(zones.length));
   const body = zones.length
     ? `<div class="zone-config-grid">${zones.map((zone) => renderZoneConfigCard(zone)).join('')}</div>`
