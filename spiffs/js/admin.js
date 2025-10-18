@@ -315,8 +315,7 @@
       list.innerHTML = nodes.map((node) => {
         if (!node) return "";
         const nodeId = Number(node.node_id ?? -1);
-        const title = [];
-        title.push(escapeHtml(nodeTitle(node)));
+        const title = escapeHtml(nodeTitle(node));
         const stateLabel = formatNodeStateLabel(node);
         const uidDisplay = formatUid(node?.uid);
         const lastSeen = formatNodeLastSeen(node);
@@ -329,7 +328,6 @@
         if (node.outputs_count != null) ioParts.push(`${node.outputs_count} uscite`);
         if (ioParts.length) metaParts.push(ioParts.join(' · '));
         //if (uidDisplay !== '—') metaParts.push(`UID ${uidDisplay}`);
-        if (uidDisplay !== '—') title.push(` - UID ${uidDisplay}`);
         if (lastSeen !== '—') metaParts.push(`Ultimo contatto: ${lastSeen}`);
         const meta = metaParts.filter(Boolean).map((part)=>escapeHtml(String(part))).join(' · ');
         const actions = nodeId === 0
@@ -339,6 +337,7 @@
             <div class="expansion-info">
               <div class="expansion-title">${title}</div>
               ${meta ? `<div class="expansion-meta">${meta}</div>` : ''}
+              ${uidDisplay ? `<div class="expansion-meta">UID ${uidDisplay}</div>` : ''}
             </div>
             <div class="expansion-actions">${actions}</div>
           </li>`;

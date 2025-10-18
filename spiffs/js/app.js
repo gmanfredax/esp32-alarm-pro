@@ -19,13 +19,17 @@ const state = {
   role: null,
   isAdmin: false,
   status: null,
+  alarmZoneIds: [],
   tamperAlarm: false,
   zones: [],
   boards: [],
   scenes: null,
   logs: [],
   logFilter: 'all',
-  activeTab: ''
+  activeTab: '',
+  sceneActiveMask: 0,
+  sceneMaskKnown: false,
+  sceneMaskSyncedForAlarm: false
 };
 
 const STATUS_POLL_INTERVAL = 2000;
@@ -85,6 +89,11 @@ const modalsRoot = document.getElementById('modals-root');
 const boardsCache = {
   list: [],
   map: new Map(),
+  pending: null
+};
+
+const scenesCache = {
+  data: null,
   pending: null
 };
 
@@ -320,6 +329,162 @@ function escapeHtml(str = ''){
     .replace(/'/g, '&#39;');
 }
 
+function getZonesList(){
+  if (Array.isArray(state.zones?.zones)) return state.zones.zones;
+  if (Array.isArray(state.zones)) return state.zones;
+  return [];
+}
+
+function getZoneLabel(id){
+  const zones = getZonesList();
+  const match = zones.find((item) => Number(item?.id) === id);
+  const name = (match?.name ?? '').toString().trim();
+  return name || `Z${id}`;
+}
+
+function parseMaskValue(raw){
+  if (raw == null) {
+    return { value: 0, valid: false };
+  }
+  if (typeof raw === 'number' && Number.isFinite(raw)) {
+    const truncated = Math.trunc(raw);
+    if (truncated < 0) {
+      return { value: 0, valid: false };
+    }
+    return { value: truncated >>> 0, valid: true };
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return { value: 0, valid: false };
+    }
+    const base = /^0x/i.test(trimmed) ? 16 : 10;
+    const parsed = Number.parseInt(trimmed, base);
+    if (!Number.isNaN(parsed) && Number.isFinite(parsed) && parsed >= 0) {
+      return { value: parsed >>> 0, valid: true };
+    }
+    return { value: 0, valid: false };
+  }
+  if (typeof raw === 'boolean') {
+    return { value: raw ? 1 : 0, valid: true };
+  }
+  const coerced = Number(raw);
+  if (!Number.isNaN(coerced) && Number.isFinite(coerced) && coerced >= 0) {
+    return { value: Math.trunc(coerced) >>> 0, valid: true };
+  }
+  return { value: 0, valid: false };
+}
+
+function setSceneMaskFromData(data){
+  if (!data || typeof data !== 'object') {
+    state.sceneActiveMask = 0;
+    state.sceneMaskKnown = false;
+    return;
+  }
+  const { value, valid } = parseMaskValue(data.active);
+  state.sceneActiveMask = value;
+  state.sceneMaskKnown = valid;
+}
+
+async function ensureScenesMeta({ force = false } = {}){
+  if (!force && scenesCache.data) {
+    state.scenes = scenesCache.data;
+    setSceneMaskFromData(scenesCache.data);
+    return scenesCache.data;
+  }
+  if (!force && scenesCache.pending) {
+    return scenesCache.pending;
+  }
+  if (force && scenesCache.pending) {
+    return scenesCache.pending;
+  }
+  const promise = apiGet('/api/scenes')
+    .then((payload) => {
+      scenesCache.data = payload;
+      state.scenes = payload;
+      setSceneMaskFromData(payload);
+      return payload;
+    })
+    .finally(() => {
+      if (scenesCache.pending === promise) {
+        scenesCache.pending = null;
+      }
+    });
+  scenesCache.pending = promise;
+  return promise;
+}
+
+function normalizeActiveFlag(value){
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) return false;
+    const lowered = trimmed.toLowerCase();
+    if (lowered === 'false' || lowered === 'no' || lowered === 'off') return false;
+    if (lowered === 'true' || lowered === 'si' || lowered === 'on') return true;
+    const numeric = Number(trimmed);
+    return Number.isFinite(numeric) ? numeric !== 0 : true;
+  }
+  return Boolean(value);
+}
+
+function computeAlarmZoneIds(status, {
+  sceneMask = 0,
+  sceneMaskKnown = false,
+  bypassMask = null,
+  knownFlags = null
+} = {}){
+  if (!status || status.state !== 'ALARM') return [];
+  if (!Array.isArray(status.zones_active)) return [];
+
+  const flags = status.zones_active;
+  const known = Array.isArray(knownFlags) ? knownFlags
+    : (Array.isArray(status.zones_known) ? status.zones_known : null);
+  const bypassInfo = parseMaskValue(bypassMask ?? status?.bypass_mask);
+  const applyBypass = bypassInfo.valid && bypassInfo.value !== 0;
+  const applySceneMask = sceneMaskKnown;
+
+  const ids = [];
+  for (let idx = 0; idx < flags.length; idx += 1) {
+    if (!normalizeActiveFlag(flags[idx])) continue;
+    if (known && !normalizeActiveFlag(known[idx])) continue;
+    const bit = 2 ** idx;
+    if (applySceneMask && (sceneMask & bit) === 0) continue;
+    if (applyBypass && (bypassInfo.value & bit) !== 0) continue;
+    ids.push(idx + 1);
+  }
+  return ids;
+}
+
+function renderAlarmZoneList(ids){
+  if (!Array.isArray(ids) || !ids.length) {
+    return '<span class="alarm-zone-empty">Nessuna zona segnalata.</span>';
+  }
+  return `<div class="alarm-zone-list">${ids
+    .map((id) => `<span class="alarm-zone-pill">${escapeHtml(getZoneLabel(id))}</span>`)
+    .join('')}</div>`;
+}
+
+function updateAlarmZonesSummary(){
+  const el = document.getElementById('kpi-alarm-zones');
+  if (!el) return;
+  el.innerHTML = renderAlarmZoneList(state.alarmZoneIds);
+}
+
+function updateZonesAlarmHighlight(){
+  const isAlarm = state.status?.state === 'ALARM';
+  const activeIds = isAlarm ? new Set(state.alarmZoneIds) : new Set();
+  $$('#zonesBoards .zone-card').forEach((card) => {
+    const raw = card?.dataset?.zoneId ?? '';
+    const zoneId = raw ? Number.parseInt(raw, 10) : NaN;
+    const chip = card?.querySelector('.chip');
+    if (!chip) return;
+    const shouldHighlight = isAlarm && Number.isFinite(zoneId) && activeIds.has(zoneId);
+    chip.classList.toggle('alarm', shouldHighlight);
+  });
+}
+
 const STATE_LABELS = Object.freeze({
   DISARMED: 'Disarmato',
   ARMED_HOME: 'Attivo in casa',
@@ -379,7 +544,32 @@ function kpiCard({ title, valueHTML }){
 async function refreshStatus(){
   try {
     const data = await apiGet('/api/status');
+    const prevStateName = state.status?.state || '';
     state.status = data;
+    const isAlarmState = data?.state === 'ALARM';
+
+    if (isAlarmState) {
+      if (!state.sceneMaskSyncedForAlarm) {
+        try {
+          await ensureScenesMeta({ force: true });
+          state.sceneMaskSyncedForAlarm = state.sceneMaskKnown;
+        } catch (scenesErr) {
+          console.warn('scenes meta', scenesErr);
+          state.sceneActiveMask = 0;
+          state.sceneMaskKnown = false;
+          state.sceneMaskSyncedForAlarm = false;
+        }
+      }
+    } else if (prevStateName === 'ALARM' || state.sceneMaskSyncedForAlarm) {
+      state.sceneMaskSyncedForAlarm = false;
+    }
+
+    state.alarmZoneIds = computeAlarmZoneIds(data, {
+      sceneMask: state.sceneActiveMask,
+      sceneMaskKnown: state.sceneMaskKnown,
+      bypassMask: data?.bypass_mask,
+      knownFlags: data?.zones_known
+    });
     state.tamperAlarm = Boolean(data?.tamper_alarm && data?.state === 'ALARM');
     setBrandCentralName(data?.central_name);
     const wrap = $('#statusCards');
@@ -387,11 +577,23 @@ async function refreshStatus(){
     const zonesActive = Array.isArray(data?.zones_active) ? data.zones_active.filter(Boolean).length : (data?.zones_active || 0);
     const zonesCount = data?.zones_count || (Array.isArray(data?.zones_active) ? data.zones_active.length : zonesActive);
     const tamper = data?.tamper ? '<span class="tag">TAMPER</span>' : '<span class="tag ok">OK</span>';
-    wrap.innerHTML = [
+    const cards = [
       kpiCard({ title: 'Stato', valueHTML: '<span id="kpi-state-val"></span>' }),
       kpiCard({ title: 'Tamper', valueHTML: tamper }),
       kpiCard({ title: 'Zone attive', valueHTML: `${zonesActive} / ${zonesCount}` })
-    ].join('');
+    ];
+    if (isAlarmState && (!Array.isArray(state.zones) || !state.zones.length) && state.activeTab !== 'zones') {
+      refreshZones();
+    }
+    if (isAlarmState) {
+      cards.push(
+        kpiCard({
+          title: 'Zone violate',
+          valueHTML: `<div id="kpi-alarm-zones" class="alarm-zone-value">${renderAlarmZoneList(state.alarmZoneIds)}</div>`
+        })
+      );
+    }
+    wrap.innerHTML = cards.join('');
     const tamperResetBtn = $('#tamperResetBtn');
     if (tamperResetBtn) {
       const shouldShow = state.tamperAlarm && Boolean(state.currentUser);
@@ -399,6 +601,8 @@ async function refreshStatus(){
     }
     const stateEl = document.getElementById('kpi-state-val');
     if (stateEl) renderAlarmState(stateEl, data, { iconHTML: stateIcon(data?.state) });
+    updateAlarmZonesSummary();
+    updateZonesAlarmHighlight();
     if (state.activeTab === 'zones' && !document.hidden) {
       refreshZones();
     }
@@ -499,12 +703,16 @@ async function refreshZones(){
 
     if (!boardIds.length) {
       container.innerHTML = '<div class="log-empty">Nessuna zona configurata.</div>';
+      updateAlarmZonesSummary();
+      updateZonesAlarmHighlight();
       return;
     }
     container.innerHTML = boardIds.map((boardId) => {
       const list = groups.get(boardId) || [];
       return renderBoardSection(boardId, list);
     }).join('');
+    updateAlarmZonesSummary();
+    updateZonesAlarmHighlight();
   } catch (err) {
     console.error('refreshZones', err);
     showNotice('Errore durante il caricamento delle zone.', 'error');
@@ -676,8 +884,7 @@ function renderSceneCard(name, mask, totalZones){
 
 async function refreshScenes(){
   try {
-    const data = await apiGet('/api/scenes');
-    state.scenes = data;
+    const data = await ensureScenesMeta({ force: true });
     const root = $('#scenesWrap');
     if (!root) return;
     const total = Number.isInteger(data?.zones) ? data.zones : 0;
@@ -1411,7 +1618,7 @@ async function init(){
     } else if (state.activeTab === 'status') {
       startStatusUpdates({ immediate: true });
     } else if (state.activeTab === 'zones') {
-      startZonessUpdates({ immediate: true });
+      startZonesUpdates({ immediate: true });
     }
   });
   window.addEventListener('pagehide', () => {    
