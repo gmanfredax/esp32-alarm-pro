@@ -29,6 +29,7 @@
 #include "outputs.h"
 #include "scenes.h"
 #include "roster.h"
+#include "audit_log.h"
 
 #include "cJSON.h"
 
@@ -400,7 +401,9 @@ esp_err_t mqtt_publish_scenes(void)
 // ─────────────────────────────────────────────────────────────────────────────
 static void handle_arm_command(const char *payload)
 {
-    const char *mode = "away";
+    char mode_buf[16];
+    strncpy(mode_buf, "away", sizeof(mode_buf) - 1);
+    mode_buf[sizeof(mode_buf) - 1] = '\0';
     cJSON *root = NULL;
     if (payload && payload[0]) {
         root = cJSON_Parse(payload);
@@ -410,7 +413,8 @@ static void handle_arm_command(const char *payload)
     if (root) {
         cJSON *m = cJSON_GetObjectItemCaseSensitive(root, "mode");
         if (cJSON_IsString(m) && m->valuestring) {
-            mode = m->valuestring;
+            strncpy(mode_buf, m->valuestring, sizeof(mode_buf) - 1);
+            mode_buf[sizeof(mode_buf) - 1] = '\0';
         }
         cJSON *bp = cJSON_GetObjectItemCaseSensitive(root, "bypass_mask");
         if (cJSON_IsString(bp) && bp->valuestring) {
@@ -432,13 +436,13 @@ static void handle_arm_command(const char *payload)
     zone_mask_t scene_mask;
     scenes_mask_all(total, &scene_mask);
     alarm_state_t target = ALARM_ARMED_AWAY;
-    if (strcasecmp(mode, "home") == 0) {
+    if (strcasecmp(mode_buf, "home") == 0) {
         target = ALARM_ARMED_HOME;
         scenes_get_mask(SCENE_HOME, &scene_mask);
-    } else if (strcasecmp(mode, "night") == 0) {
+    } else if (strcasecmp(mode_buf, "night") == 0) {
         target = ALARM_ARMED_NIGHT;
         scenes_get_mask(SCENE_NIGHT, &scene_mask);
-    } else if (strcasecmp(mode, "custom") == 0) {
+    } else if (strcasecmp(mode_buf, "custom") == 0) {
         target = ALARM_ARMED_CUSTOM;
         scenes_get_mask(SCENE_CUSTOM, &scene_mask);
     }
@@ -453,13 +457,80 @@ static void handle_arm_command(const char *payload)
     default: break;
     }
 
+    char scene_desc[48];
+    zone_mask_format_brief(&scene_mask, total, 4, scene_desc, sizeof(scene_desc));
+    char note[64];
+    size_t avail = sizeof(note);
+    if (avail > 0) {
+        const size_t prefix = 12; // strlen("mode=") + strlen(" scene=")
+        if (avail > 1) {
+            avail -= 1;
+        }
+        if (avail > prefix) {
+            avail -= prefix;
+        } else {
+            avail = 0;
+        }
+    }
+    size_t mode_len = strnlen(mode_buf, sizeof(mode_buf) - 1);
+    if (mode_len > avail) {
+        mode_len = avail;
+    }
+    size_t scene_len = 0;
+    if (avail > mode_len) {
+        size_t scene_avail = avail - mode_len;
+        size_t scene_cap = sizeof(scene_desc) - 1;
+        if (scene_avail < scene_cap) {
+            scene_cap = scene_avail;
+        }
+        scene_len = strnlen(scene_desc, scene_cap);
+    }
+    snprintf(note, sizeof(note), "mode=%.*s scene=%.*s", (int)mode_len, mode_buf, (int)scene_len, scene_desc);
+    audit_append("alarm_arm", "mqtt", 1, note);
+
     if (root) cJSON_Delete(root);
     mqtt_publish_state();
 }
 
 static void handle_disarm_command(void)
 {
+    alarm_state_t prev_state = alarm_get_state();
+    zone_mask_t scene_mask;
+    scenes_get_active_mask(&scene_mask);
+    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    if (total > SCENES_MAX_ZONES) {
+        total = SCENES_MAX_ZONES;
+    }
+    zone_mask_limit(&scene_mask, total);
+    char scene_desc[48];
+    zone_mask_format_brief(&scene_mask, total, 4, scene_desc, sizeof(scene_desc));
+    const char *prev_label = alarm_state_name(prev_state);
+    char note[64];
+    size_t avail = sizeof(note);
+    if (avail > 0) {
+        const size_t prefix = 12; // strlen("prev=") + strlen(" scene=")
+        if (avail > 1) {
+            avail -= 1;
+        }
+        if (avail > prefix) {
+            avail -= prefix;
+        } else {
+            avail = 0;
+        }
+    }
+    size_t prev_len = strnlen(prev_label, avail);
+    size_t scene_len = 0;
+    if (avail > prev_len) {
+        size_t scene_avail = avail - prev_len;
+        size_t scene_cap = sizeof(scene_desc) - 1;
+        if (scene_avail < scene_cap) {
+            scene_cap = scene_avail;
+        }
+        scene_len = strnlen(scene_desc, scene_cap);
+    }
+    snprintf(note, sizeof(note), "prev=%.*s scene=%.*s", (int)prev_len, prev_label, (int)scene_len, scene_desc);
     alarm_disarm();
+    audit_append("alarm_disarm", "mqtt", 1, note);
     mqtt_publish_state();
 }
 

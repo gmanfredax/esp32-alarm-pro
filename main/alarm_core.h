@@ -85,6 +85,7 @@ void           alarm_set_led_maint(bool on);
 
 // Info diagnostica
 bool           alarm_last_alarm_was_tamper(void);
+const char*    alarm_state_name(alarm_state_t st);
 
 #ifdef __cplusplus
 }

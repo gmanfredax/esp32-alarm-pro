@@ -1,7 +1,9 @@
 #include "alarm_core.h"
 #include "esp_log.h"
 #include "outputs.h"
+#include "audit_log.h"
 #include <string.h>
+#include <stdio.h>
 #include "esp_timer.h"
 #include "scenes.h"
 #include "gpio_inputs.h"   // per INPUT_ZONES_COUNT e inputs_zone_bit()
@@ -34,6 +36,70 @@ static bool          s_exit_unified      = false;
 // Gestione ritardo di ingresso (entry delay)
 static bool          s_entry_pending     = false;
 static zone_mask_t   s_entry_zmask;
+
+const char* alarm_state_name(alarm_state_t st)
+{
+    switch (st) {
+    case ALARM_DISARMED:    return "DISARMED";
+    case ALARM_ARMED_HOME:  return "ARMED_HOME";
+    case ALARM_ARMED_AWAY:  return "ARMED_AWAY";
+    case ALARM_ARMED_NIGHT: return "ARMED_NIGHT";
+    case ALARM_ARMED_CUSTOM:return "ARMED_CUSTOM";
+    case ALARM_ALARM:       return "ALARM";
+    case ALARM_MAINTENANCE: return "MAINTENANCE";
+    default:                return "UNKNOWN";
+    }
+}
+
+static void audit_alarm_trigger_event(const char *cause, const zone_mask_t *zones, int zone_index)
+{
+    char note[64];
+    char zones_buf[48];
+    zone_mask_t tmp;
+    bool has_mask = false;
+    zone_mask_clear(&tmp);
+    if (zones) {
+        zone_mask_copy(&tmp, zones);
+        zone_mask_limit(&tmp, ALARM_MAX_ZONES);
+        has_mask = zone_mask_any(&tmp);
+    }
+    if (!has_mask && zone_index >= 0 && zone_index < (int)ALARM_MAX_ZONES) {
+        zone_mask_clear(&tmp);
+        zone_mask_set(&tmp, (uint16_t)zone_index);
+        has_mask = true;
+    }
+    if (has_mask) {
+        zone_mask_format_brief(&tmp, ALARM_MAX_ZONES, 4, zones_buf, sizeof(zones_buf));
+    } else {
+        snprintf(zones_buf, sizeof(zones_buf), "-");
+    }
+    const char *reason = (cause && cause[0]) ? cause : "unknown";
+    size_t avail = sizeof(note);
+    if (avail > 0) {
+        const size_t prefix = 13; // strlen("cause=") + strlen(" zones=")
+        if (avail > 1) {
+            avail -= 1; // leave space for null terminator
+        }
+        if (avail > prefix) {
+            avail -= prefix;
+        } else {
+            avail = 0;
+        }
+    }
+    size_t reason_len = strnlen(reason, avail);
+    size_t zones_len = 0;
+    if (avail > reason_len) {
+        size_t zones_avail = avail - reason_len;
+        size_t zones_cap = sizeof(zones_buf) - 1;
+        if (zones_avail < zones_cap) {
+            zones_cap = zones_avail;
+        }
+        zones_len = strnlen(zones_buf, zones_cap);
+    }
+    snprintf(note, sizeof(note), "cause=%.*s zones=%.*s", (int)reason_len, reason, (int)zones_len, zones_buf);
+    audit_append("alarm_trigger", "system", 1, note);
+}
+
 static uint64_t      s_entry_deadline_us = 0;
 static int           s_entry_zone        = -1;   // indice 0-based di una zona coinvolta
 
@@ -264,6 +330,9 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
                     outputs_siren(true);
                     ESP_LOGW(TAG, "EXIT timeout (ritardo unico) con zona ancora aperta -> ALARM");
                     mqtt_publish_state();
+                    zone_mask_t triggered;
+                    zone_mask_and(&triggered, zmask, &s_exit_guard_mask);
+                    audit_alarm_trigger_event("exit", &triggered, -1);
                 }
                 // reset stato entry eventuale
                 s_entry_pending = false;
@@ -288,6 +357,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
                     outputs_siren(true);
                     ESP_LOGW(TAG, "ENTRY timeout -> ALARM (Z%d)", s_entry_zone >= 0 ? (s_entry_zone + 1) : -1);
                     mqtt_publish_state();
+                    audit_alarm_trigger_event("entry_timeout", &s_entry_zmask, s_entry_zone);
                 }
                 s_entry_pending     = false;
                 s_entry_deadline_us = 0;
@@ -337,6 +407,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
                 outputs_siren(true);
                 ESP_LOGW(TAG, "ZONE instant -> ALARM");
                 mqtt_publish_state();
+                audit_alarm_trigger_event("instant", &trig, -1);
             }
             return;
         }
@@ -358,6 +429,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
             s_entry_zone = min_z;
             s_entry_deadline_us = now + ((uint64_t)min_ms) * 1000ULL;
             ESP_LOGI(TAG, "ENTRY delay avviato %u ms (Z%d)", (unsigned)min_ms, min_z >= 0 ? (min_z + 1) : -1);
+            zone_mask_copy(&s_entry_zmask, &trig);
         } else {
             // Se già in corso, eventualmente ACCORCIA la deadline se il nuovo minimo è più vicino
             const uint64_t candidate = now + ((uint64_t)min_ms) * 1000ULL;
@@ -366,6 +438,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
                 s_entry_zone = min_z;
                 ESP_LOGI(TAG, "ENTRY deadline accorciata a %u ms (Z%d)", (unsigned)min_ms, min_z >= 0 ? (min_z + 1) : -1);
             }
+            zone_mask_or(&s_entry_zmask, &s_entry_zmask, &trig);
         }
     }
 }

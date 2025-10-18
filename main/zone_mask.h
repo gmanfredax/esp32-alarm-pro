@@ -204,6 +204,107 @@ static inline void zone_mask_from_u32(zone_mask_t *mask, uint32_t value)
     }
 }
 
+static inline void zone_mask_format_brief(const zone_mask_t *mask,
+                                          uint16_t limit,
+                                          unsigned max_items,
+                                          char *out,
+                                          size_t cap)
+{
+    if (!out || cap == 0) {
+        return;
+    }
+    if (!mask || limit == 0 || max_items == 0) {
+        if (cap > 0) {
+            if (cap > 1) {
+                out[0] = '-';
+                out[1] = '\0';
+            } else {
+                out[0] = '\0';
+            }
+        }
+        return;
+    }
+    if (limit > ZONE_MASK_CAPACITY) {
+        limit = ZONE_MASK_CAPACITY;
+    }
+    out[0] = '\0';
+    size_t pos = 0;
+    unsigned listed = 0;
+    uint16_t total = 0;
+    for (uint16_t idx = 0; idx < limit; ++idx) {
+        if (!zone_mask_test(mask, idx)) {
+            continue;
+        }
+        ++total;
+        if (listed < max_items) {
+            char token[8];
+            int token_len = snprintf(token, sizeof(token), "Z%u", (unsigned)(idx + 1u));
+            if (token_len < 0) {
+                token_len = 0;
+            }
+            if (listed > 0 && pos < cap) {
+                int written = snprintf(out + pos, cap - pos, ",");
+                if (written < 0) {
+                    written = 0;
+                }
+                if ((size_t)written >= cap - pos) {
+                    pos = cap - 1u;
+                } else {
+                    pos += (size_t)written;
+                }
+            }
+            if (pos < cap) {
+                int written = snprintf(out + pos, cap - pos, "%s", token);
+                if (written < 0) {
+                    written = 0;
+                }
+                if ((size_t)written >= cap - pos) {
+                    pos = cap - 1u;
+                } else {
+                    pos += (size_t)written;
+                }
+            }
+            ++listed;
+        }
+    }
+    if (total == 0) {
+        if (cap > 1) {
+            out[0] = '-';
+            out[1] = '\0';
+        } else if (cap > 0) {
+            out[0] = '\0';
+        }
+        return;
+    }
+    if (total > listed) {
+        if (listed > 0 && pos < cap) {
+            int written = snprintf(out + pos, cap - pos, ",");
+            if (written < 0) {
+                written = 0;
+            }
+            if ((size_t)written >= cap - pos) {
+                pos = cap - 1u;
+            } else {
+                pos += (size_t)written;
+            }
+        }
+        if (pos < cap) {
+            int written = snprintf(out + pos, cap - pos, "+%u", (unsigned)(total - listed));
+            if (written < 0) {
+                written = 0;
+            }
+            if ((size_t)written >= cap - pos) {
+                pos = cap - 1u;
+            } else {
+                pos += (size_t)written;
+            }
+        }
+    } else if (pos == 0 && cap > 1) {
+        out[0] = '-';
+        out[1] = '\0';
+    }
+}
+
 static inline size_t zone_mask_hex_length(uint16_t zone_count)
 {
     size_t words = zone_mask_required_words(zone_count);

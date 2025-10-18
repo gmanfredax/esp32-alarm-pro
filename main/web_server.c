@@ -3888,6 +3888,9 @@ static const char* audit_event_label(const char* code){
     if (strcmp(code, "hw_reset") == 0) return "Reset hardware";
     if (strcmp(code, "websec") == 0) return "Certificato web";
     if (strcmp(code, "tamper_reset") == 0) return "Reset tamper";
+    if (strcmp(code, "alarm_arm") == 0) return "Allarme armato";
+    if (strcmp(code, "alarm_disarm") == 0) return "Allarme disinserito";
+    if (strcmp(code, "alarm_trigger") == 0) return "Allarme zone";
     return code;
 }
 
@@ -3903,6 +3906,15 @@ static void audit_format_message(const audit_entry_t* ent, char* out, size_t cap
 
     if (!ent) {
         snprintf(out, cap, "%s", label);
+        return;
+    }
+
+    if (ent && strcmp(ent->event, "alarm_trigger") == 0) {
+        if (has_note) {
+            snprintf(out, cap, "%s (%s)", label, ent->note);
+        } else {
+            snprintf(out, cap, "%s", label);
+        }
         return;
     }
 
@@ -5247,6 +5259,37 @@ static esp_err_t arm_post(httpd_req_t* req)
     }
     alarm_begin_exit(exit_ms);
 
+    char scene_desc[48];
+    zone_mask_format_brief(&scene_mask, (uint16_t)zones_total, 4, scene_desc, sizeof(scene_desc));
+    char note[64];
+    size_t avail = sizeof(note);
+    if (avail > 0) {
+        const size_t prefix = 12; // strlen("mode=") + strlen(" scene=")
+        if (avail > 1) {
+            avail -= 1;
+        }
+        if (avail > prefix) {
+            avail -= prefix;
+        } else {
+            avail = 0;
+        }
+    }
+    size_t mode_len = strnlen(mode, sizeof(mode) - 1);
+    if (mode_len > avail) {
+        mode_len = avail;
+    }
+    size_t scene_len = 0;
+    if (avail > mode_len) {
+        size_t scene_avail = avail - mode_len;
+        size_t scene_cap = sizeof(scene_desc) - 1;
+        if (scene_avail < scene_cap) {
+            scene_cap = scene_avail;
+        }
+        scene_len = strnlen(scene_desc, scene_cap);
+    }
+    snprintf(note, sizeof(note), "mode=%.*s scene=%.*s", (int)mode_len, mode, (int)scene_len, scene_desc);
+    audit_append("alarm_arm", user, 1, note);
+
     return json_reply(req, "{\"ok\":true}");
 }
 
@@ -5300,8 +5343,45 @@ static esp_err_t tamper_reset_post(httpd_req_t* req)
 
     cJSON_Delete(root);
 
+    alarm_state_t prev_state = alarm_get_state();
+    zone_mask_t scene_mask;
+    scenes_get_active_mask(&scene_mask);
+    int zones_total = zones_effective_total();
+    if (zones_total < 0) {
+        zones_total = 0;
+    }
+    zone_mask_limit(&scene_mask, (uint16_t)zones_total);
+    char scene_desc[48];
+    zone_mask_format_brief(&scene_mask, (uint16_t)zones_total, 4, scene_desc, sizeof(scene_desc));
+    const char *prev_label = alarm_state_name(prev_state);
+    char disarm_note[64];
+    size_t avail_note = sizeof(disarm_note);
+    if (avail_note > 0) {
+        const size_t prefix = 25; // strlen("prev=") + strlen(" scene=") + strlen(" cause=tamper")
+        if (avail_note > 1) {
+            avail_note -= 1;
+        }
+        if (avail_note > prefix) {
+            avail_note -= prefix;
+        } else {
+            avail_note = 0;
+        }
+    }
+    size_t prev_len = strnlen(prev_label, avail_note);
+    size_t scene_len = 0;
+    if (avail_note > prev_len) {
+        size_t scene_avail = avail_note - prev_len;
+        size_t scene_cap = sizeof(scene_desc) - 1;
+        if (scene_avail < scene_cap) {
+            scene_cap = scene_avail;
+        }
+        scene_len = strnlen(scene_desc, scene_cap);
+    }
+    snprintf(disarm_note, sizeof(disarm_note), "prev=%.*s scene=%.*s cause=tamper", (int)prev_len, prev_label, (int)scene_len, scene_desc);
+
     alarm_disarm();
     audit_append("tamper_reset", user, 1, "Reset tamper");
+    audit_append("alarm_disarm", user, 1, disarm_note);
     return json_reply(req, "{\"ok\":true}");
 }
 
@@ -5327,7 +5407,44 @@ static esp_err_t disarm_post(httpd_req_t* req)
     if(!pin[0]) return httpd_resp_send_err(req, 400, "pin"), ESP_FAIL;
     if(!auth_verify_pin(user, pin)) return httpd_resp_send_err(req, 401, "bad pin"), ESP_FAIL;
 
+    alarm_state_t prev_state = alarm_get_state();
+    zone_mask_t scene_mask;
+    scenes_get_active_mask(&scene_mask);
+    int zones_total = zones_effective_total();
+    if (zones_total < 0) {
+        zones_total = 0;
+    }
+    zone_mask_limit(&scene_mask, (uint16_t)zones_total);
+    char scene_desc[48];
+    zone_mask_format_brief(&scene_mask, (uint16_t)zones_total, 4, scene_desc, sizeof(scene_desc));
+    const char *prev_label = alarm_state_name(prev_state);
+    char note[64];
+    size_t avail = sizeof(note);
+    if (avail > 0) {
+        const size_t prefix = 12; // strlen("prev=") + strlen(" scene=")
+        if (avail > 1) {
+            avail -= 1;
+        }
+        if (avail > prefix) {
+            avail -= prefix;
+        } else {
+            avail = 0;
+        }
+    }
+    size_t prev_len = strnlen(prev_label, avail);
+    size_t scene_len = 0;
+    if (avail > prev_len) {
+        size_t scene_avail = avail - prev_len;
+        size_t scene_cap = sizeof(scene_desc) - 1;
+        if (scene_avail < scene_cap) {
+            scene_cap = scene_avail;
+        }
+        scene_len = strnlen(scene_desc, scene_cap);
+    }
+    snprintf(note, sizeof(note), "prev=%.*s scene=%.*s", (int)prev_len, prev_label, (int)scene_len, scene_desc);
+
     alarm_disarm();
+    audit_append("alarm_disarm", user, 1, note);
     return json_reply(req, "{\"ok\":true}");
 }
 

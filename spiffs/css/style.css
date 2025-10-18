@@ -207,7 +207,13 @@ body.modal-open{overflow:hidden;}
 .tag.err{background:rgba(239,68,68,.18);border-color:rgba(239,68,68,.45);color:#fecaca}
 
 /* .zones-grid{display:ruby;grid-template-columns:repeat(2,1fr);gap:12px} */
-.zones-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
+/*.zones-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}*/
+.zones-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(240px,1fr));
+  gap:16px;
+}
+.zones-grid .card{margin:0}
 .board-sections{display:flex;flex-direction:column;gap:1.5rem}
 .board-section{display:flex;flex-direction:column;gap:.85rem}
 .board-header{display:flex;align-items:center;justify-content:space-between;gap:.75rem}
@@ -221,12 +227,18 @@ body.modal-open{overflow:hidden;}
 .board-count{font-size:.85rem;color:var(--muted)}
 /* Badge nelle card zona (RA/RC/AE) */
 /* .zones-grid .chip { position: relative; padding-right: 3.2rem; min-width: 200px;}*/
-.zones-grid .chip { position: relative; padding-right: 3.2rem; min-width: 160px;}
+/*.zones-grid .chip { position: relative; padding-right: 3.2rem; min-width: 160px;}*/
+.zones-grid .chip {
+  position: relative;
+  padding-right: 3.2rem;
+  min-width: 0;
+  width: 100%;
+}
 .zones-grid .badges { position:absolute; top:.35rem; right:.35rem; display:flex; gap:.25rem; }
 .badge { font-size:.62rem; line-height:1; padding:.18rem .32rem; border-radius:.3rem;
   background:rgba(120,160,200,.18); border:1px solid rgba(120,160,200,.35); }
-@media(min-width:640px){.zones-grid{grid-template-columns:repeat(3,1fr)}}
-@media(min-width:960px){.zones-grid{grid-template-columns:repeat(6,1fr)}}
+/*@media(min-width:640px){.zones-grid{grid-template-columns:repeat(3,1fr)}}
+@media(min-width:960px){.zones-grid{grid-template-columns:repeat(6,1fr)}}*/
 
 .chip{display:inline-block;border:1px solid var(--border);padding:.4rem .7rem;border-radius:12px}
 .chip.on{background:var(--accent);color:#00152a;border-color:var(--accent)}
