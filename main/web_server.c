@@ -92,6 +92,13 @@ static void web_server_restart_async(void);
 static const char *TAG = "web";
 static const char *TAG_ADMIN __attribute__((unused)) = "admin_html";
 
+static bool parse_can_node_id(const char *uri, uint8_t *out_node);
+static bool parse_can_node_outputs_uri(const char *uri, uint8_t *out_node);
+static bool parse_can_node_assign_uri(const char *uri, uint8_t *out_node);
+static bool web_uri_match(const char *reference_uri,
+                          const char *uri_to_match,
+                          size_t match_upto);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
 // ─────────────────────────────────────────────────────────────────────────────
@@ -648,6 +655,67 @@ static bool parse_can_nodes_uri(const char *uri, uint8_t *out_node)
         *out_node = (uint8_t)node;
     }
     return true;
+}
+
+static bool web_uri_match(const char *reference_uri,
+                          const char *uri_to_match,
+                          size_t match_upto)
+{
+    if (!reference_uri || !uri_to_match) {
+        return false;
+    }
+
+    if (httpd_uri_match_wildcard(reference_uri, uri_to_match, match_upto)) {
+        return true;
+    }
+
+    int can_match_kind = 0;
+    if (strcmp(reference_uri, "/api/can/node/*/assign") == 0) {
+        can_match_kind = 1;
+    } else if (strcmp(reference_uri, "/api/can/node/*/outputs") == 0) {
+        can_match_kind = 2;
+    } else if (strcmp(reference_uri, "/api/can/node/*/identify") == 0) {
+        can_match_kind = 3;
+    } else {
+        return false;
+    }
+
+    size_t uri_len = strlen(uri_to_match);
+    size_t effective_len = match_upto;
+    if (effective_len == 0 || effective_len > uri_len) {
+        effective_len = uri_len;
+    }
+
+    size_t path_len = strcspn(uri_to_match, "?");
+    if (path_len > effective_len) {
+        path_len = effective_len;
+    }
+
+    char *path = malloc(path_len + 1);
+    if (!path) {
+        return false;
+    }
+    memcpy(path, uri_to_match, path_len);
+    path[path_len] = '\0';
+
+    bool matched = false;
+    switch (can_match_kind) {
+        case 1:
+            matched = parse_can_node_assign_uri(path, NULL);
+            break;
+        case 2:
+            matched = parse_can_node_outputs_uri(path, NULL);
+            break;
+        case 3:
+            matched = parse_can_node_id(path, NULL);
+            break;
+        default:
+            matched = false;
+            break;
+    }
+
+    free(path);
+    return matched;
 }
 
 static esp_err_t api_can_nodes_get(httpd_req_t *req)
@@ -4536,7 +4604,7 @@ static esp_err_t start_http_redirect_server(void){
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
     cfg.ctrl_port += 1;  // avoid clashing with the HTTPS server control socket
-    cfg.uri_match_fn = httpd_uri_match_wildcard;
+    cfg.uri_match_fn = web_uri_match; //httpd_uri_match_wildcard;
     cfg.lru_purge_enable = true;
     httpd_handle_t srv = NULL;
     esp_err_t err = httpd_start(&srv, &cfg);
@@ -4771,7 +4839,7 @@ static esp_err_t start_web(void){
     cfg.max_uri_handlers = 150;
     cfg.lru_purge_enable = true;
     cfg.server_port = 443;
-    cfg.uri_match_fn = httpd_uri_match_wildcard;
+    cfg.uri_match_fn = web_uri_match; //httpd_uri_match_wildcard;
 
     httpd_handle_t srv = NULL;
     esp_err_t err = https_start(&srv, &cfg);

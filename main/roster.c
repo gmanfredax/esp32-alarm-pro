@@ -8,8 +8,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_timer.h"
+#include "esp_log.h"
+#include "nvs.h"
 
 #define ROSTER_MAX_NODES 128u
+#define ROSTER_NVS_NAMESPACE "roster"
+#define ROSTER_NVS_KEY_UID_MAP "uid_map"
+
+static const char *TAG = "roster";
 
 typedef struct {
     bool used;
@@ -38,6 +44,63 @@ static roster_master_info_t s_master = {
 static roster_node_t s_nodes[ROSTER_MAX_NODES];
 static roster_uid_entry_t s_uid_map[ROSTER_MAX_NODES];
 static SemaphoreHandle_t s_roster_lock = NULL;
+
+static esp_err_t uid_map_save_locked(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(ROSTER_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_open(%s) failed: %s", ROSTER_NVS_NAMESPACE, esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_blob(handle, ROSTER_NVS_KEY_UID_MAP, s_uid_map, sizeof(s_uid_map));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to persist CAN UID map: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(handle);
+    return err;
+}
+
+static void uid_map_load_locked(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(ROSTER_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        if (err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "nvs_open(%s) for read failed: %s", ROSTER_NVS_NAMESPACE, esp_err_to_name(err));
+        }
+        return;
+    }
+
+    size_t required = sizeof(s_uid_map);
+    err = nvs_get_blob(handle, ROSTER_NVS_KEY_UID_MAP, s_uid_map, &required);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        memset(s_uid_map, 0, sizeof(s_uid_map));
+    } else if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to load CAN UID map: %s", esp_err_to_name(err));
+        memset(s_uid_map, 0, sizeof(s_uid_map));
+    } else if (required != sizeof(s_uid_map)) {
+        if (required < sizeof(s_uid_map)) {
+            memset(((uint8_t *)s_uid_map) + required, 0, sizeof(s_uid_map) - required);
+        }
+    }
+    nvs_close(handle);
+
+    for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
+        roster_uid_entry_t *entry = &s_uid_map[i];
+        if (!entry->used) {
+            continue;
+        }
+        if (entry->node_id == 0 || entry->node_id >= ROSTER_MAX_NODES) {
+            memset(entry, 0, sizeof(*entry));
+        }
+    }
+}
 
 static SemaphoreHandle_t ensure_lock(void)
 {
@@ -90,34 +153,52 @@ static bool uid_map_lookup(const uint8_t *uid, uint8_t *out_node_id)
     return false;
 }
 
-static void uid_map_set(uint8_t node_id, const uint8_t *uid)
+static bool uid_map_set_internal(uint8_t node_id, const uint8_t *uid)
 {
     if (node_id == 0 || !uid) {
-        return;
+        return false;
     }
+    bool changed = false;
+    bool found = false;
     for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
         roster_uid_entry_t *entry = &s_uid_map[i];
         if (entry->used && entry->node_id == node_id) {
-            memcpy(entry->uid, uid, sizeof(entry->uid));
-            return;
+            if (memcmp(entry->uid, uid, sizeof(entry->uid)) != 0) {
+                memcpy(entry->uid, uid, sizeof(entry->uid));
+                changed = true;
+            }
+            found = true;
+            break;
         }
     }
-    for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
-        roster_uid_entry_t *entry = &s_uid_map[i];
-        if (entry->used) {
-            continue;
+    if (!found) {
+        for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
+            roster_uid_entry_t *entry = &s_uid_map[i];
+            if (entry->used) {
+                continue;
+            }
+            entry->used = true;
+            entry->node_id = node_id;
+            memcpy(entry->uid, uid, sizeof(entry->uid));
+            changed = true;
+            found = true;
+            break;
         }
-        entry->used = true;
-        entry->node_id = node_id;
-        memcpy(entry->uid, uid, sizeof(entry->uid));
-        return;
+    }
+    return changed;
+}
+
+static void uid_map_set(uint8_t node_id, const uint8_t *uid)
+{
+    if (uid_map_set_internal(node_id, uid)) {
+        uid_map_save_locked();
     }
 }
 
-static void uid_map_clear(uint8_t node_id)
+static bool uid_map_clear_internal(uint8_t node_id)
 {
     if (node_id == 0) {
-        return;
+        return false;
     }
     for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
         roster_uid_entry_t *entry = &s_uid_map[i];
@@ -126,8 +207,16 @@ static void uid_map_clear(uint8_t node_id)
         }
         if (entry->node_id == node_id) {
             memset(entry, 0, sizeof(*entry));
-            return;
+            return true;
         }
+    }
+    return false;
+}
+
+static void uid_map_clear(uint8_t node_id)
+{
+    if (uid_map_clear_internal(node_id)) {
+        uid_map_save_locked();
     }
 }
 
@@ -175,6 +264,7 @@ void roster_init(uint8_t master_inputs, uint8_t master_outputs, uint16_t master_
     xSemaphoreTake(s_roster_lock, portMAX_DELAY);
     memset(s_nodes, 0, sizeof(s_nodes));
     memset(s_uid_map, 0, sizeof(s_uid_map));
+    uid_map_load_locked();
     strncpy(s_master.label, "Centrale", sizeof(s_master.label) - 1);
     strncpy(s_master.kind, "master", sizeof(s_master.kind) - 1);
     s_master.caps = master_caps;
@@ -190,6 +280,7 @@ esp_err_t roster_reset(void)
     xSemaphoreTake(s_roster_lock, portMAX_DELAY);
     memset(s_nodes, 0, sizeof(s_nodes));
     memset(s_uid_map, 0, sizeof(s_uid_map));
+    uid_map_save_locked();
     xSemaphoreGive(s_roster_lock);
     return ESP_OK;
 }
@@ -440,10 +531,18 @@ esp_err_t roster_reassign_node_id(uint8_t current_id, uint8_t new_id)
     dst->identify_active = false;
     dst->last_seen_ms = 0;
 
-    uid_map_clear(current_id);
-    uid_map_clear(new_id);
-    if (snapshot.info_valid) {
-        uid_map_set(new_id, snapshot.uid);
+    bool map_changed = false;
+    if (uid_map_clear_internal(current_id)) {
+        map_changed = true;
+    }
+    if (uid_map_clear_internal(new_id)) {
+        map_changed = true;
+    }
+    if (snapshot.info_valid && uid_map_set_internal(new_id, snapshot.uid)) {
+        map_changed = true;
+    }
+    if (map_changed) {
+        uid_map_save_locked();
     }
 
     xSemaphoreGive(s_roster_lock);
