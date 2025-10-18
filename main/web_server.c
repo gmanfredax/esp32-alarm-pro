@@ -3888,10 +3888,125 @@ static const char* audit_event_label(const char* code){
     if (strcmp(code, "hw_reset") == 0) return "Reset hardware";
     if (strcmp(code, "websec") == 0) return "Certificato web";
     if (strcmp(code, "tamper_reset") == 0) return "Reset tamper";
+    if (strcmp(code, "tamper_alarm") == 0) return "Tamper violato";
     if (strcmp(code, "alarm_arm") == 0) return "Allarme armato";
     if (strcmp(code, "alarm_disarm") == 0) return "Allarme disinserito";
     if (strcmp(code, "alarm_trigger") == 0) return "Allarme zone";
     return code;
+}
+
+static bool extract_note_field(const char *note, const char *key, char *out, size_t cap)
+{
+    if (!out || cap == 0 || !note || !key || !key[0]) {
+        return false;
+    }
+    out[0] = '\0';
+    size_t key_len = strlen(key);
+    const char *cursor = note;
+    while (*cursor) {
+        while (*cursor == ' ') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        const char *segment_end = strchr(cursor, ' ');
+        size_t segment_len = segment_end ? (size_t)(segment_end - cursor) : strlen(cursor);
+        if (segment_len > key_len + 1 && strncmp(cursor, key, key_len) == 0 && cursor[key_len] == '=') {
+            size_t value_len = segment_len - key_len - 1;
+            if (value_len >= cap) {
+                value_len = cap - 1;
+            }
+            memcpy(out, cursor + key_len + 1, value_len);
+            out[value_len] = '\0';
+            return true;
+        }
+        cursor += segment_len;
+        if (*cursor == ' ') {
+            ++cursor;
+        }
+    }
+    return false;
+}
+
+static void scenario_label_from_code(const char *code, char *out, size_t cap)
+{
+    if (!out || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!code || !code[0]) {
+        return;
+    }
+    char buffer[48];
+    strlcpy(buffer, code, sizeof(buffer));
+    char *start = buffer;
+    if (strncasecmp(start, "ARMED_", 6) == 0) {
+        start += 6;
+    } else if (strncasecmp(start, "PRE_", 4) == 0) {
+        start += 4;
+    }
+    for (char *p = start; *p; ++p) {
+        if (*p == '_' || *p == '-') {
+            *p = ' ';
+        } else {
+            *p = (char)tolower((unsigned char)*p);
+        }
+    }
+    bool new_word = true;
+    size_t out_idx = 0;
+    for (const char *p = start; *p && out_idx + 1 < cap; ++p) {
+        char c = *p;
+        if (c == ' ') {
+            if (out_idx == 0 || out[out_idx - 1] == ' ') {
+                continue;
+            }
+            out[out_idx++] = ' ';
+            new_word = true;
+            continue;
+        }
+        if (new_word) {
+            out[out_idx++] = (char)toupper((unsigned char)c);
+            new_word = false;
+        } else {
+            out[out_idx++] = c;
+        }
+    }
+    while (out_idx > 0 && out[out_idx - 1] == ' ') {
+        --out_idx;
+    }
+    out[out_idx] = '\0';
+    if (out[0] == '\0') {
+        strlcpy(out, code, cap);
+    }
+}
+
+static void format_user_display(const char *username, char *out, size_t cap)
+{
+    if (!out || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!username || !username[0]) {
+        return;
+    }
+    bool has_upper = false;
+    for (const char *p = username; *p; ++p) {
+        if (isupper((unsigned char)*p)) {
+            has_upper = true;
+            break;
+        }
+    }
+    if (!has_upper) {
+        size_t idx = 0;
+        for (const char *p = username; *p && idx + 1 < cap; ++p) {
+            out[idx] = (idx == 0) ? (char)toupper((unsigned char)*p) : (char)tolower((unsigned char)*p);
+            ++idx;
+        }
+        out[idx] = '\0';
+        return;
+    }
+    strlcpy(out, username, cap);
 }
 
 static void audit_format_message(const audit_entry_t* ent, char* out, size_t cap){
@@ -3909,7 +4024,48 @@ static void audit_format_message(const audit_entry_t* ent, char* out, size_t cap
         return;
     }
 
-    if (ent && strcmp(ent->event, "alarm_trigger") == 0) {
+    if (strcmp(ent->event, "alarm_arm") == 0 || strcmp(ent->event, "alarm_disarm") == 0) {
+        char scenario_code[48];
+        scenario_code[0] = '\0';
+        if (strcmp(ent->event, "alarm_arm") == 0) {
+            extract_note_field(ent->note, "mode", scenario_code, sizeof(scenario_code));
+        } else {
+            extract_note_field(ent->note, "prev", scenario_code, sizeof(scenario_code));
+        }
+        char scenario_label[48];
+        scenario_label_from_code(scenario_code, scenario_label, sizeof(scenario_label));
+        if (!scenario_label[0]) {
+            strlcpy(scenario_label, "—", sizeof(scenario_label));
+        }
+        char user_buf[48];
+        format_user_display(ent->username, user_buf, sizeof(user_buf));
+        if (!user_buf[0]) {
+            strlcpy(user_buf, "-", sizeof(user_buf));
+        }
+        const char *action = (strcmp(ent->event, "alarm_arm") == 0) ? "INSERITO" : "DISINSERITO";
+        snprintf(out, cap, "Allarme %s - scenario: %s\nutente: %s", action, scenario_label, user_buf);
+        return;
+    }
+
+    if (strcmp(ent->event, "tamper_alarm") == 0) {
+        char prev_code[48];
+        prev_code[0] = '\0';
+        extract_note_field(ent->note, "prev", prev_code, sizeof(prev_code));
+        char scenario_label[48];
+        scenario_label_from_code(prev_code, scenario_label, sizeof(scenario_label));
+        if (!scenario_label[0]) {
+            strlcpy(scenario_label, "—", sizeof(scenario_label));
+        }
+        char user_buf[48];
+        format_user_display(ent->username, user_buf, sizeof(user_buf));
+        if (!user_buf[0]) {
+            strlcpy(user_buf, "Sistema", sizeof(user_buf));
+        }
+        snprintf(out, cap, "Allarme TAMPER - scenario: %s\nutente: %s", scenario_label, user_buf);
+        return;
+    }
+
+    if (strcmp(ent->event, "alarm_trigger") == 0) {
         if (has_note) {
             snprintf(out, cap, "%s (%s)", label, ent->note);
         } else {
@@ -3941,6 +4097,20 @@ static void audit_format_message(const audit_entry_t* ent, char* out, size_t cap
                  has_user ? " per " : "",
                  has_user ? ent->username : "");
     }
+}
+
+static bool logs_event_is_alarm_related(const audit_entry_t *ent)
+{
+    if (!ent || !ent->event[0]) {
+        return false;
+    }
+    const char *ev = ent->event;
+    if (strcasecmp(ev, "alarm_arm") == 0) return true;
+    if (strcasecmp(ev, "alarm_disarm") == 0) return true;
+    if (strcasecmp(ev, "alarm_trigger") == 0) return true;
+    if (strcasecmp(ev, "tamper_alarm") == 0) return true;
+    if (strcasecmp(ev, "tamper_reset") == 0) return true;
+    return false;
 }
 
 static size_t json_escape_string(const char *src, char *dst, size_t dst_cap)
@@ -4205,7 +4375,7 @@ static esp_err_t logs_get(httpd_req_t* req){
                            sizeof(entry_buf) - (size_t)offset,
                            "\"ts_us\":%.0f,\"uptime_s\":%.6f,\"result\":%d,"
                            "\"event\":\"%s\",\"user\":\"%s\",\"note\":\"%s\","
-                           "\"message\":\"%s\",\"level\":\"%s\"}",
+                           "\"message\":\"%s\",\"level\":\"%s\"",
                            (double)ent->ts_us,
                            (double)ent->ts_us / 1000000.0,
                            ent->result,
@@ -4216,6 +4386,24 @@ static esp_err_t logs_get(httpd_req_t* req){
                            level);
         if (offset < 0 || offset >= (int)sizeof(entry_buf)) {
             entry_buf[sizeof(entry_buf) - 1] = '\0';
+        }
+
+        if (offset >= 0 && offset < (int)sizeof(entry_buf) && logs_event_is_alarm_related(ent)) {
+            offset += snprintf(entry_buf + offset,
+                               sizeof(entry_buf) - (size_t)offset,
+                               ",\"category\":\"alarm\"");
+            if (offset < 0 || offset >= (int)sizeof(entry_buf)) {
+                entry_buf[sizeof(entry_buf) - 1] = '\0';
+            }
+        }
+
+        if (offset >= 0 && offset < (int)sizeof(entry_buf)) {
+            if ((size_t)offset < sizeof(entry_buf) - 1) {
+                entry_buf[offset++] = '}';
+                entry_buf[offset] = '\0';
+            } else {
+                entry_buf[sizeof(entry_buf) - 1] = '\0';
+            }
         }
 
         send_err = httpd_resp_sendstr_chunk(req, entry_buf);

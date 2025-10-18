@@ -79,6 +79,12 @@ function startZonesUpdates({ immediate = false } = {}){
   }, ZONESS_POLL_INTERVAL);
 }
 
+function setDisarmVisibility(visible){
+  const btn = $('#disarmBtn');
+  if (!btn) return;
+  btn.classList.toggle('hidden', !visible);
+}
+
 const dateTimeFormatter = new Intl.DateTimeFormat('it-IT', {
   dateStyle: 'short',
   timeStyle: 'medium'
@@ -545,8 +551,10 @@ async function refreshStatus(){
   try {
     const data = await apiGet('/api/status');
     const prevStateName = state.status?.state || '';
+    const prevAlarmZoneIds = Array.isArray(state.alarmZoneIds) ? [...state.alarmZoneIds] : [];
     state.status = data;
     const isAlarmState = data?.state === 'ALARM';
+    const tamperAlarmActive = Boolean(data?.tamper_alarm && isAlarmState);
 
     if (isAlarmState) {
       if (!state.sceneMaskSyncedForAlarm) {
@@ -564,14 +572,21 @@ async function refreshStatus(){
       state.sceneMaskSyncedForAlarm = false;
     }
 
-    state.alarmZoneIds = computeAlarmZoneIds(data, {
+    let computedAlarmZoneIds = computeAlarmZoneIds(data, {
       sceneMask: state.sceneActiveMask,
       sceneMaskKnown: state.sceneMaskKnown,
       bypassMask: data?.bypass_mask,
       knownFlags: data?.zones_known
     });
-    state.tamperAlarm = Boolean(data?.tamper_alarm && data?.state === 'ALARM');
+    if (!isAlarmState) {
+      computedAlarmZoneIds = [];
+    } else if (tamperAlarmActive && !computedAlarmZoneIds.length && prevAlarmZoneIds.length) {
+      computedAlarmZoneIds = prevAlarmZoneIds;
+    }
+    state.alarmZoneIds = computedAlarmZoneIds;
+    state.tamperAlarm = tamperAlarmActive;
     setBrandCentralName(data?.central_name);
+    setDisarmVisibility(isAlarmState);
     const wrap = $('#statusCards');
     if (!wrap) return;
     const zonesActive = Array.isArray(data?.zones_active) ? data.zones_active.filter(Boolean).length : (data?.zones_active || 0);
@@ -961,9 +976,24 @@ function getLogLevel(entry){
   return typeof level === 'string' ? level.toUpperCase() : String(level ?? '');
 }
 
+function hasCategory(entry, desired){
+  if (!entry || !desired) return false;
+  const target = desired.toString().toLowerCase();
+  const single = entry?.category;
+  if (typeof single === 'string' && single.toLowerCase() === target) {
+    return true;
+  }
+  const categories = entry?.categories;
+  if (Array.isArray(categories)) {
+    return categories.some((item) => typeof item === 'string' && item.toLowerCase() === target);
+  }
+  return false;
+}
+
 function filterLogEntries(entries, filter){
   if (filter === 'all') return entries;
   return entries.filter((entry) => {
+    if (filter === 'alarm') return hasCategory(entry, 'alarm');
     const level = getLogLevel(entry);
     if (!level) return false;
     if (filter === 'info') return level.includes('INFO');
@@ -1012,11 +1042,19 @@ function renderLogEntries(entries){
     const level = getLogLevel(entry);
     const ts = formatLogTimestamp(entry?.ts ?? entry?.timestamp ?? entry?.time ?? entry?.date);
     const levelTag = level ? `<span class="tag ${level.includes('ERR') ? 'err' : level.includes('WARN') ? 'warn' : ''}">${level}</span>` : '';
+    const tags = [];
+    if (hasCategory(entry, 'alarm')) {
+      tags.push('<span class="tag alarm">Allarme</span>');
+    }
+    if (levelTag) {
+      tags.push(levelTag);
+    }
+    const tagsHtml = tags.join(' ');
     return `
       <div class="log-entry">
         <div class="log-meta">
           <span>${escapeHtml(ts || '—')}</span>
-          ${levelTag}
+          ${tagsHtml}
         </div>
         <div class="log-body">${message}</div>
       </div>`;

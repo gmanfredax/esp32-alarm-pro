@@ -205,6 +205,7 @@ body.modal-open{overflow:hidden;}
 .tag.ok{background:rgba(16,185,129,.15);border-color:rgba(16,185,129,.45);color:#c7f9d4}
 .tag.warn{background:rgba(250,204,21,.16);border-color:rgba(250,204,21,.42);color:#fde68a}
 .tag.err{background:rgba(239,68,68,.18);border-color:rgba(239,68,68,.45);color:#fecaca}
+.tag.alarm{background:rgba(56,189,248,.18);border-color:rgba(56,189,248,.5);color:#bae6fd}
 
 /* .zones-grid{display:ruby;grid-template-columns:repeat(2,1fr);gap:12px} */
 /*.zones-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}*/

@@ -19,6 +19,7 @@ static profile_t     profiles[7];
 
 // True se l'ultimo passaggio allo stato ALARM è stato causato dal tamper
 static bool          s_alarm_from_tamper = false;
+static bool          s_tamper_latched   = false;
 
 // Bypass dinamico valido per la singola sessione ARM (auto-exclude)
 static zone_mask_t   s_bypass_mask;
@@ -100,6 +101,45 @@ static void audit_alarm_trigger_event(const char *cause, const zone_mask_t *zone
     audit_append("alarm_trigger", "system", 1, note);
 }
 
+static void audit_tamper_alarm_event(const char *prev_state_label)
+{
+    const char *prev = (prev_state_label && prev_state_label[0]) ? prev_state_label : "";
+    zone_mask_t scene_mask;
+    zone_mask_clear(&scene_mask);
+    scenes_get_active_mask(&scene_mask);
+    zone_mask_limit(&scene_mask, ALARM_MAX_ZONES);
+    char scene_desc[48];
+    zone_mask_format_brief(&scene_mask, ALARM_MAX_ZONES, 4, scene_desc, sizeof(scene_desc));
+
+    char note[64];
+    size_t avail = sizeof(note);
+    if (avail > 0) {
+        const size_t prefix = 12; // strlen("prev=") + strlen(" scene=")
+        if (avail > 1) {
+            avail -= 1;
+        }
+        if (avail > prefix) {
+            avail -= prefix;
+        } else {
+            avail = 0;
+        }
+    }
+
+    size_t prev_len = strnlen(prev, avail);
+    size_t scene_len = 0;
+    if (avail > prev_len) {
+        size_t scene_avail = avail - prev_len;
+        size_t scene_cap = sizeof(scene_desc) - 1;
+        if (scene_avail < scene_cap) {
+            scene_cap = scene_avail;
+        }
+        scene_len = strnlen(scene_desc, scene_cap);
+    }
+
+    snprintf(note, sizeof(note), "prev=%.*s scene=%.*s", (int)prev_len, prev, (int)scene_len, scene_desc);
+    audit_append("tamper_alarm", "system", 0, note);
+}
+
 static uint64_t      s_entry_deadline_us = 0;
 static int           s_entry_zone        = -1;   // indice 0-based di una zona coinvolta
 
@@ -115,6 +155,7 @@ void alarm_init(void)
     s_entry_deadline_us = 0;
     s_entry_zone = -1;
     s_alarm_from_tamper = false;
+    s_tamper_latched = false;
     zone_mask_clear(&s_exit_guard_mask);
     zone_mask_clear(&s_entry_zmask);
     memset(s_zone_opts, 0, sizeof(s_zone_opts));
@@ -269,6 +310,7 @@ void alarm_disarm(void)
     s_entry_deadline_us = 0;
     s_entry_zone = -1;
     s_alarm_from_tamper = false;
+    s_tamper_latched = false;
     zone_mask_clear(&s_exit_guard_mask);
     zone_mask_clear(&s_entry_zmask);
 
@@ -295,6 +337,11 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
     }
     // Tamper ha priorità (eccetto manutenzione)
     if (tamper) {
+        if (!s_tamper_latched) {
+            const char *prev_label = alarm_state_name(s_state);
+            audit_tamper_alarm_event(prev_label);
+            s_tamper_latched = true;
+        }
         if (s_state != ALARM_MAINTENANCE) {
             if (s_state != ALARM_ALARM) {
                 s_state = ALARM_ALARM;
@@ -306,6 +353,11 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
         }
         return;
     }
+
+    if (s_tamper_latched) {
+        s_tamper_latched = false;
+    }
+
 
     // Stati ARMATI: gestisci trigger zone / ritardi
     if (s_state == ALARM_ARMED_HOME || s_state == ALARM_ARMED_AWAY || s_state == ALARM_ARMED_NIGHT || s_state == ALARM_ARMED_CUSTOM)
