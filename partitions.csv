@@ -1,10 +1,10 @@
 # --- Partitions (16MB flash) ---
 # Layout coerente e capiente: Factory 2M, OTA 3M+3M, SPIFFS 6M
 # Name,   Type, SubType, Offset,   Size,  Flags
-nvs,      data, nvs,     0x9000,   0x5000
-otadata,  data, ota,     0xE000,   0x2000
-phy_init, data, phy,     0x10000,  0x1000
-factory,  app,  factory, 0x20000,  2M
+nvs,      data, nvs,     0x9000,   0x37000
+otadata,  data, ota,     0x40000,  0x2000
+phy_init, data, phy,     0x42000,  0x1000
+factory,  app,  factory, 0x50000,  2M
 ota_0,    app,  ota_0,            ,3M
 ota_1,    app,  ota_1,            ,3M
 spiffs,   data, spiffs,           ,6M

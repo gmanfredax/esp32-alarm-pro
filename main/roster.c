@@ -14,6 +14,7 @@
 #define ROSTER_MAX_NODES 128u
 #define ROSTER_NVS_NAMESPACE "roster"
 #define ROSTER_NVS_KEY_UID_MAP "uid_map"
+#define ROSTER_UID_MAP_VERSION 1u
 
 static const char *TAG = "roster";
 
@@ -45,6 +46,13 @@ static roster_node_t s_nodes[ROSTER_MAX_NODES];
 static roster_uid_entry_t s_uid_map[ROSTER_MAX_NODES];
 static SemaphoreHandle_t s_roster_lock = NULL;
 
+static bool uid_map_set_internal(uint8_t node_id, const uint8_t *uid);
+
+typedef struct {
+    uint8_t node_id;
+    uint8_t uid[sizeof(((roster_node_t *)0)->uid)];
+} roster_uid_record_t;
+
 static esp_err_t uid_map_save_locked(void)
 {
     nvs_handle_t handle;
@@ -54,7 +62,38 @@ static esp_err_t uid_map_save_locked(void)
         return err;
     }
 
-    err = nvs_set_blob(handle, ROSTER_NVS_KEY_UID_MAP, s_uid_map, sizeof(s_uid_map));
+    roster_uid_record_t records[ROSTER_MAX_NODES];
+    uint8_t count = 0;
+    for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
+        const roster_uid_entry_t *entry = &s_uid_map[i];
+        if (!entry->used) {
+            continue;
+        }
+        if (count >= ROSTER_MAX_NODES) {
+            break;
+        }
+        records[count].node_id = entry->node_id;
+        memcpy(records[count].uid, entry->uid, sizeof(records[count].uid));
+        ++count;
+    }
+
+    uint8_t blob[2 + sizeof(records)];
+    blob[0] = ROSTER_UID_MAP_VERSION;
+    blob[1] = count;
+    size_t blob_size = 2 + ((size_t)count) * sizeof(roster_uid_record_t);
+    if (count > 0) {
+        memcpy(blob + 2, records, ((size_t)count) * sizeof(roster_uid_record_t));
+    }
+
+    err = nvs_set_blob(handle, ROSTER_NVS_KEY_UID_MAP, blob, blob_size);
+    if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
+        esp_err_t erase_err = nvs_erase_key(handle, ROSTER_NVS_KEY_UID_MAP);
+        if (erase_err != ESP_OK && erase_err != ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGW(TAG, "Failed to erase UID map blob before retry: %s", esp_err_to_name(erase_err));
+        } else {
+            err = nvs_set_blob(handle, ROSTER_NVS_KEY_UID_MAP, blob, blob_size);
+        }
+    }
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
@@ -77,17 +116,44 @@ static void uid_map_load_locked(void)
         return;
     }
 
-    size_t required = sizeof(s_uid_map);
-    err = nvs_get_blob(handle, ROSTER_NVS_KEY_UID_MAP, s_uid_map, &required);
+    uint8_t blob[sizeof(s_uid_map)];
+    size_t required = sizeof(blob);
+    err = nvs_get_blob(handle, ROSTER_NVS_KEY_UID_MAP, blob, &required);
+    bool rewrite = false;
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         memset(s_uid_map, 0, sizeof(s_uid_map));
     } else if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to load CAN UID map: %s", esp_err_to_name(err));
         memset(s_uid_map, 0, sizeof(s_uid_map));
-    } else if (required != sizeof(s_uid_map)) {
-        if (required < sizeof(s_uid_map)) {
-            memset(((uint8_t *)s_uid_map) + required, 0, sizeof(s_uid_map) - required);
+    } else if (required == sizeof(s_uid_map)) {
+        memcpy(s_uid_map, blob, sizeof(s_uid_map));
+        rewrite = true;
+    } else if (required >= 2) {
+        uint8_t version = blob[0];
+        if (version == ROSTER_UID_MAP_VERSION) {
+            uint8_t count = blob[1];
+            size_t expected = 2 + ((size_t)count) * sizeof(roster_uid_record_t);
+            if (count > ROSTER_MAX_NODES || required < expected) {
+                ESP_LOGW(TAG, "Invalid CAN UID map blob (count=%u size=%zu)", (unsigned)count, required);
+                memset(s_uid_map, 0, sizeof(s_uid_map));
+            } else {
+                memset(s_uid_map, 0, sizeof(s_uid_map));
+                const roster_uid_record_t *records = (const roster_uid_record_t *)(blob + 2);
+                for (size_t i = 0; i < count; ++i) {
+                    uint8_t node_id = records[i].node_id;
+                    if (node_id == 0 || node_id >= ROSTER_MAX_NODES) {
+                        continue;
+                    }
+                    uid_map_set_internal(node_id, records[i].uid);
+                }
+            }
+        } else {
+            ESP_LOGW(TAG, "Unknown CAN UID map version %u", (unsigned)version);
+            memset(s_uid_map, 0, sizeof(s_uid_map));
         }
+    } else {
+        ESP_LOGW(TAG, "CAN UID map blob too small (%zu)", required);
+        memset(s_uid_map, 0, sizeof(s_uid_map));
     }
     nvs_close(handle);
 
@@ -99,6 +165,10 @@ static void uid_map_load_locked(void)
         if (entry->node_id == 0 || entry->node_id >= ROSTER_MAX_NODES) {
             memset(entry, 0, sizeof(*entry));
         }
+    }
+
+    if (rewrite) {
+        uid_map_save_locked();
     }
 }
 
