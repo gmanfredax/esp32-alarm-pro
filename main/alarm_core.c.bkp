@@ -19,21 +19,21 @@ static profile_t     profiles[7];
 static bool          s_alarm_from_tamper = false;
 
 // Bypass dinamico valido per la singola sessione ARM (auto-exclude)
-static zone_mask_t   s_bypass_mask;
+static uint32_t      s_bypass_mask = 0;
 
 // Opzioni per-zona (ritardi, auto_esclude)
 static zone_opts_t   s_zone_opts[ALARM_MAX_ZONES];
 
 // Finestra di uscita (exit delay)
-static uint64_t      s_exit_deadline_us  = 0;
+static uint64_t      s_exit_deadline_us = 0;
 // "Ritardo unico": se armo con una o più zone a ritardo già aperte,
 // usiamo il loro tempo come exit e, alla scadenza, se restano aperte -> ALLARME.
-static zone_mask_t   s_exit_guard_mask;   // zone aperte al momento dell'ARM con ritardo ingresso>0
-static bool          s_exit_unified      = false;
+static uint32_t      s_exit_guard_mask  = 0;   // zone aperte al momento dell'ARM con ritardo ingresso>0
+static bool          s_exit_unified     = false;
 
 // Gestione ritardo di ingresso (entry delay)
 static bool          s_entry_pending     = false;
-static zone_mask_t   s_entry_zmask;
+static uint32_t      s_entry_zmask       = 0;
 static uint64_t      s_entry_deadline_us = 0;
 static int           s_entry_zone        = -1;   // indice 0-based di una zona coinvolta
 
@@ -43,29 +43,30 @@ static int           s_entry_zone        = -1;   // indice 0-based di una zona c
 void alarm_init(void)
 {
     s_state = ALARM_DISARMED;
-    zone_mask_clear(&s_bypass_mask);
+    s_bypass_mask = 0;
     s_exit_deadline_us = 0;
     s_entry_pending = false;
     s_entry_deadline_us = 0;
     s_entry_zone = -1;
     s_alarm_from_tamper = false;
-    zone_mask_clear(&s_exit_guard_mask);
-    zone_mask_clear(&s_entry_zmask);
     memset(s_zone_opts, 0, sizeof(s_zone_opts));
 
-    zone_mask_t ALL;
-    scenes_mask_all(ALARM_MAX_ZONES, &ALL);
-    zone_mask_t NONE;
-    zone_mask_clear(&NONE);
+    const uint32_t ALL = scenes_mask_all(ALARM_MAX_ZONES);
 
-    profiles[ALARM_ARMED_AWAY]  = (profile_t){ .active_mask = ALL,  .entry_delay_ms = 30000, .exit_delay_ms = 30000 };
-    profiles[ALARM_ARMED_HOME]  = (profile_t){ .active_mask = ALL,  .entry_delay_ms =  1500, .exit_delay_ms =  1500 };
-    profiles[ALARM_ARMED_NIGHT] = (profile_t){ .active_mask = ALL,  .entry_delay_ms =  1500, .exit_delay_ms =  1500 };
-    profiles[ALARM_ARMED_CUSTOM]= (profile_t){ .active_mask = ALL,  .entry_delay_ms =     0, .exit_delay_ms =     0 };
+    // Profili di default (12 zone): AWAY = tutte, HOME/NIGHT = perimetrali, CUSTOM = nessuna
+    // profiles[ALARM_ARMED_AWAY]  = (profile_t){ .active_mask = 0x0FFF, .entry_delay_ms = 30000, .exit_delay_ms = 30000 };
+    // profiles[ALARM_ARMED_HOME]  = (profile_t){ .active_mask = 0x00FF, .entry_delay_ms =  1500, .exit_delay_ms =  1500 };
+    // profiles[ALARM_ARMED_NIGHT] = (profile_t){ .active_mask = 0x00FF, .entry_delay_ms =  1500, .exit_delay_ms =  1500 };
+    // profiles[ALARM_ARMED_CUSTOM]= (profile_t){ .active_mask = 0x0000, .entry_delay_ms =     0, .exit_delay_ms =     0 };
 
-    profiles[ALARM_DISARMED]    = (profile_t){ .active_mask = NONE, .entry_delay_ms =     0, .exit_delay_ms =     0 };
-    profiles[ALARM_ALARM]       = (profile_t){ .active_mask = NONE, .entry_delay_ms =     0, .exit_delay_ms =     0 };
-    profiles[ALARM_MAINTENANCE] = (profile_t){ .active_mask = NONE, .entry_delay_ms =     0, .exit_delay_ms =     0 };
+    profiles[ALARM_ARMED_AWAY]  = (profile_t){ .active_mask = ALL,    .entry_delay_ms = 30000, .exit_delay_ms = 30000 };
+    profiles[ALARM_ARMED_HOME]  = (profile_t){ .active_mask = ALL,    .entry_delay_ms =  1500, .exit_delay_ms =  1500 };
+    profiles[ALARM_ARMED_NIGHT] = (profile_t){ .active_mask = ALL,    .entry_delay_ms =  1500, .exit_delay_ms =  1500 };
+    profiles[ALARM_ARMED_CUSTOM]= (profile_t){ .active_mask = ALL,    .entry_delay_ms =     0, .exit_delay_ms =     0 };
+
+    profiles[ALARM_DISARMED]    = (profile_t){ .active_mask = 0x00000000u, .entry_delay_ms =     0, .exit_delay_ms =     0 };
+    profiles[ALARM_ALARM]       = (profile_t){ .active_mask = 0x00000000u, .entry_delay_ms =     0, .exit_delay_ms =     0 };
+    profiles[ALARM_MAINTENANCE] = (profile_t){ .active_mask = 0x00000000u, .entry_delay_ms =     0, .exit_delay_ms =     0 };
 
     outputs_led_state(false);
     outputs_led_maint(false);
@@ -111,23 +112,9 @@ void alarm_set_zone_opts(int zone_index_1_based, const zone_opts_t* opts)
     s_zone_opts[i] = *opts;
 }
 
-void alarm_set_bypass_mask(const zone_mask_t *mask)
-{
-    if (!mask) {
-        zone_mask_clear(&s_bypass_mask);
-        return;
-    }
-    zone_mask_copy(&s_bypass_mask, mask);
-    zone_mask_limit(&s_bypass_mask, ALARM_MAX_ZONES);
-}
+void alarm_set_bypass_mask(uint32_t mask) { s_bypass_mask = mask; }
 
-void alarm_get_bypass_mask(zone_mask_t *out_mask)
-{
-    if (!out_mask) {
-        return;
-    }
-    zone_mask_copy(out_mask, &s_bypass_mask);
-}
+uint32_t alarm_get_bypass_mask(void) { return s_bypass_mask; }
 
 void alarm_begin_exit(uint32_t duration_ms)
 {
@@ -140,15 +127,10 @@ void alarm_begin_exit(uint32_t duration_ms)
     ESP_LOGI(TAG, "Exit delay avviato: %u ms", (unsigned)duration_ms);
 }
 
-void alarm_set_exit_guard(const zone_mask_t *mask, bool use_unified)
+void alarm_set_exit_guard(uint32_t mask, bool use_unified)
 {
-    if (mask) {
-        zone_mask_copy(&s_exit_guard_mask, mask);
-        zone_mask_limit(&s_exit_guard_mask, ALARM_MAX_ZONES);
-    } else {
-        zone_mask_clear(&s_exit_guard_mask);
-    }
-    s_exit_unified = use_unified && zone_mask_any(&s_exit_guard_mask);
+    s_exit_guard_mask = mask;
+    s_exit_unified    = use_unified && (mask != 0);
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // Comandi ARM/DISARM
@@ -197,14 +179,12 @@ void alarm_disarm(void)
     outputs_siren(false);
 
     // Reset stato dinamico della sessione
-    zone_mask_clear(&s_bypass_mask);
+    s_bypass_mask = 0;
     s_exit_deadline_us = 0;
     s_entry_pending = false;
     s_entry_deadline_us = 0;
     s_entry_zone = -1;
     s_alarm_from_tamper = false;
-    zone_mask_clear(&s_exit_guard_mask);
-    zone_mask_clear(&s_entry_zmask);
 
     ESP_LOGI(TAG, "DISARMED");
     mqtt_publish_state();
@@ -222,11 +202,8 @@ void alarm_set_led_maint(bool on)  { outputs_led_maint(on); }
 //  - zmask: bitfield Z1..Z32 -> bit0..bit31
 //  - tamper: TRUE se tamper attivo
 // ─────────────────────────────────────────────────────────────────────────────
-void alarm_tick(const zone_mask_t *zmask, bool tamper)
+void alarm_tick(uint32_t zmask, bool tamper)
 {
-    if (!zmask) {
-        return;
-    }
     // Tamper ha priorità (eccetto manutenzione)
     if (tamper) {
         if (s_state != ALARM_MAINTENANCE) {
@@ -245,11 +222,8 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
     if (s_state == ALARM_ARMED_HOME || s_state == ALARM_ARMED_AWAY || s_state == ALARM_ARMED_NIGHT || s_state == ALARM_ARMED_CUSTOM)
     {
         const profile_t p = profiles[s_state];
-        zone_mask_t eff_mask = p.active_mask;
-        zone_mask_t scene_mask;
-        scenes_get_active_mask(&scene_mask);
-        zone_mask_and(&eff_mask, &eff_mask, &scene_mask); // scenari
-        zone_mask_andnot(&eff_mask, &eff_mask, &s_bypass_mask); // bypass sessione
+        uint32_t eff_mask = p.active_mask & scenes_get_active_mask(); // scenari
+        eff_mask &= ~s_bypass_mask;                                   // bypass sessione
 
         const uint64_t now = esp_timer_get_time();
         const bool in_exit = (s_exit_deadline_us != 0 && now < s_exit_deadline_us);
@@ -257,7 +231,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
         // Ritardo unico: se la finestra di uscita è stata avviata perché c'erano zone a ritardo già aperte,
         // allora allo scadere dell'exit, se una di quelle zone è ANCORA aperta, scatta l'allarme.
         if (s_exit_unified && s_exit_deadline_us != 0 && now >= s_exit_deadline_us) {
-            if (zone_mask_intersects(zmask, &s_exit_guard_mask)) {
+            if ((zmask & s_exit_guard_mask) != 0) {
                 if (s_state != ALARM_ALARM) {
                     s_state = ALARM_ALARM;
                     s_alarm_from_tamper = false;
@@ -267,14 +241,14 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
                 }
                 // reset stato entry eventuale
                 s_entry_pending = false;
-                zone_mask_clear(&s_entry_zmask);
+                s_entry_zmask = 0;
                 s_entry_deadline_us = 0;
                 s_entry_zone = -1;
                 return;
             } else {
                 // tutte richiusE prima della scadenza: fine exit "silenziosa"
                 s_exit_unified = false;
-                zone_mask_clear(&s_exit_guard_mask);
+                s_exit_guard_mask = 0;
                 // prosegui (stato rimane armato)
             }
         }
@@ -292,38 +266,33 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
                 s_entry_pending     = false;
                 s_entry_deadline_us = 0;
                 s_entry_zone        = -1;
-                zone_mask_clear(&s_entry_zmask);
+                s_entry_zmask       = 0;
                 return;
             }
             // Non “return”: continuiamo comunque a valutare nuovi trigger
         }
 
         // Trigger effettivi sulle zone attive (profilo + scenari − bypass)
-        zone_mask_t trig;
-        zone_mask_and(&trig, zmask, &eff_mask);
-        if (!zone_mask_any(&trig)) return;
+        uint32_t trig = zmask & eff_mask;
+        if (!trig) return;
 
         // Durante exit window: ignora i trigger di sole zone marcate exit_delay
         if (in_exit) {
-            bool has_non_exit = false;
+            uint32_t masked = 0;
             for (int z = 0; z < ALARM_MAX_ZONES; ++z) {
-                if (zone_mask_test(&trig, (uint16_t)z)) {
-                    bool guarded = s_exit_unified && zone_mask_test(&s_exit_guard_mask, (uint16_t)z);
-                    if (!s_zone_opts[z].exit_delay && !guarded) {
-                        has_non_exit = true;
-                        break;
-                    }
+                if (trig & (1u << z)) {
+                    if (s_zone_opts[z].exit_delay || (s_exit_unified && (s_exit_guard_mask & (1u << z)))) masked |= (1u << z);
                 }
             }
             // Se tutte le zone triggerate sono "exit_delay", ignorale finché dura l'exit
-            if (!has_non_exit) return;
+            if ((trig & ~masked) == 0) return;
             // Altrimenti, “trig” mantiene almeno una zona fuori exit_delay → prosegui
         }
 
         // Se esiste una zona senza entry_delay -> ALARM immediato
         bool any_instant = false;
         for (int z = 0; z < ALARM_MAX_ZONES; ++z) {
-            if (zone_mask_test(&trig, (uint16_t)z)) {
+            if (trig & (1u << z)) {
                 if (!s_zone_opts[z].entry_delay) {
                     any_instant = true;
                     break;
@@ -346,7 +315,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
         uint32_t min_ms = 0xFFFFFFFFu;
         int      min_z  = -1;
         for (int z = 0; z < ALARM_MAX_ZONES; ++z) {
-            if (zone_mask_test(&trig, (uint16_t)z)) {
+            if (trig & (1u << z)) {
                 const uint32_t ms = s_zone_opts[z].entry_time_ms;
                 if (ms < min_ms) { min_ms = ms; min_z = z; }
             }

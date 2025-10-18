@@ -1,10 +1,11 @@
 # Colleziona tutti i .c nella cartella main (comodo se aggiungi file spesso)
-file(GLOB MAIN_SRCS "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
+#file(GLOB MAIN_SRCS "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
+file(GLOB MAIN_SRCS "*.c")
 
 set(MAIN_EMBED_TXTFILES
     "certs/server_cert.pem"
     "certs/server_key.pem"
-    "certs/broker_ca.pem"
+#    "certs/broker_ca.pem"
 )
 
 set(MQTT_BROKER_CA_RELATIVE "certs/broker_ca.pem")
@@ -38,19 +39,16 @@ idf_component_register(
         spi_flash
         esp_timer
         esp_system
-        json          # <— componente cJSON si chiama "json"
+        json
         lwip
         mqtt
         fatfs
         spiffs
     PRIV_REQUIRES
-        esp_https_server   # <— trascina da solo esp-tls e mbedtls
+        esp_https_server
         driver
     EMBED_TXTFILES
         ${MAIN_EMBED_TXTFILES}
-#        "certs/server_cert.pem"
-#        "certs/server_key.pem"
-#        "certs/broker_ca.pem"
 )
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE CAN_TEST_BROADCAST=1)

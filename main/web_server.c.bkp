@@ -4354,13 +4354,7 @@ static esp_err_t status_get(httpd_req_t* req){
     cJSON_AddBoolToObject(root, "tamper", tamper);
     cJSON_AddBoolToObject(root, "tamper_alarm", tamper_alarm);
     cJSON_AddNumberToObject(root, "outputs_mask", (unsigned)outmask);
-    zone_mask_t bypass_mask;
-    alarm_get_bypass_mask(&bypass_mask);
-    zone_mask_limit(&bypass_mask, (uint16_t)zones_total);
-    char bypass_hex[ZONE_MASK_WORDS * 8u + 1u];
-    zone_mask_to_hex(&bypass_mask, (uint16_t)zones_total, bypass_hex, sizeof(bypass_hex));
-    cJSON_AddNumberToObject(root, "bypass_mask", (double)zone_mask_to_u32(&bypass_mask));
-    cJSON_AddStringToObject(root, "bypass_mask_hex", bypass_hex);
+    cJSON_AddNumberToObject(root, "bypass_mask", (unsigned)alarm_get_bypass_mask());
     cJSON_AddNumberToObject(root, "exit_pending_ms", (unsigned)exit_ms);
     cJSON_AddNumberToObject(root, "entry_pending_ms", (unsigned)entry_ms);
     cJSON_AddNumberToObject(root, "entry_zone", entry_zone);
@@ -4449,11 +4443,11 @@ static esp_err_t zones_get(httpd_req_t* req){
 
 static esp_err_t scenes_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
-    zone_mask_t h, n, c, a;
+    uint32_t h=0,n=0,c=0,a=0;
     scenes_get_mask(SCENE_HOME,  &h);
     scenes_get_mask(SCENE_NIGHT, &n);
     scenes_get_mask(SCENE_CUSTOM,&c);
-    scenes_get_active_mask(&a);
+    a = scenes_get_active_mask();
 
     int zones_total = zones_effective_total();
     if (zones_total > SCENES_MAX_ZONES) {
@@ -4468,29 +4462,11 @@ static esp_err_t scenes_get(httpd_req_t* req){
         return ESP_ERR_NO_MEM;
     }
 
-    zone_mask_limit(&h, (uint16_t)zones_total);
-    zone_mask_limit(&n, (uint16_t)zones_total);
-    zone_mask_limit(&c, (uint16_t)zones_total);
-    zone_mask_limit(&a, (uint16_t)zones_total);
-
-    char home_hex[ZONE_MASK_WORDS * 8u + 1u];
-    char night_hex[ZONE_MASK_WORDS * 8u + 1u];
-    char custom_hex[ZONE_MASK_WORDS * 8u + 1u];
-    char active_hex[ZONE_MASK_WORDS * 8u + 1u];
-    zone_mask_to_hex(&h, (uint16_t)zones_total, home_hex, sizeof(home_hex));
-    zone_mask_to_hex(&n, (uint16_t)zones_total, night_hex, sizeof(night_hex));
-    zone_mask_to_hex(&c, (uint16_t)zones_total, custom_hex, sizeof(custom_hex));
-    zone_mask_to_hex(&a, (uint16_t)zones_total, active_hex, sizeof(active_hex));
-
     cJSON_AddNumberToObject(root, "zones", zones_total);
-    cJSON_AddNumberToObject(root, "home",   (double)zone_mask_to_u32(&h));
-    cJSON_AddNumberToObject(root, "night",  (double)zone_mask_to_u32(&n));
-    cJSON_AddNumberToObject(root, "custom", (double)zone_mask_to_u32(&c));
-    cJSON_AddNumberToObject(root, "active", (double)zone_mask_to_u32(&a));
-    cJSON_AddStringToObject(root, "home_hex", home_hex);
-    cJSON_AddStringToObject(root, "night_hex", night_hex);
-    cJSON_AddStringToObject(root, "custom_hex", custom_hex);
-    cJSON_AddStringToObject(root, "active_hex", active_hex);
+    cJSON_AddNumberToObject(root, "home", (double)h);
+    cJSON_AddNumberToObject(root, "night", (double)n);
+    cJSON_AddNumberToObject(root, "custom", (double)c);
+    cJSON_AddNumberToObject(root, "active", (double)a);
 
     cJSON *home_ids = cJSON_CreateArray();
     cJSON *night_ids = cJSON_CreateArray();
@@ -4504,11 +4480,11 @@ static esp_err_t scenes_get(httpd_req_t* req){
         return ESP_ERR_NO_MEM;
     }
 
-    int cnt = scenes_mask_to_ids(&h, ids, zones_total, (uint16_t)zones_total);
+    int cnt = scenes_mask_to_ids(h, ids, zones_total);
     for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(home_ids, cJSON_CreateNumber(ids[i]));
-    cnt = scenes_mask_to_ids(&n, ids, zones_total, (uint16_t)zones_total);
+    cnt = scenes_mask_to_ids(n, ids, zones_total);
     for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(night_ids, cJSON_CreateNumber(ids[i]));
-    cnt = scenes_mask_to_ids(&c, ids, zones_total, (uint16_t)zones_total);
+    cnt = scenes_mask_to_ids(c, ids, zones_total);
     for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(custom_ids, cJSON_CreateNumber(ids[i]));
 
     cJSON_AddItemToObject(root, "home_ids", home_ids);
@@ -4556,49 +4532,29 @@ static esp_err_t scenes_post(httpd_req_t* req){
     }
 
     // mask o ids[]
-    zone_mask_t mask;
-    zone_mask_clear(&mask);
-    bool have_mask = false;
-
-    const cJSON *jmask_hex = cJSON_GetObjectItemCaseSensitive(json, "mask_hex");
-    if (cJSON_IsString(jmask_hex) && jmask_hex->valuestring) {
-        have_mask = zone_mask_from_hex(&mask, jmask_hex->valuestring);
-    }
-
-    if (!have_mask) {
-        const cJSON *jmask = cJSON_GetObjectItemCaseSensitive(json, "mask");
-        if (cJSON_IsNumber(jmask)) {
-            zone_mask_from_u32(&mask, (uint32_t)((jmask->valuedouble < 0) ? 0 : jmask->valuedouble));
-            have_mask = true;
-        }
-    }
-
-    if (!have_mask) {
+    uint32_t mask = 0u;
+    const cJSON *jmask = cJSON_GetObjectItemCaseSensitive(json, "mask");
+    if(cJSON_IsNumber(jmask)){
+        mask = (jmask->valuedouble < 0) ? 0u : (uint32_t)jmask->valuedouble;
+    } else {
         const cJSON *ids = cJSON_GetObjectItemCaseSensitive(json, "ids");
         if (cJSON_IsArray(ids)){
-            int tmp_ids[SCENES_MAX_ZONES];
-            int count = 0;
             cJSON *it=NULL;
             cJSON_ArrayForEach(it, ids){
-                if(cJSON_IsNumber(it) && count < SCENES_MAX_ZONES){
-                    tmp_ids[count++] = it->valueint;
+                if(cJSON_IsNumber(it)){
+                    int id = it->valueint;
+                    if(id>=1 && id<=zones_total) mask |= (1u << (id-1));
                 }
             }
-            scenes_ids_to_mask(tmp_ids, count, &mask);
-            have_mask = true;
+        } else {
+            cJSON_Delete(json);
+            httpd_resp_send_err(req, 400, "mask");
+            return ESP_FAIL;
         }
-    }
-
-    if (!have_mask) {
-        cJSON_Delete(json);
-        httpd_resp_send_err(req, 400, "mask");
-        return ESP_FAIL;
     }
     cJSON_Delete(json);
 
-    zone_mask_limit(&mask, (uint16_t)zones_total);
-
-    if (scenes_set_mask(s, &mask)!=ESP_OK){
+    if (scenes_set_mask(s, mask)!=ESP_OK){
         httpd_resp_send_err(req, 500, "nvs");
         return ESP_FAIL;
     }
@@ -5152,21 +5108,16 @@ static esp_err_t arm_post(httpd_req_t* req)
         zones_total = SCENES_MAX_ZONES;
     }
 
-    zone_mask_t scene_mask;
-    bool mode_ok = true;
-    if      (strcasecmp(mode, "away")  == 0) { target = ALARM_ARMED_AWAY;   scenes_mask_all((uint16_t)zones_total, &scene_mask); }
-    else if (strcasecmp(mode, "home")  == 0) { target = ALARM_ARMED_HOME;   scenes_get_mask(SCENE_HOME,  &scene_mask); }
-    else if (strcasecmp(mode, "night") == 0) { target = ALARM_ARMED_NIGHT;  scenes_get_mask(SCENE_NIGHT, &scene_mask); }
-    else if (strcasecmp(mode, "custom")== 0) { target = ALARM_ARMED_CUSTOM; scenes_get_mask(SCENE_CUSTOM,&scene_mask); }
-    else { mode_ok = false; }
-    if (!mode_ok) return httpd_resp_send_err(req, 400, "bad mode"), ESP_FAIL;
-    zone_mask_limit(&scene_mask, (uint16_t)zones_total);
+    uint32_t scene_mask = 0;
+    if      (strcasecmp(mode, "away")==0)   { target = ALARM_ARMED_AWAY;  scene_mask = scenes_mask_all(zones_total); }
+    else if (strcasecmp(mode, "home")==0)   { target = ALARM_ARMED_HOME;  scenes_get_mask(SCENE_HOME,  &scene_mask); }
+    else if (strcasecmp(mode, "night")==0)  { target = ALARM_ARMED_NIGHT; scenes_get_mask(SCENE_NIGHT, &scene_mask); }
+    else if (strcasecmp(mode, "custom")==0) { target = ALARM_ARMED_CUSTOM;scenes_get_mask(SCENE_CUSTOM,&scene_mask); }
+    else return httpd_resp_send_err(req, 400, "bad mode"), ESP_FAIL;
 
     // 2) Calcola effettiva maschera attiva (profilo ∧ scena)
     profile_t prof = alarm_get_profile(target);
-    zone_mask_t eff_mask = prof.active_mask;
-    zone_mask_limit(&eff_mask, (uint16_t)zones_total);
-    zone_mask_and(&eff_mask, &eff_mask, &scene_mask);
+    uint32_t eff_mask = prof.active_mask & scene_mask;
 
     // 3) Costruisci elenco zone aperte e bypass automatico (auto_exclude)
     zones_snapshot_t snapshot;
@@ -5176,36 +5127,32 @@ static esp_err_t arm_post(httpd_req_t* req)
         snapshot_total = zones_total;
     }
 
-    zone_mask_t open_mask;
-    zone_mask_clear(&open_mask);
+    uint32_t open_mask = 0;
     for (int idx = 0; idx < snapshot_total; ++idx){
         const zone_state_entry_t *entry = &snapshot.entries[idx];
-        if (entry->known && entry->active) zone_mask_set(&open_mask, (uint16_t)idx);
+        if (entry->known && entry->active) open_mask |= (1u << idx);
     }
-    zone_mask_limit(&open_mask, (uint16_t)zones_total);
-
-    zone_mask_t blocking;
-    zone_mask_t bypass_mask;
-    zone_mask_clear(&blocking);
-    zone_mask_clear(&bypass_mask);
+    uint32_t blocking = 0, bypass = 0;
     for (int i=0; i<zones_total; ++i){
-        if (zone_mask_test(&eff_mask, (uint16_t)i) && zone_mask_test(&open_mask, (uint16_t)i)){
+        uint32_t bit = (1u<<i);
+        if ( (eff_mask & bit) && (open_mask & bit) ){
             bool has_delay = (s_zone_cfg[i].zone_delay && s_zone_cfg[i].zone_time > 0);
             if (has_delay){
                 continue;  // né blocking, né bypass
             }
-            if (s_zone_cfg[i].auto_exclude) zone_mask_set(&bypass_mask, (uint16_t)i);
-            else                            zone_mask_set(&blocking, (uint16_t)i);
+            if (s_zone_cfg[i].auto_exclude) bypass |= bit;
+            else                            blocking |= bit;
         }
     }
-
-    if (zone_mask_any(&blocking)){
+    
+    if (blocking){
         // Ritorna 409 + lista zone bloccanti con id+name
         char buf[512]; size_t off=0;
         off += snprintf(buf+off,sizeof(buf)-off,"{\"open_blocking\":[");
         bool first=true;
         for (int i=0;i<zones_total;i++){
-            if (zone_mask_test(&blocking, (uint16_t)i)){
+            uint32_t bit = (1u<<i);
+            if (blocking & bit){
                 zone_cfg_t *c=&s_zone_cfg[i];
                 off += snprintf(buf+off,sizeof(buf)-off, "%s{\"id\":%d", first?"":",", i+1);
                 if (c->name[0]) off += snprintf(buf+off,sizeof(buf)-off, ",\"name\":\"%s\"", c->name);
@@ -5221,8 +5168,8 @@ static esp_err_t arm_post(httpd_req_t* req)
     }
 
     // 4) Applica scena attiva e bypass
-    scenes_set_active_mask(&scene_mask);
-    alarm_set_bypass_mask(&bypass_mask);
+    scenes_set_active_mask(scene_mask);
+    alarm_set_bypass_mask(bypass);
 
     // 5) ARM vero e proprio
     if      (target == ALARM_ARMED_AWAY)   alarm_arm_away();
@@ -5237,8 +5184,8 @@ static esp_err_t arm_post(httpd_req_t* req)
     {
         uint32_t min_s = 0; bool found=false;
         for (int i=0;i<zones_total;i++){
-            if (zone_mask_test(&eff_mask, (uint16_t)i) && zone_mask_test(&open_mask, (uint16_t)i) &&
-                s_zone_cfg[i].zone_delay && s_zone_cfg[i].zone_time>0 ){
+            uint32_t bit = (1u<<i);
+            if ( (eff_mask & bit) && (open_mask & bit) && s_zone_cfg[i].zone_delay && s_zone_cfg[i].zone_time>0 ){
                 if (!found || (uint32_t)s_zone_cfg[i].zone_time < min_s){ min_s = (uint32_t)s_zone_cfg[i].zone_time; }
                 found = true;
             }

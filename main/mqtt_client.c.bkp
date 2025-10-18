@@ -57,7 +57,7 @@ static char                     s_topic_scenes[128];
 static char                     s_topic_cmd_base[128];
 static char                     s_topic_cmd_sub[160];
 static size_t                   s_cmd_base_len = 0;
-static zone_mask_t              s_last_zone_mask;
+static uint32_t                 s_last_zone_mask = 0xFFFFFFFFu;
 static int                      s_last_zone_count = -1;
 static bool                     s_secret_ready = false;
 
@@ -234,8 +234,7 @@ esp_err_t mqtt_publish_state(void)
 
     uint16_t outputs_mask = 0;
     outputs_get_mask(&outputs_mask);
-    zone_mask_t bypass_mask;
-    alarm_get_bypass_mask(&bypass_mask);
+    uint32_t bypass_mask = alarm_get_bypass_mask();
 
     uint16_t gpioab = 0;
     inputs_read_all(&gpioab);
@@ -245,16 +244,11 @@ esp_err_t mqtt_publish_state(void)
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
 
-    uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
-    zone_mask_limit(&bypass_mask, zones_total);
-    char bypass_hex[ZONE_MASK_WORDS * 8u + 1u];
-    zone_mask_to_hex(&bypass_mask, zones_total, bypass_hex, sizeof(bypass_hex));
-
     cJSON_AddStringToObject(root, "state", state_name);
+    uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
     cJSON_AddNumberToObject(root, "zones_count", (double)zones_total);
     cJSON_AddNumberToObject(root, "outputs_mask", (double)outputs_mask);
-    cJSON_AddStringToObject(root, "bypass_mask", bypass_hex);
-    cJSON_AddNumberToObject(root, "bypass_mask_legacy", (double)zone_mask_to_u32(&bypass_mask));
+    cJSON_AddNumberToObject(root, "bypass_mask", (double)bypass_mask);
     cJSON_AddItemToObject(root, "tamper", cJSON_CreateBool(tamper));
     cJSON_AddItemToObject(root, "tamper_alarm", cJSON_CreateBool(tamper_alarm));
     cJSON_AddNumberToObject(root, "exit_pending_ms", (double)exit_ms);
@@ -271,7 +265,7 @@ esp_err_t mqtt_publish_state(void)
     return err;
 }
 
-static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
+static esp_err_t publish_zones_internal(uint32_t mask, bool force)
 {
     if (!s_client) return ESP_ERR_INVALID_STATE;
     uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
@@ -279,28 +273,22 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
         total = SCENES_MAX_ZONES;
     }
 
-    zone_mask_t limited;
-    if (mask) {
-        zone_mask_copy(&limited, mask);
-    } else {
-        zone_mask_clear(&limited);
+    uint32_t valid_bits = scenes_mask_all(total);
+    if (valid_bits != 0xFFFFFFFFu) {
+        mask &= valid_bits;
     }
-    zone_mask_limit(&limited, total);
 
-    if (!force && zone_mask_equal(&limited, &s_last_zone_mask) && s_last_zone_count == (int)total) {
+    if (!force && mask == s_last_zone_mask && s_last_zone_count == (int)total) {
         return ESP_OK;
     }
 
-    zone_mask_copy(&s_last_zone_mask, &limited);
+    s_last_zone_mask = mask;
     s_last_zone_count = (int)total;
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
 
-    char mask_hex[ZONE_MASK_WORDS * 8u + 1u];
-    zone_mask_to_hex(&limited, total, mask_hex, sizeof(mask_hex));
-    cJSON_AddStringToObject(root, "mask", mask_hex);
-    cJSON_AddNumberToObject(root, "mask_legacy", (double)zone_mask_to_u32(&limited));
+    cJSON_AddNumberToObject(root, "mask", (double)mask);
     ensure_timestamp(root);
 
     cJSON *arr = cJSON_AddArrayToObject(root, "zones");
@@ -309,7 +297,7 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
         return ESP_ERR_NO_MEM;
     }
     for (int i = 0; i < total; ++i) {
-        bool active = zone_mask_test(&limited, (uint16_t)i);
+        bool active = (mask & (1u << i)) != 0;
         cJSON_AddItemToArray(arr, cJSON_CreateBool(active));
     }
 
@@ -322,7 +310,7 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
     return err;
 }
 
-esp_err_t mqtt_publish_zones(const zone_mask_t *mask)
+esp_err_t mqtt_publish_zones(uint32_t mask)
 {
     return publish_zones_internal(mask, false);
 }
@@ -331,11 +319,10 @@ esp_err_t mqtt_publish_scenes(void)
 {
     if (!s_client) return ESP_ERR_INVALID_STATE;
 
-    zone_mask_t mask_home, mask_night, mask_custom, mask_active;
+    uint32_t mask_home = 0, mask_night = 0, mask_custom = 0;
     scenes_get_mask(SCENE_HOME, &mask_home);
     scenes_get_mask(SCENE_NIGHT, &mask_night);
     scenes_get_mask(SCENE_CUSTOM, &mask_custom);
-    scenes_get_active_mask(&mask_active);
 
     int ids[SCENES_MAX_ZONES];
 
@@ -346,28 +333,6 @@ esp_err_t mqtt_publish_scenes(void)
         total = SCENES_MAX_ZONES;
     }
     cJSON_AddNumberToObject(root, "zones_count", (double)total);
-    zone_mask_limit(&mask_home, total);
-    zone_mask_limit(&mask_night, total);
-    zone_mask_limit(&mask_custom, total);
-    zone_mask_limit(&mask_active, total);
-
-    char home_hex[ZONE_MASK_WORDS * 8u + 1u];
-    char night_hex[ZONE_MASK_WORDS * 8u + 1u];
-    char custom_hex[ZONE_MASK_WORDS * 8u + 1u];
-    char active_hex[ZONE_MASK_WORDS * 8u + 1u];
-    zone_mask_to_hex(&mask_home, total, home_hex, sizeof(home_hex));
-    zone_mask_to_hex(&mask_night, total, night_hex, sizeof(night_hex));
-    zone_mask_to_hex(&mask_custom, total, custom_hex, sizeof(custom_hex));
-    zone_mask_to_hex(&mask_active, total, active_hex, sizeof(active_hex));
-
-    cJSON_AddStringToObject(root, "home", home_hex);
-    cJSON_AddStringToObject(root, "night", night_hex);
-    cJSON_AddStringToObject(root, "custom", custom_hex);
-    cJSON_AddStringToObject(root, "active", active_hex);
-    cJSON_AddNumberToObject(root, "home_legacy",   (double)zone_mask_to_u32(&mask_home));
-    cJSON_AddNumberToObject(root, "night_legacy",  (double)zone_mask_to_u32(&mask_night));
-    cJSON_AddNumberToObject(root, "custom_legacy", (double)zone_mask_to_u32(&mask_custom));
-    cJSON_AddNumberToObject(root, "active_legacy", (double)zone_mask_to_u32(&mask_active));
     ensure_timestamp(root);
 
     cJSON *arr_home = cJSON_AddArrayToObject(root, "home");
@@ -379,11 +344,11 @@ esp_err_t mqtt_publish_scenes(void)
         return ESP_ERR_NO_MEM;
     }
 
-    int cnt = scenes_mask_to_ids(&mask_home, ids, total, total);
+    int cnt = scenes_mask_to_ids(mask_home, ids, total);
     for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(arr_home, cJSON_CreateNumber(ids[i]));
-    cnt = scenes_mask_to_ids(&mask_night, ids, total, total);
+    cnt = scenes_mask_to_ids(mask_night, ids, total);
     for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(arr_night, cJSON_CreateNumber(ids[i]));
-    cnt = scenes_mask_to_ids(&mask_custom, ids, total, total);
+    cnt = scenes_mask_to_ids(mask_custom, ids, total);
     for (int i = 0; i < cnt; ++i) cJSON_AddItemToArray(arr_custom, cJSON_CreateNumber(ids[i]));
 
     char *payload = cJSON_PrintUnformatted(root);
@@ -405,32 +370,21 @@ static void handle_arm_command(const char *payload)
     if (payload && payload[0]) {
         root = cJSON_Parse(payload);
     }
-    zone_mask_t requested_bypass;
-    bool bypass_present = false;
     if (root) {
         cJSON *m = cJSON_GetObjectItemCaseSensitive(root, "mode");
         if (cJSON_IsString(m) && m->valuestring) {
             mode = m->valuestring;
         }
         cJSON *bp = cJSON_GetObjectItemCaseSensitive(root, "bypass_mask");
-        if (cJSON_IsString(bp) && bp->valuestring) {
-            bypass_present = zone_mask_from_hex(&requested_bypass, bp->valuestring);
-        } else if (cJSON_IsNumber(bp)) {
-            zone_mask_from_u32(&requested_bypass, (uint32_t)bp->valuedouble);
-            bypass_present = true;
+        if (cJSON_IsNumber(bp)) {
+            alarm_set_bypass_mask((uint32_t)bp->valuedouble);
         }
     }
     uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
     if (total > SCENES_MAX_ZONES) {
         total = SCENES_MAX_ZONES;
     }
-    if (bypass_present) {
-        zone_mask_limit(&requested_bypass, total);
-        alarm_set_bypass_mask(&requested_bypass);
-    }
-
-    zone_mask_t scene_mask;
-    scenes_mask_all(total, &scene_mask);
+    uint32_t scene_mask = scenes_mask_all(total);
     alarm_state_t target = ALARM_ARMED_AWAY;
     if (strcasecmp(mode, "home") == 0) {
         target = ALARM_ARMED_HOME;
@@ -442,8 +396,7 @@ static void handle_arm_command(const char *payload)
         target = ALARM_ARMED_CUSTOM;
         scenes_get_mask(SCENE_CUSTOM, &scene_mask);
     }
-    zone_mask_limit(&scene_mask, total);
-    scenes_set_active_mask(&scene_mask);
+    scenes_set_active_mask(scene_mask);
 
     switch (target) {
     case ALARM_ARMED_HOME:   alarm_arm_home(); break;
@@ -498,12 +451,11 @@ static void handle_scenes_set(const char *payload)
                 ids[count++] = (int)item->valuedouble;
             }
         }
-        zone_mask_t mask;
-        scenes_ids_to_mask(ids, count, &mask);
+        uint32_t mask = scenes_ids_to_mask(ids, count);
         scene_t sc = SCENE_CUSTOM;
         if (strcasecmp(scene->valuestring, "home") == 0) sc = SCENE_HOME;
         else if (strcasecmp(scene->valuestring, "night") == 0) sc = SCENE_NIGHT;
-        if (scenes_set_mask(sc, &mask) == ESP_OK) {
+        if (scenes_set_mask(sc, mask) == ESP_OK) {
             mqtt_publish_scenes();
         } else {
             ESP_LOGW(TAG, "Scene set failed (%s)", scene->valuestring);
@@ -520,21 +472,8 @@ static void handle_bypass_set(const char *payload)
     if (!root) return;
 
     cJSON *mask = cJSON_GetObjectItemCaseSensitive(root, "mask");
-    zone_mask_t bits;
-    bool ok = false;
-    if (cJSON_IsString(mask) && mask->valuestring) {
-        ok = zone_mask_from_hex(&bits, mask->valuestring);
-    } else if (cJSON_IsNumber(mask)) {
-        zone_mask_from_u32(&bits, (uint32_t)mask->valuedouble);
-        ok = true;
-    }
-    if (ok) {
-        uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
-        if (total > SCENES_MAX_ZONES) {
-            total = SCENES_MAX_ZONES;
-        }
-        zone_mask_limit(&bits, total);
-        alarm_set_bypass_mask(&bits);
+    if (cJSON_IsNumber(mask)) {
+        alarm_set_bypass_mask((uint32_t)mask->valuedouble);
         mqtt_publish_state();
     }
 
@@ -562,7 +501,7 @@ static void handle_command(const char *topic, const char *payload)
         mqtt_publish_scenes();
     } else if (strcmp(suffix, "status/get") == 0) {
         mqtt_publish_state();
-        publish_zones_internal(&s_last_zone_mask, true);
+        publish_zones_internal(s_last_zone_mask, true);
     } else if (strcmp(suffix, "bypass/set") == 0) {
         handle_bypass_set(payload);
     } else {
@@ -583,7 +522,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         publish_availability("online");
         esp_mqtt_client_subscribe(s_client, s_topic_cmd_sub, CONFIG_APP_CLOUD_QOS_COMMANDS);
         mqtt_publish_state();
-        publish_zones_internal(&s_last_zone_mask, true);
+        publish_zones_internal(s_last_zone_mask, true);
         mqtt_publish_scenes();
         break;
     case MQTT_EVENT_DISCONNECTED:

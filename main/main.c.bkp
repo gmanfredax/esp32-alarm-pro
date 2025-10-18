@@ -1374,16 +1374,13 @@ static void nvs_init_safe(void)
     }
 }
 
-static void compose_zone_mask(uint16_t master_gpio, uint16_t zones_total, zone_mask_t *out_mask)
+static uint32_t compose_zone_mask(uint16_t master_gpio, uint16_t zones_total)
 {
-    if (!out_mask) {
-        return;
-    }
     if (zones_total > ALARM_MAX_ZONES) {
         zones_total = ALARM_MAX_ZONES;
     }
 
-    zone_mask_clear(out_mask);
+    uint32_t mask = 0;
     uint16_t master_limit = INPUT_ZONES_COUNT;
     if (master_limit > zones_total) {
         master_limit = zones_total;
@@ -1391,13 +1388,14 @@ static void compose_zone_mask(uint16_t master_gpio, uint16_t zones_total, zone_m
 
     for (uint16_t i = 1; i <= master_limit; ++i) {
         if (inputs_zone_bit(master_gpio, i)) {
-            zone_mask_set(out_mask, (uint16_t)(i - 1u));
+            mask |= (1u << (i - 1));
         }
     }
 
     if (zones_total <= INPUT_ZONES_COUNT) {
-        zone_mask_limit(out_mask, zones_total);
-        return;
+        uint32_t keep = scenes_mask_all(zones_total);
+        mask &= keep;
+        return mask;
     }
 
     roster_node_inputs_t nodes[32];
@@ -1413,12 +1411,14 @@ static void compose_zone_mask(uint16_t master_gpio, uint16_t zones_total, zone_m
         for (uint8_t bit = 0; bit < inputs && offset < zones_total && offset < ALARM_MAX_ZONES; ++bit, ++offset) {
             bool active = node->inputs_valid && ((node->inputs_bitmap & (1u << bit)) != 0u);
             if (active) {
-                zone_mask_set(out_mask, offset);
+                mask |= (1u << offset);
             }
         }
     }
 
-    zone_mask_limit(out_mask, zones_total);
+    uint32_t keep = scenes_mask_all(zones_total);
+    mask &= keep;
+    return mask;
 }
 
 // static void reset_buttons_init(void)
@@ -1528,15 +1528,13 @@ static void system_main_task(void *arg)
 
     uint16_t initial_gpio = 0;
     uint16_t last_zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
-    zone_mask_t last_mask;
-    zone_mask_clear(&last_mask);
+    uint32_t last_mask = 0;
     bool first_cycle = true;
     if (inputs_read_all(&initial_gpio) == ESP_OK) {
         uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
-        zone_mask_t init_mask;
-        compose_zone_mask(initial_gpio, zones_total, &init_mask);
-        mqtt_publish_zones(&init_mask);
-        zone_mask_copy(&last_mask, &init_mask);
+        uint32_t init_mask = compose_zone_mask(initial_gpio, zones_total);
+        mqtt_publish_zones(init_mask);
+        last_mask = init_mask;
         last_zones_total = zones_total;
         first_cycle = false;
     }
@@ -1568,20 +1566,19 @@ static void system_main_task(void *arg)
         inputs_read_all(&ab);
 
         uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
-        zone_mask_t zmask;
-        compose_zone_mask(ab, zones_total, &zmask);
+        uint32_t zmask = compose_zone_mask(ab, zones_total);
 
         // esempio: tamper su bit (8+4) come da tuo codice
         bool tamper = inputs_tamper(ab);
 
-        if (first_cycle || !zone_mask_equal(&zmask, &last_mask) || zones_total != last_zones_total) {
-            mqtt_publish_zones(&zmask);
-            zone_mask_copy(&last_mask, &zmask);
+        if (first_cycle || zmask != last_mask || zones_total != last_zones_total) {
+            mqtt_publish_zones(zmask);
+            last_mask = zmask;
             last_zones_total = zones_total;
             first_cycle = false;
         }
 
-        alarm_tick(&zmask, tamper);
+        alarm_tick(zmask, tamper);
 
         vTaskDelay(pdMS_TO_TICKS(100));
 
