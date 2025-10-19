@@ -553,7 +553,10 @@ async function refreshStatus(){
     const prevStateName = state.status?.state || '';
     const prevAlarmZoneIds = Array.isArray(state.alarmZoneIds) ? [...state.alarmZoneIds] : [];
     state.status = data;
-    const isAlarmState = data?.state === 'ALARM';
+    const stateName = typeof data?.state === 'string' ? data.state : '';
+    const isAlarmState = stateName === 'ALARM';
+    const isArmedState = stateName.startsWith('ARMED_');
+    const isPendingState = stateName === 'PRE_ARM' || stateName === 'PRE_DISARM';
     const tamperAlarmActive = Boolean(data?.tamper_alarm && isAlarmState);
 
     if (isAlarmState) {
@@ -586,7 +589,7 @@ async function refreshStatus(){
     state.alarmZoneIds = computedAlarmZoneIds;
     state.tamperAlarm = tamperAlarmActive;
     setBrandCentralName(data?.central_name);
-    setDisarmVisibility(isAlarmState);
+    setDisarmVisibility(isAlarmState || isArmedState || isPendingState);
     const wrap = $('#statusCards');
     if (!wrap) return;
     const zonesActive = Array.isArray(data?.zones_active) ? data.zones_active.filter(Boolean).length : (data?.zones_active || 0);
@@ -1043,10 +1046,11 @@ function renderLogEntries(entries){
     const ts = formatLogTimestamp(entry?.ts ?? entry?.timestamp ?? entry?.time ?? entry?.date);
     const levelTag = level ? `<span class="tag ${level.includes('ERR') ? 'err' : level.includes('WARN') ? 'warn' : ''}">${level}</span>` : '';
     const tags = [];
-    if (hasCategory(entry, 'alarm')) {
+    const isAlarmCategory = hasCategory(entry, 'alarm');
+    if (isAlarmCategory) {
       tags.push('<span class="tag alarm">Allarme</span>');
     }
-    if (levelTag) {
+    if (!isAlarmCategory && levelTag) {
       tags.push(levelTag);
     }
     const tagsHtml = tags.join(' ');
