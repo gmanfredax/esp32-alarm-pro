@@ -79,6 +79,7 @@
 
 #include "lwip/ip4_addr.h"
 #include "lwip/ip_addr.h"
+#include "lwip/inet.h"
 
 extern const unsigned char certs_server_cert_pem_start[] asm("_binary_server_cert_pem_start");
 extern const unsigned char certs_server_cert_pem_end[]   asm("_binary_server_cert_pem_end");
@@ -5344,7 +5345,19 @@ esp_err_t web_server_start(void){
 
     zones_load_from_nvs();
 
-    ESP_LOGI(TAG, "Pronto. Apri https://<esp-ip>");
+    const char *ip_url = "<esp-ip>";
+    char ip_str[IP4ADDR_STRLEN_MAX] = {0};
+    esp_netif_t* netif = provisioning_get_primary_netif();
+    if (netif){
+        esp_netif_ip_info_t ip_info = {0};
+        if (esp_netif_get_ip_info(netif, &ip_info) == ESP_OK && ip_info.ip.addr != 0){
+            ip4addr_ntoa_r((const ip4_addr_t*)&ip_info.ip, ip_str, sizeof(ip_str));
+            if (ip_str[0] != '\0'){
+                ip_url = ip_str;
+            }
+        }
+    }
+    ESP_LOGI(TAG, "Pronto. Apri https://%s", ip_url);
     return ESP_OK;
 }
 

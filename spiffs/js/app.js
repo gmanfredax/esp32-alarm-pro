@@ -36,8 +36,99 @@ const state = {
 
 const STATUS_POLL_INTERVAL = 2000;
 const ZONESS_POLL_INTERVAL = 2000;
+const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 let statusPollTimer = null;
 let zonesPollTimer = null;
+let idleTimer = null;
+let idleTracking = false;
+let idleTriggering = false;
+let lastActivityTs = Date.now();
+const idleEvents = ['pointerdown', 'pointermove', 'keydown', 'touchstart', 'wheel'];
+const idleListenerOptions = { passive: true };
+
+function stopIdleTracking(){
+  if (!idleTracking) return;
+  idleTracking = false;
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+  }
+  idleEvents.forEach((eventName) => {
+    document.removeEventListener(eventName, handleActivity, idleListenerOptions);
+  });
+  document.removeEventListener('visibilitychange', handleVisibilityChange);
+  window.removeEventListener('focus', handleWindowFocus);
+}
+
+function handleVisibilityChange(){
+  if (document.hidden) {
+    scheduleIdleCheck();
+  } else {
+    resetIdleTimer();
+  }
+}
+
+function handleWindowFocus(){
+  resetIdleTimer();
+}
+
+function handleActivity(){
+  if (!idleTracking || idleTriggering) return;
+  lastActivityTs = Date.now();
+  scheduleIdleCheck();
+}
+
+function resetIdleTimer(){
+  if (!idleTracking || idleTriggering) return;
+  lastActivityTs = Date.now();
+  scheduleIdleCheck();
+}
+
+function scheduleIdleCheck(){
+  if (!idleTracking || idleTriggering) return;
+  const elapsed = Date.now() - lastActivityTs;
+  const remaining = Math.max(IDLE_TIMEOUT_MS - elapsed, 1000);
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = window.setTimeout(checkIdleTimeout, remaining);
+}
+
+function checkIdleTimeout(){
+  if (!idleTracking || idleTriggering) return;
+  const inactiveFor = Date.now() - lastActivityTs;
+  if (inactiveFor < IDLE_TIMEOUT_MS - 500) {
+    scheduleIdleCheck();
+    return;
+  }
+  triggerIdleLogout();
+}
+
+function triggerIdleLogout(){
+  if (idleTriggering) return;
+  idleTriggering = true;
+  stopIdleTracking();
+  stopStatusUpdates();
+  stopZonesUpdates();
+  (async () => {
+    try {
+      await apiPost('/api/logout', {});
+    } catch (err) {
+      console.warn('idle logout', err);
+    }
+    requireLogin();
+  })();
+}
+
+function startIdleTracking(){
+  if (idleTracking || idleTriggering) return;
+  idleTracking = true;
+  lastActivityTs = Date.now();
+  idleEvents.forEach((eventName) => {
+    document.addEventListener(eventName, handleActivity, idleListenerOptions);
+  });
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+  window.addEventListener('focus', handleWindowFocus);
+  scheduleIdleCheck();
+}
 
 function stopStatusUpdates(){
   if (statusPollTimer) {
@@ -255,6 +346,7 @@ async function ensureBoardsLoaded(force = false){
 setBoards([]);
 
 function requireLogin(){
+  stopIdleTracking();
   clearSession();
   window.location.replace('./login.html');
 }
@@ -1968,6 +2060,8 @@ async function init(){
     requireLogin();
     return;
   }
+
+  startIdleTracking();
 
   ensureBoardsLoaded().catch((err) => console.warn('boards metadata', err));
 
