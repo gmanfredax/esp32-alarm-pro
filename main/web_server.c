@@ -343,6 +343,29 @@ static esp_err_t read_body_to_buf(httpd_req_t* req, char* buf, size_t cap, size_
     return ESP_OK;
 }
 
+static bool json_get_int64(const cJSON *json, const char *key, int64_t *out){
+    if (!json || !key || !out) {
+        return false;
+    }
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(json, key);
+    if (!item) {
+        return false;
+    }
+    if (cJSON_IsString(item) && item->valuestring) {
+        char *end = NULL;
+        long long value = strtoll(item->valuestring, &end, 10);
+        if (end && *end == '\0') {
+            *out = (int64_t)value;
+            return true;
+        }
+    }
+    if (cJSON_IsNumber(item)) {
+        *out = (int64_t)item->valuedouble;
+        return true;
+    }
+    return false;
+}
+
 static esp_err_t json_reply(httpd_req_t* req, const char* json){
     set_https_security_headers(req);
     httpd_resp_set_type(req, "application/json");
@@ -4485,6 +4508,58 @@ static esp_err_t logs_clear_post(httpd_req_t* req){
     return ESP_OK;
 }
 
+static esp_err_t logs_delete_post(httpd_req_t* req){
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    if (req->content_len <= 0 || req->content_len > 256) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body");
+        return ESP_FAIL;
+    }
+
+    char body[256];
+    size_t body_len = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &body_len) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body");
+        return ESP_FAIL;
+    }
+
+    cJSON *json = cJSON_ParseWithLength(body, body_len);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json");
+        return ESP_FAIL;
+    }
+
+    int64_t ts_us = 0;
+    bool has_ts = json_get_int64(json, "ts_us", &ts_us);
+    if (!has_ts) {
+        has_ts = json_get_int64(json, "tsUs", &ts_us);
+    }
+
+    if (!has_ts || ts_us <= 0) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ts_us");
+        return ESP_FAIL;
+    }
+
+    esp_err_t err = audit_delete(ts_us);
+    cJSON_Delete(json);
+    if (err == ESP_ERR_NOT_FOUND) {
+        return json_error_reply(req, "404 Not Found", "not_found");
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "audit_delete failed: %s", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "delete");
+        return err;
+    }
+
+    set_https_security_headers(req);
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 static esp_err_t status_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
 
@@ -5103,6 +5178,7 @@ static esp_err_t api_admin_only_get(httpd_req_t* req){
 static esp_err_t status_get(httpd_req_t* req);
 static esp_err_t logs_get(httpd_req_t* req);
 static esp_err_t logs_clear_post(httpd_req_t* req);
+static esp_err_t logs_delete_post(httpd_req_t* req);
 static esp_err_t zones_get (httpd_req_t* req);
 static esp_err_t scenes_get(httpd_req_t* req);
 static esp_err_t scenes_post(httpd_req_t* req);
@@ -5175,6 +5251,7 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/scenes",             .method = HTTP_POST, .handler = scenes_post },
     { .uri = "/api/logs",               .method = HTTP_GET,  .handler = logs_get },
     { .uri = "/api/logs/clear",         .method = HTTP_POST, .handler = logs_clear_post },
+    { .uri = "/api/logs/delete",        .method = HTTP_POST, .handler = logs_delete_post },
     { .uri = "/api/user/password",      .method = HTTP_POST, .handler = user_post_password },
     { .uri = "/api/user/totp",          .method = HTTP_GET,  .handler = user_get_totp },
     { .uri = "/api/user/totp/enable",   .method = HTTP_POST, .handler = user_post_totp_enable },

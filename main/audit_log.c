@@ -106,6 +106,71 @@ esp_err_t audit_clear_all(void){
     return last_err;
 }
 
+esp_err_t audit_delete(int64_t ts_us){
+    if (!s_nvs) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (ts_us <= 0 || s_count == 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t current = s_count;
+    audit_entry_t *entries = calloc(current, sizeof(audit_entry_t));
+    if (!entries) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    int fetched = audit_dump_recent(entries, current);
+    if (fetched <= 0) {
+        free(entries);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t keep = 0;
+    bool removed = false;
+    for (int i = 0; i < fetched; ++i) {
+        if (!removed && entries[i].ts_us == ts_us) {
+            removed = true;
+            continue;
+        }
+        entries[keep++] = entries[i];
+    }
+
+    if (!removed) {
+        free(entries);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    esp_err_t last_err = ESP_OK;
+    for (uint16_t i = 0; i < s_cap; ++i) {
+        char key[16];
+        key_for_index(i, key);
+        esp_err_t err = nvs_erase_key(s_nvs, key);
+        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) {
+            last_err = err;
+        }
+    }
+
+    for (size_t i = 0; i < keep; ++i) {
+        char key[16];
+        key_for_index((uint16_t)i, key);
+        esp_err_t err = nvs_set_blob(s_nvs, key, &entries[i], sizeof(entries[i]));
+        if (err != ESP_OK) {
+            last_err = err;
+        }
+    }
+
+    s_count = (uint16_t)keep;
+    s_head = (uint16_t)(keep % s_cap);
+
+    esp_err_t meta_err = save_meta();
+    free(entries);
+    if (meta_err != ESP_OK) {
+        return meta_err;
+    }
+    return last_err;
+}
+
 esp_err_t audit_stream_json(httpd_req_t* req, size_t limit){
     if (limit==0 || limit > s_count) limit = s_count;
     httpd_resp_set_type(req,"application/json");

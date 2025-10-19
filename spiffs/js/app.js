@@ -25,6 +25,8 @@ const state = {
   boards: [],
   scenes: null,
   logs: [],
+  logsFrom: null,
+  logsTo: null,
   logFilter: 'all',
   activeTab: '',
   sceneActiveMask: 0,
@@ -598,7 +600,7 @@ async function refreshStatus(){
     const cards = [
       kpiCard({ title: 'Stato', valueHTML: '<span id="kpi-state-val"></span>' }),
       kpiCard({ title: 'Tamper', valueHTML: tamper }),
-      kpiCard({ title: 'Zone attive', valueHTML: `${zonesActive} / ${zonesCount}` })
+      kpiCard({ title: 'Zone aperte', valueHTML: `${zonesActive} / ${zonesCount}` })
     ];
     if (isAlarmState && (!Array.isArray(state.zones) || !state.zones.length) && state.activeTab !== 'zones') {
       refreshZones();
@@ -671,13 +673,17 @@ function renderBoardSection(boardId, zones){
   const content = zones.length
     ? `<div class="zones-grid">${zones.map((zone) => renderZoneChip(zone, { offline })).join('')}</div>`
     : '<div class="log-empty small">Nessuna zona associata.</div>';
+  const safeBoardId = Number.isFinite(boardId) ? boardId : 0;
   return `
-    <section class="board-section" data-board="${boardId}">
+    <section class="board-section" data-board="${safeBoardId}">
       <div class="board-header">
         <h4>${label}</h4>
-        <div class="board-meta">
-          ${statusHtml}
-          <span class="board-count">${zoneCount}</span>
+        <div class="board-actions">
+          <div class="board-meta">
+            ${statusHtml}
+            <span class="board-count">${zoneCount}</span>
+          </div>
+          <button type="button" class="btn tiny admin-only" data-board-config="${safeBoardId}">Configura zone</button>
         </div>
       </div>
       ${content}
@@ -762,30 +768,16 @@ function renderZoneConfigCard(zone){
   `;
 }
 
-function renderZonesConfigSection(boardId, zones){
-  const meta = getBoardMeta(boardId);
-  const label = escapeHtml(boardLabel(meta, boardId, zones));
-  const { html: statusHtml } = renderBoardStatus(meta, zones);
-  const zoneCount = escapeHtml(formatZoneCount(zones.length));
-  const body = zones.length
-    ? `<div class="zone-config-grid">${zones.map((zone) => renderZoneConfigCard(zone)).join('')}</div>`
-    : '<div class="log-empty small">Nessuna zona configurata.</div>';
-  return `
-    <section class="zone-config-section" data-board="${boardId}">
-      <div class="zone-config-section-head">
-        <h4>${label}</h4>
-        <div class="board-meta">
-          ${statusHtml}
-          <span class="board-count">${zoneCount}</span>
-        </div>
-      </div>
-      ${body}
-    </section>
-  `;
-}
-
-async function openZonesConfig(){
+async function openZonesConfig({ boardId = null } = {}){
   try {
+    const parsedBoard = Number.isFinite(boardId)
+      ? boardId
+      : (typeof boardId === 'string' ? Number.parseInt(boardId, 10) : NaN);
+    if (!Number.isFinite(parsedBoard)) {
+      showNotice('Scheda non valida per la configurazione delle zone.', 'warn');
+      return;
+    }
+
     const payload = await apiGet('/api/zones/config');
     const items = Array.isArray(payload?.items) ? payload.items : [];
 
@@ -795,35 +787,40 @@ async function openZonesConfig(){
       console.warn('boards metadata', metaErr);
     }
 
-    const groups = new Map();
-    items.forEach((item) => {
+    const boardItems = items.filter((item) => {
       const bid = Number(item?.board);
-      const boardId = Number.isFinite(bid) ? bid : 0;
-      const arr = groups.get(boardId) || [];
-      arr.push(item);
-      groups.set(boardId, arr);
+      const target = Number.isFinite(bid) ? bid : 0;
+      return target === parsedBoard;
     });
 
-    for (const arr of groups.values()) {
-      arr.sort((a, b) => (Number(a?.id) || 0) - (Number(b?.id) || 0));
-    }
+    boardItems.sort((a, b) => (Number(a?.id) || 0) - (Number(b?.id) || 0));
 
-    const boardIdsSet = new Set(boardsCache.list.map((board) => board.node_id));
-    for (const boardId of groups.keys()) boardIdsSet.add(boardId);
-    const boardIds = Array.from(boardIdsSet).sort(sortBoardIds);
+    const meta = getBoardMeta(parsedBoard);
+    const label = escapeHtml(boardLabel(meta, parsedBoard, boardItems));
+    const { html: statusHtml } = renderBoardStatus(meta, boardItems);
+    const zoneCount = escapeHtml(formatZoneCount(boardItems.length));
 
-    const sectionsHtml = boardIds.length
-      ? boardIds.map((boardId) => renderZonesConfigSection(boardId, groups.get(boardId) || [])).join('')
-      : '<div class="log-empty small">Nessuna zona configurabile.</div>';
+    const bodyHtml = boardItems.length
+      ? `<div class="zone-config-grid">${boardItems.map((zone) => renderZoneConfigCard(zone)).join('')}</div>`
+      : '<div class="log-empty small">Nessuna zona configurabile per questa scheda.</div>';
 
     const modal = showModal(`
       <div class="zones-config">
         <div class="zones-config-header">
-          <h3>Configurazione zone</h3>
-          <button class="btn tiny outline" type="button" id="zonesCfgClose">Chiudi</button>
+          <div class="zones-config-title-row">
+            <h3>Configurazione zone</h3>
+            <button class="btn tiny outline" type="button" id="zonesCfgClose">Chiudi</button>
+          </div>
+          <div class="zones-config-subtitle">
+            <span class="subtitle-label">Scheda: ${label}</span>
+            <div class="zones-config-subtitle-meta">
+              ${statusHtml}
+              <span class="board-count">${zoneCount}</span>
+            </div>
+          </div>
         </div>
-        <div class="zones-config-body">
-          ${sectionsHtml}
+        <div class="zones-config-body" data-board="${parsedBoard}">
+          ${bodyHtml}
         </div>
         <div id="zonesCfgMsg" class="msg small hidden"></div>
         <div class="row" style="justify-content:flex-end;gap:.5rem;margin-top:1rem">
@@ -848,14 +845,14 @@ async function openZonesConfig(){
         const delayInput = $('[data-field="zone_delay"]', card);
         const timeInput = $('[data-field="zone_time"]', card);
         const autoInput = $('[data-field="auto_exclude"]', card);
-        const boardId = Number(card.dataset.boardId);
+        const cardBoardId = Number(card.dataset.boardId);
         return {
           id,
           name: nameInput?.value?.trim() || '',
           zone_delay: !!(delayInput && delayInput.checked),
           zone_time: Math.max(0, Number.parseInt(timeInput?.value ?? '0', 10) || 0),
           auto_exclude: !!(autoInput && autoInput.checked),
-          board: Number.isFinite(boardId) ? boardId : 0
+          board: Number.isFinite(cardBoardId) ? cardBoardId : parsedBoard
         };
       }).filter(Boolean);
 
@@ -946,8 +943,33 @@ function normalizeLogs(payload){
   return [];
 }
 
+function getLogTsUs(entry){
+  if (!entry || typeof entry === 'string') return null;
+  const raw = entry?.ts_us ?? entry?.tsUs ?? entry?.tsUS ?? entry?.timestamp_us ?? entry?.timestampUs;
+  if (raw == null) return null;
+  if (typeof raw === 'number') {
+    return Number.isFinite(raw) ? Math.trunc(raw) : null;
+  }
+  if (typeof raw === 'string') {
+    const parsed = Number.parseFloat(raw);
+    return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
+  }
+  return null;
+}
+
 function getLogTimestampValue(entry){
   if (!entry || typeof entry === 'string') return Number.NEGATIVE_INFINITY;
+  const iso = entry?.ts_iso ?? entry?.tsIso ?? entry?.iso ?? entry?.timestamp_iso ?? entry?.timestampIso;
+  if (typeof iso === 'string' && iso) {
+    const parsedIso = Date.parse(iso);
+    if (!Number.isNaN(parsedIso)) {
+      return parsedIso;
+    }
+  }
+  const tsUs = getLogTsUs(entry);
+  if (Number.isFinite(tsUs)) {
+    return Math.trunc(tsUs / 1000);
+  }
   const raw = entry?.ts ?? entry?.timestamp ?? entry?.time ?? entry?.date;
   if (!raw && raw !== 0) return Number.NEGATIVE_INFINITY;
   if (raw instanceof Date) {
@@ -1006,6 +1028,63 @@ function filterLogEntries(entries, filter){
   });
 }
 
+function filterLogsByDate(entries){
+  const from = state.logsFrom;
+  const to = state.logsTo;
+  const hasFrom = from != null && Number.isFinite(from);
+  const hasTo = to != null && Number.isFinite(to);
+  if (!hasFrom && !hasTo) {
+    return entries;
+  }
+  return entries.filter((entry) => {
+    const value = getLogTimestampValue(entry);
+    if (!Number.isFinite(value)) return false;
+    if (hasFrom && value < from) return false;
+    if (hasTo && value > to) return false;
+    return true;
+  });
+}
+
+function formatDateInputValue(ms){
+  if (!Number.isFinite(ms)) return '';
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return '';
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function parseDateInputValue(value, { endOfDay = false } = {}){
+  if (typeof value !== 'string' || !value) return null;
+  const parts = value.split('-');
+  if (parts.length !== 3) return null;
+  const year = Number.parseInt(parts[0], 10);
+  const month = Number.parseInt(parts[1], 10);
+  const day = Number.parseInt(parts[2], 10);
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+  const date = endOfDay
+    ? new Date(year, month - 1, day, 23, 59, 59, 999)
+    : new Date(year, month - 1, day, 0, 0, 0, 0);
+  const time = date.getTime();
+  return Number.isNaN(time) ? null : time;
+}
+
+function updateLogDateInputs(){
+  const fromInput = $('#logsDateFrom');
+  const toInput = $('#logsDateTo');
+  if (fromInput) {
+    fromInput.value = state.logsFrom != null && Number.isFinite(state.logsFrom)
+      ? formatDateInputValue(state.logsFrom)
+      : '';
+  }
+  if (toInput) {
+    toInput.value = state.logsTo != null && Number.isFinite(state.logsTo)
+      ? formatDateInputValue(state.logsTo)
+      : '';
+  }
+}
+
 function updateLogFilterButtons(){
   $$('#logsFilterGroup button[data-filter]').forEach((btn) => {
     const filter = btn.dataset.filter || 'all';
@@ -1032,9 +1111,20 @@ function renderLogEntries(entries){
     list.innerHTML = '<div class="log-empty">Nessun evento registrato.</div>';
     return;
   }
-  const filtered = filterLogEntries(entries, state.logFilter);
+  const severityFiltered = filterLogEntries(entries, state.logFilter);
+  const filtered = filterLogsByDate(severityFiltered);
   if (!filtered.length) {
-    list.innerHTML = '<div class="log-empty">Nessun evento per il filtro selezionato.</div>';
+    const hasDate = (state.logsFrom != null && Number.isFinite(state.logsFrom))
+      || (state.logsTo != null && Number.isFinite(state.logsTo));
+    let message = 'Nessun evento per il filtro selezionato.';
+    if (severityFiltered.length === 0 && state.logFilter !== 'all') {
+      message = 'Nessun evento per il filtro selezionato.';
+    } else if (hasDate && state.logFilter !== 'all') {
+      message = 'Nessun evento per il filtro/periodo selezionato.';
+    } else if (hasDate) {
+      message = 'Nessun evento per il periodo selezionato.';
+    }
+    list.innerHTML = `<div class="log-empty small">${message}</div>`;
     return;
   }
   list.innerHTML = filtered.map((entry) => {
@@ -1043,7 +1133,8 @@ function renderLogEntries(entries){
     }
     const message = escapeHtml(entry?.message || entry?.msg || entry?.text || JSON.stringify(entry));
     const level = getLogLevel(entry);
-    const ts = formatLogTimestamp(entry?.ts ?? entry?.timestamp ?? entry?.time ?? entry?.date);
+    const tsSource = entry?.ts_iso ?? entry?.ts ?? entry?.timestamp ?? entry?.time ?? entry?.date;
+    const ts = formatLogTimestamp(tsSource);
     const levelTag = level ? `<span class="tag ${level.includes('ERR') ? 'err' : level.includes('WARN') ? 'warn' : ''}">${level}</span>` : '';
     const tags = [];
     const isAlarmCategory = hasCategory(entry, 'alarm');
@@ -1054,20 +1145,33 @@ function renderLogEntries(entries){
       tags.push(levelTag);
     }
     const tagsHtml = tags.join(' ');
+    const tsUs = getLogTsUs(entry);
+    const deleteBtn = state.isAdmin && Number.isFinite(tsUs)
+      ? `<button type="button" class="log-delete-btn" data-log-delete="${tsUs}" aria-label="Elimina evento"><span aria-hidden="true">🗑️</span></button>`
+      : '';
     return `
-      <div class="log-entry">
+      <div class="log-entry" data-ts="${Number.isFinite(tsUs) ? tsUs : ''}">
         <div class="log-meta">
           <span>${escapeHtml(ts || '—')}</span>
           ${tagsHtml}
         </div>
         <div class="log-body">${message}</div>
+        ${deleteBtn}
       </div>`;
   }).join('');
 }
 
 async function refreshLogs(){
   try {
-    const payload = await apiGet('/api/logs');
+    const params = new URLSearchParams();
+    if (state.logsFrom != null && Number.isFinite(state.logsFrom)) {
+      params.set('since', String(Math.floor(state.logsFrom / 1000)));
+    }
+    if (state.logsTo != null && Number.isFinite(state.logsTo)) {
+      params.set('until', String(Math.ceil(state.logsTo / 1000)));
+    }
+    const query = params.toString();
+    const payload = await apiGet(query ? `/api/logs?${query}` : '/api/logs');
     const entries = sortLogEntries(normalizeLogs(payload));
     state.logs = entries;
     renderLogEntries(entries);
@@ -1079,19 +1183,118 @@ async function refreshLogs(){
 
 function setupLogFilters(){
   const group = $('#logsFilterGroup');
-  if (!group) return;
-  group.addEventListener('click', (event) => {
-    const btn = event.target.closest('button[data-filter]');
+  if (group) {
+    group.addEventListener('click', (event) => {
+      const btn = event.target.closest('button[data-filter]');
+      if (!btn) return;
+      const filter = btn.dataset.filter || 'all';
+      if (state.logFilter === filter) return;
+      state.logFilter = filter;
+      updateLogFilterButtons();
+      if (state.logs.length) {
+        renderLogEntries(state.logs);
+      }
+    });
+  }
+
+  const markInvalid = (input) => {
+    if (!input) return;
+    input.classList.add('input-error');
+    window.setTimeout(() => input.classList.remove('input-error'), 1600);
+  };
+
+  $('#logsRefresh')?.addEventListener('click', () => refreshLogs());
+
+  const fromInput = $('#logsDateFrom');
+  const toInput = $('#logsDateTo');
+  const resetBtn = $('#logsDateReset');
+
+  fromInput?.addEventListener('change', () => {
+    const value = fromInput.value;
+    if (!value) {
+      state.logsFrom = null;
+      updateLogDateInputs();
+      refreshLogs();
+      return;
+    }
+    const parsed = parseDateInputValue(value, { endOfDay: false });
+    if (parsed == null) {
+      markInvalid(fromInput);
+      updateLogDateInputs();
+      return;
+    }
+    state.logsFrom = parsed;
+    if (state.logsTo != null && Number.isFinite(state.logsTo) && state.logsTo < state.logsFrom) {
+      const fallback = parseDateInputValue(value, { endOfDay: true });
+      state.logsTo = fallback != null ? fallback : state.logsFrom;
+    }
+    updateLogDateInputs();
+    refreshLogs();
+  });
+
+  toInput?.addEventListener('change', () => {
+    const value = toInput.value;
+    if (!value) {
+      state.logsTo = null;
+      updateLogDateInputs();
+      refreshLogs();
+      return;
+    }
+    const parsed = parseDateInputValue(value, { endOfDay: true });
+    if (parsed == null) {
+      markInvalid(toInput);
+      updateLogDateInputs();
+      return;
+    }
+    state.logsTo = parsed;
+    if (state.logsFrom != null && Number.isFinite(state.logsFrom) && state.logsTo < state.logsFrom) {
+      const fallback = parseDateInputValue(value, { endOfDay: false });
+      state.logsFrom = fallback != null ? fallback : state.logsTo;
+    }
+    updateLogDateInputs();
+    refreshLogs();
+  });
+
+  resetBtn?.addEventListener('click', () => {
+    if (state.logsFrom == null && state.logsTo == null) {
+      return;
+    }
+    state.logsFrom = null;
+    state.logsTo = null;
+    updateLogDateInputs();
+    refreshLogs();
+  });
+
+  $('#logsList')?.addEventListener('click', async (event) => {
+    const btn = event.target.closest('button[data-log-delete]');
     if (!btn) return;
-    const filter = btn.dataset.filter || 'all';
-    if (state.logFilter === filter) return;
-    state.logFilter = filter;
-    updateLogFilterButtons();
-    if (state.logs.length) {
-      renderLogEntries(state.logs);
+    const tsValue = Number(btn.dataset.logDelete);
+    if (!Number.isFinite(tsValue)) return;
+    const confirmed = await showConfirm({
+      title: 'Elimina evento',
+      message: 'Confermi l’eliminazione di questo evento dal log?',
+      confirmLabel: 'Elimina',
+      confirmTone: 'danger'
+    });
+    if (!confirmed) return;
+    btn.disabled = true;
+    try {
+      await apiPost('/api/logs/delete', { ts_us: tsValue.toString() });
+      showNotice('Evento eliminato dal log.', 'info');
+      await refreshLogs();
+    } catch (err) {
+      console.error('logDelete', err);
+      if (err instanceof HttpError && err.status === 404) {
+        showNotice('Evento non trovato o già rimosso.', 'warn');
+      } else {
+        showNotice('Impossibile eliminare l’evento.', 'error');
+      }
+      btn.disabled = false;
     }
   });
+
   updateLogFilterButtons();
+  updateLogDateInputs();
 }
 
 function setupCommands(){
@@ -1213,12 +1416,19 @@ function updateAdminVisibility(){
     el.classList.toggle('hidden', !state.isAdmin);
     el.style.removeProperty('display');
   });
+  if (state.logs.length) {
+    renderLogEntries(state.logs);
+  }
 }
 
 function setupZonesConfig(){
-  $('#btnZonesCfg')?.addEventListener('click', () => {
+  $('#zonesBoards')?.addEventListener('click', (event) => {
     if (!state.isAdmin) return;
-    openZonesConfig();
+    const btn = event.target.closest('button[data-board-config]');
+    if (!btn) return;
+    const boardId = Number.parseInt(btn.dataset.boardConfig ?? '', 10);
+    if (Number.isNaN(boardId)) return;
+    openZonesConfig({ boardId });
   });
 }
 
@@ -1230,14 +1440,90 @@ function clearModals(){
 function showModal(innerHtml, options = {}){
   if (!modalsRoot) return null;
   clearModals();
-  const modalClass = options.modalClass ? ` ${options.modalClass}` : '';
-  modalsRoot.innerHTML = `<div class="modal-overlay"><div class="card modal${modalClass}">${innerHtml}</div></div>`;
+  const { modalClass = '', onClose } = options;
+  const modalClasses = ['card', 'modal'];
+  if (modalClass) {
+    modalClasses.push(modalClass);
+  }
+  modalsRoot.innerHTML = `<div class="modal-overlay"><div class="${modalClasses.join(' ')}">${innerHtml}</div></div>`;
   document.body.classList.add('modal-open');
   const overlay = modalsRoot.firstElementChild;
   overlay?.addEventListener('click', (event) => {
-    if (event.target === overlay && !event.defaultPrevented) clearModals();
+    if (event.target === overlay && !event.defaultPrevented) {
+      if (typeof onClose === 'function') {
+        onClose();
+      } else {
+        clearModals();
+      }
+    }
   });
   return overlay?.querySelector('.modal') || null;
+}
+
+function showConfirm({
+  title = 'Conferma',
+  message = '',
+  confirmLabel = 'Conferma',
+  cancelLabel = 'Annulla',
+  confirmTone = 'primary'
+} = {}){
+  return new Promise((resolve) => {
+    let settled = false;
+    const cleanup = (modal, onKeyDown) => {
+      if (modal) modal.removeEventListener('keydown', onKeyDown);
+    };
+    const close = (value, modal, onKeyDown) => {
+      if (settled) return;
+      settled = true;
+      cleanup(modal, onKeyDown);
+      clearModals();
+      resolve(value);
+    };
+
+    const confirmClass = confirmTone === 'danger' ? 'btn danger' : 'btn primary';
+    const modal = showModal(`
+      <div class="modal-head">
+        <h3>${escapeHtml(title)}</h3>
+      </div>
+      <div class="modal-body">
+        <p class="modal-message">${escapeHtml(message)}</p>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn secondary" data-act="cancel">${escapeHtml(cancelLabel)}</button>
+        <button type="button" class="${confirmClass}" data-act="confirm">${escapeHtml(confirmLabel)}</button>
+      </div>
+    `, {
+      modalClass: 'confirm-modal',
+      onClose: () => close(false, modal, onKeyDown)
+    });
+
+    if (!modal) {
+      resolve(false);
+      return;
+    }
+
+    const confirmBtn = modal.querySelector('[data-act="confirm"]');
+    const cancelBtn = modal.querySelector('[data-act="cancel"]');
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        close(false, modal, onKeyDown);
+      } else if (event.key === 'Enter') {
+        event.preventDefault();
+        close(true, modal, onKeyDown);
+      }
+    };
+
+    modal.setAttribute('tabindex', '-1');
+    modal.addEventListener('keydown', onKeyDown);
+
+    cancelBtn?.addEventListener('click', () => close(false, modal, onKeyDown));
+    confirmBtn?.addEventListener('click', () => close(true, modal, onKeyDown));
+
+    window.requestAnimationFrame(() => {
+      (confirmBtn || modal).focus({ preventScroll: true });
+    });
+  });
 }
 
 function promptForPin({
@@ -1637,12 +1923,15 @@ async function init(){
   setupUserMenu();
   setupLogFilters();
 
-  $('#logsRefresh')?.addEventListener('click', () => refreshLogs());
   $('#logsClear')?.addEventListener('click', async () => {
     if (!state.isAdmin) return;
-    if (!window.confirm('Sei sicuro di voler cancellare tutti i log?')) {
-      return;
-    }
+    const confirmed = await showConfirm({
+      title: 'Svuota log eventi',
+      message: 'Vuoi cancellare definitivamente tutti gli eventi dal log?',
+      confirmLabel: 'Cancella tutto',
+      confirmTone: 'danger'
+    });
+    if (!confirmed) return;
     try {
       await apiPost('/api/logs/clear', {});
       state.logs = [];
