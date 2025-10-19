@@ -133,6 +133,15 @@ static void touch_session(session_t* s){
     s->expires_abs = (now - s->created > ABS_TTL_SEC) ? s->expires_abs : (now + IDLE_TTL_SEC);
 }
 
+static bool should_touch_session(const httpd_req_t* req){
+    if (!req) return true;
+    const char* uri = req->uri;
+    if (!uri[0]) return true;
+    if (strcmp(uri, "/api/status") == 0) return false;
+    if (strcmp(uri, "/api/zones") == 0) return false;
+    return true;
+}
+
 // Costruisce la stringa Set-Cookie nel frame chiamante (evita buffer dangling)
 static int build_cookie_sid(char* out, size_t outcap, const char* sid_b64){
     if (!out || outcap==0 || !sid_b64 || !sid_b64[0]) return -1;
@@ -170,6 +179,8 @@ static bool get_cookie_value(httpd_req_t* req, const char* key, char* out, size_
 
 static session_t* session_from_request(httpd_req_t* req){
     if (!req) return NULL;
+    bool touch_allowed = should_touch_session(req);
+
     size_t len = httpd_req_get_hdr_value_len(req, "Authorization");
     if (len){
         char* hdr = malloc(len+1);
@@ -179,7 +190,7 @@ static session_t* session_from_request(httpd_req_t* req){
                     const char* token = hdr + 7;
                     session_t* s = find_by_atk(token);
                     if (s){
-                        touch_session(s);
+                        if (touch_allowed) touch_session(s);
                         free(hdr);
                         return s;
                     }
@@ -192,7 +203,7 @@ static session_t* session_from_request(httpd_req_t* req){
     if (get_cookie_value(req, "SID", sid, sizeof(sid))){
         session_t* s = find_by_sid(sid);
         if (s){
-            touch_session(s);
+            if (touch_allowed) touch_session(s);
             return s;
         }
     }

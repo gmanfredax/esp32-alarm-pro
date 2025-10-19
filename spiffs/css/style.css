@@ -38,6 +38,7 @@ input,button,select,textarea{font:inherit;}
 .prefix-input{display:flex;align-items:center;gap:.55rem;background:#0d1525;border:1px solid var(--border);border-radius:14px;padding:.55rem .75rem;}
 .prefix-input .prefix{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85rem;color:var(--muted);white-space:nowrap;}
 .prefix-input input{flex:1;background:transparent;border:0;padding:0;color:inherit;font:inherit;outline:none;min-width:0;}
+.prefix-input input.input-readonly{color:var(--muted);cursor:default;}
 
 .row{display:flex;align-items:center;gap:.75rem;}
 .row.between{justify-content:space-between;}
@@ -217,7 +218,7 @@ body.modal-open{overflow:hidden;}
   gap:16px;
 }
 .zones-grid .card{margin:0}
-.board-sections{display:flex;flex-direction:column;gap:1.5rem}
+.board-sections{display:flex;flex-direction:column;gap:2.5rem}
 .board-section{display:flex;flex-direction:column;gap:.85rem}
 .board-header{display:flex;align-items:center;justify-content:space-between;gap:.75rem}
 .board-header h4{margin:0;font-size:1.05rem;letter-spacing:.35px}

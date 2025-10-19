@@ -7,6 +7,7 @@ import {
   getToken,
   HttpError,
   sanitizeSystemId,
+  setApiBase,
   setSystemId,
   setToken
 } from './api.js';
@@ -23,6 +24,7 @@ const footYear = document.getElementById('footYear');
 
 let otpRequired = false;
 let pendingRequest = false;
+let lanSystemLocked = false;
 
 if (footYear) footYear.textContent = String(new Date().getFullYear());
 
@@ -30,6 +32,98 @@ const savedSuffix = getSystemSuffix();
 if (savedSuffix) {
   systemInput.value = savedSuffix;
 }
+
+function updateSystemInputLock(){
+  if (!systemInput) return;
+  if (lanSystemLocked) {
+    systemInput.readOnly = true;
+    systemInput.setAttribute('aria-readonly', 'true');
+    systemInput.classList.add('input-readonly');
+  } else {
+    systemInput.readOnly = false;
+    systemInput.removeAttribute('aria-readonly');
+    systemInput.classList.remove('input-readonly');
+  }
+}
+
+function isLanHostname(hostname){
+  const value = (hostname || '').toLowerCase();
+  if (!value) return false;
+  if (value === 'localhost' || value === '::1') return true;
+  if (value.startsWith('127.')) return true;
+  const localSuffixes = ['.local', '.lan', '.home'];
+  if (localSuffixes.some((suffix) => value.endsWith(suffix))) return true;
+  if (value.includes(':')) {
+    return value.startsWith('fe80:') || value.startsWith('fd') || value.startsWith('fc');
+  }
+  const segments = value.split('.');
+  if (segments.length !== 4) return false;
+  const octets = segments.map((segment) => {
+    if (segment === '' || /[^0-9]/.test(segment)) return -1;
+    const number = Number(segment);
+    return Number.isInteger(number) ? number : -1;
+  });
+  if (octets.some((octet) => octet < 0 || octet > 255)) return false;
+  const [a, b] = octets;
+  if (a === 10) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 169 && b === 254) return true;
+  return false;
+}
+
+function extractSuffixFromHostname(hostname){
+  if (!hostname) return '';
+  const lower = hostname.toLowerCase();
+  const prefix = 'nsalarmpro-';
+  if (!lower.startsWith(prefix)) return '';
+  const remainder = lower.slice(prefix.length);
+  const stopIndex = remainder.indexOf('.');
+  const raw = stopIndex >= 0 ? remainder.slice(0, stopIndex) : remainder;
+  return sanitizeSystemId(raw);
+}
+
+function enforceLanSystemId(suffix){
+  const cleaned = sanitizeSystemId(suffix);
+  if (!systemInput || !cleaned) return;
+  systemInput.value = cleaned;
+  lanSystemLocked = true;
+  updateSystemInputLock();
+  setSystemId(cleaned);
+}
+
+async function initializeSystemId(){
+  if (!systemInput || typeof window === 'undefined' || !window.location) return;
+  const hostname = window.location.hostname || '';
+  if (!isLanHostname(hostname)) return;
+
+  setApiBase(window.location.origin);
+
+  const hostSuffix = extractSuffixFromHostname(hostname);
+  if (hostSuffix) {
+    enforceLanSystemId(hostSuffix);
+    return;
+  }
+
+  try {
+    const response = await fetch(`${window.location.origin}/api/provision/status`, {
+      credentials: 'include'
+    });
+    if (!response.ok) return;
+    const data = await response.json().catch(() => null);
+    if (!data || typeof data !== 'object') return;
+    const deviceId = typeof data.device_id === 'string' ? data.device_id.trim() : '';
+    if (!deviceId) return;
+    const normalized = deviceId.toLowerCase().startsWith('nsalarmpro-')
+      ? deviceId.slice('nsalarmpro-'.length)
+      : deviceId;
+    enforceLanSystemId(normalized);
+  } catch (err) {
+    console.warn('Impossibile recuperare ID sistema via LAN', err);
+  }
+}
+
+initializeSystemId();
 
 (async () => {
   if (getToken() && getSystemSuffix()) {
@@ -55,9 +149,15 @@ function setMessage(text, type = 'error'){
 }
 
 function setDisabled(disabled){
-  [systemInput, userInput, passInput, otpInput, submitBtn].forEach((el) => {
+  [userInput, passInput, otpInput, submitBtn].forEach((el) => {
     if (el) el.disabled = disabled;
   });
+  if (systemInput) {
+    systemInput.disabled = disabled;
+    if (!disabled) {
+      updateSystemInputLock();
+    }
+  }
   if (submitBtn) submitBtn.textContent = disabled ? 'Attendere…' : 'Accedi';
 }
 

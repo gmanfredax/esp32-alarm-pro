@@ -2721,6 +2721,12 @@ static esp_err_t provision_finish_post(httpd_req_t* req){
     esp_err_t err = provisioning_set_flag(true);
     if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs"), ESP_FAIL;
 
+    uint64_t now_ms = utils_wall_time_ms();
+    esp_err_t reg_err = roster_master_set_registered_at(now_ms);
+    if (reg_err != ESP_OK) {
+        ESP_LOGW(TAG, "Impossibile salvare registered_at della centrale: %s", esp_err_to_name(reg_err));
+    }
+
     err = mqtt_reload_config();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Impossibile riavviare MQTT al termine del provisioning: %s", esp_err_to_name(err));

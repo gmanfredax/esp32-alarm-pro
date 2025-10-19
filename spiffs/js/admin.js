@@ -302,6 +302,37 @@
     return cleaned.replace(/(.{2})/g, "$1 ").trim();
   }
 
+  const WALL_TIME_MIN_MS = Date.UTC(2000, 0, 1);
+
+  function coerceTimestampMs(value){
+    if (value == null) return null;
+    let raw = null;
+    if (typeof value === "number") {
+      raw = value;
+    } else if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+      const parsed = Number(trimmed);
+      raw = Number.isFinite(parsed) ? parsed : null;
+    } else {
+      raw = Number(value);
+    }
+    if (!Number.isFinite(raw) || raw <= 0) return null;
+    if (raw < WALL_TIME_MIN_MS) return null;
+    return raw;
+  }
+
+  function formatNodeAssociation(node){
+    if (!node) return "—";
+    const nodeId = Number(node?.node_id ?? -1);
+    const raw = coerceTimestampMs(nodeId === 0
+      ? (node?.registered_at_ms ?? node?.registered_at)
+      : (node?.associated_at_ms ?? node?.associated_at)
+    );
+    if (!Number.isFinite(raw)) return "—";
+    return formatDateTime(raw);
+  }
+
   function formatNodeLastSeen(node){
     const raw = Number(node?.last_seen_ms ?? node?.last_seen);
     if (!Number.isFinite(raw) || raw <= 0) return "—";
@@ -318,7 +349,7 @@
         const title = escapeHtml(nodeTitle(node));
         const stateLabel = formatNodeStateLabel(node);
         const uidDisplay = formatUid(node?.uid);
-        const lastSeen = formatNodeLastSeen(node);
+        const association = formatNodeAssociation(node);
         const metaParts = [];
         if (nodeId >= 0) metaParts.push(`ID ${nodeId}`);
         if (stateLabel) metaParts.push(`Stato: ${stateLabel}`);
@@ -327,8 +358,8 @@
         if (node.inputs_count != null) ioParts.push(`${node.inputs_count} ingressi`);
         if (node.outputs_count != null) ioParts.push(`${node.outputs_count} uscite`);
         if (ioParts.length) metaParts.push(ioParts.join(' · '));
-        //if (uidDisplay !== '—') metaParts.push(`UID ${uidDisplay}`);
-        if (lastSeen !== '—') metaParts.push(`Ultimo contatto: ${lastSeen}`);
+        const assocLabel = nodeId === 0 ? "Registrata il" : "Associata il";
+        if (association !== "—") metaParts.push(`${assocLabel}: ${association}`);
         const meta = metaParts.filter(Boolean).map((part)=>escapeHtml(String(part))).join(' · ');
         const actions = nodeId === 0
           ? '<span class="muted">Master</span>'
@@ -523,6 +554,8 @@
     const labelValue = typeof node?.label === "string" ? node.label : "";
     const stateLabel = escapeHtml(formatNodeStateLabel(node));
     const uidDisplay = escapeHtml(formatUid(node?.uid));
+    const associationLabel = nodeId === 0 ? "Registrata il" : "Associata il";
+    const association = escapeHtml(formatNodeAssociation(node));
     const lastSeen = escapeHtml(formatNodeLastSeen(node));
     const inputsCount = Number.isFinite(Number(node?.inputs_count)) ? Number(node.inputs_count) : "—";
     const outputsCount = Number.isFinite(Number(node?.outputs_count)) ? Number(node.outputs_count) : "—";
@@ -551,6 +584,7 @@
           <span class="muted">Stato</span><span>${stateLabel}</span>
           <span class="muted">Ingressi</span><span>${escapeHtml(String(inputsCount))}</span>
           <span class="muted">Uscite</span><span>${escapeHtml(String(outputsCount))}</span>
+          <span class="muted">${associationLabel}</span><span>${association}</span>
           <span class="muted">Ultimo contatto</span><span>${lastSeen}</span>
         </div>
         <div class="row" style="gap:.5rem;flex-wrap:wrap;margin-bottom:1rem;">

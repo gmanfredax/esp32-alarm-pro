@@ -36,6 +36,7 @@ typedef struct {
     uint8_t outputs_pwm;
     roster_node_state_t state;
     uint64_t last_seen_ms;
+    uint64_t associated_at_ms;
     bool identify_active;
     bool info_valid;
     bool inputs_valid;
@@ -109,6 +110,10 @@ uint16_t roster_effective_zones(uint8_t master_inputs);
 void roster_stats(size_t *out_total, size_t *out_online);
 void roster_to_json(cJSON *out_array);
 cJSON *roster_node_to_json(uint8_t node_id);
+
+void roster_master_set_device_id(const char *device_id);
+esp_err_t roster_master_set_registered_at(uint64_t registered_at_ms);
+uint64_t roster_master_get_registered_at(void);
 
 #ifdef __cplusplus
 }

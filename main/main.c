@@ -1487,6 +1487,7 @@ static void system_main_task(void *arg)
 
     // ensure_scan_mutex();
     roster_init(INPUT_ZONES_COUNT, MASTER_OUTPUTS_COUNT, 0);
+    roster_master_set_device_id(device_id);
 
 #if defined(CONFIG_APP_CAN_ENABLED)
     // ESP_ERROR_CHECK(can_master_driver_start());
