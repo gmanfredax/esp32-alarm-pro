@@ -52,6 +52,36 @@ esp_err_t can_master_send_raw(uint32_t cob_id, const void *payload, uint8_t len)
  */
 esp_err_t can_master_assign_address(uint8_t node_id, const uint8_t uid[CAN_PROTO_UID_LENGTH]);
 
+typedef struct {
+    uint64_t timestamp_ms;
+    uint64_t last_activity_ms;
+    uint32_t packets_sent;
+    uint32_t packets_received;
+    uint32_t packets_lost;
+    uint32_t tx_errors;
+    uint32_t rx_errors;
+    uint32_t offline_events;
+    uint32_t nodes_known;
+    uint32_t nodes_online;
+    bool driver_started;
+} can_master_bus_telemetry_t;
+
+typedef struct {
+    uint8_t node_id;
+    bool exists;
+    bool online;
+    uint64_t last_seen_ms;
+    uint64_t last_online_ms;
+    uint32_t heartbeat_count;
+    uint32_t info_count;
+    uint32_t command_count;
+    uint32_t command_errors;
+    uint32_t offline_events;
+} can_master_node_telemetry_t;
+
+esp_err_t can_master_get_bus_telemetry(can_master_bus_telemetry_t *out);
+esp_err_t can_master_get_node_telemetry(uint8_t node_id, can_master_node_telemetry_t *out);
+
 #ifdef __cplusplus
 }
 #endif

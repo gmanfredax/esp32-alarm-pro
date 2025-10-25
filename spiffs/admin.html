@@ -28,6 +28,16 @@
     .status-line{margin:.6rem 0 0;font-size:.9rem}
     .status-line.error{color:#f87171}
     .status-line.success{color:#34d399}
+    .telemetry-grid{display:grid;gap:1rem;margin-top:.75rem}
+    @media (min-width:720px){.telemetry-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    .telemetry-card{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:10px;padding:1rem}
+    .telemetry-card h4{margin-top:0;margin-bottom:.6rem;font-size:1.05rem}
+    .telemetry-metric{display:flex;justify-content:space-between;align-items:center;margin:.35rem 0;font-variant-numeric:tabular-nums}
+    .telemetry-metric span{color:var(--muted)}
+    .telemetry-metric strong{font-weight:600}
+    .telemetry-metric strong.warn{color:#f87171}
+    .telemetry-status{margin:.5rem 0;font-size:.9rem;color:var(--muted)}
+    .telemetry-status.error{color:#f87171}
   </style>
 </head>
 <body>

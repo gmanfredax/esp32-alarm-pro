@@ -19,7 +19,9 @@
 #include "roster.h"
 #include "pdo.h"
 #include "web_server.h"
+#include "log_system.h"
 #include "cJSON.h"
+#include "utils.h"
 
 #ifndef TWAI_FRAME_MAX_DLC
 #define TWAI_FRAME_MAX_DLC 8
@@ -43,6 +45,12 @@ typedef struct {
     uint8_t outputs_pwm;
     bool outputs_valid;
     bool inputs_valid;
+    uint32_t heartbeat_count;
+    uint32_t info_count;
+    uint32_t command_count;
+    uint32_t command_errors;
+    uint32_t offline_events;
+    uint64_t last_online_ms;
 } can_master_node_t;
 
 static const char *TAG = "can_master";
@@ -52,12 +60,25 @@ static bool s_driver_started = false;
 static SemaphoreHandle_t s_state_lock = NULL;
 static can_master_node_t s_nodes[CAN_MAX_NODE_ID + 1];
 
+typedef struct {
+    uint32_t rx_ok;
+    uint32_t tx_ok;
+    uint32_t rx_err;
+    uint32_t tx_err;
+    uint32_t offline_events;
+    uint64_t last_activity_ms;
+} can_master_bus_stats_t;
+
+static can_master_bus_stats_t s_bus_stats = {0};
+static SemaphoreHandle_t s_stats_lock = NULL;
+
 static SemaphoreHandle_t s_scan_lock = NULL;
 static bool s_scan_in_progress = false;
 static size_t s_scan_new_nodes = 0;
 static esp_timer_handle_t s_scan_timer = NULL;
 
 static SemaphoreHandle_t state_lock_get(void);
+static SemaphoreHandle_t stats_lock_get(void);
 static SemaphoreHandle_t scan_lock_get(void);
 static void can_master_rx_task(void *arg);
 static void can_master_handle_frame(const twai_message_t *msg);
@@ -65,7 +86,7 @@ static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbe
 static void can_master_handle_info(uint8_t node_id, const can_proto_info_t *payload);
 static void can_master_check_timeouts(void);
 static void can_master_notify_online(uint8_t node_id, bool is_new, uint64_t now_ms);
-static void can_master_notify_offline(uint8_t node_id, uint64_t now_ms);
+static void can_master_notify_offline(uint8_t node_id, uint64_t now_ms, const char *reason);
 static void can_master_notify_io_state(uint8_t node_id,
                                        uint32_t inputs_bitmap,
                                        bool inputs_valid,
@@ -81,10 +102,41 @@ static esp_err_t can_master_driver_start_internal(void);
 static void scan_timer_cb(void *arg);
 static twai_timing_config_t can_timing_config(void);
 static void can_master_handle_addr_request(const twai_message_t *msg);
+static void can_master_stats_note_rx(bool ok);
+static void can_master_stats_note_tx(bool ok);
+static void can_master_stats_note_offline(void);
+static void can_master_log_offline(uint8_t node_id, const char *reason, uint64_t now_ms);
 
 static inline uint64_t now_ms(void)
 {
     return (uint64_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static uint64_t wall_time_from_monotonic(uint64_t monotonic_ms,
+                                         uint64_t now_monotonic_ms,
+                                         uint64_t now_wall_ms)
+{
+    if (monotonic_ms == 0 || now_wall_ms == 0 || now_monotonic_ms == 0) {
+        return 0;
+    }
+
+    if (monotonic_ms == now_monotonic_ms) {
+        return now_wall_ms;
+    }
+
+    if (monotonic_ms > now_monotonic_ms) {
+        uint64_t delta = monotonic_ms - now_monotonic_ms;
+        if (UINT64_MAX - now_wall_ms < delta) {
+            return now_wall_ms;
+        }
+        return now_wall_ms + delta;
+    }
+
+    uint64_t delta = now_monotonic_ms - monotonic_ms;
+    if (now_wall_ms < delta) {
+        return 0;
+    }
+    return now_wall_ms - delta;
 }
 
 static SemaphoreHandle_t state_lock_get(void)
@@ -93,6 +145,14 @@ static SemaphoreHandle_t state_lock_get(void)
         s_state_lock = xSemaphoreCreateMutex();
     }
     return s_state_lock;
+}
+
+static SemaphoreHandle_t stats_lock_get(void)
+{
+    if (!s_stats_lock) {
+        s_stats_lock = xSemaphoreCreateMutex();
+    }
+    return s_stats_lock;
 }
 
 static SemaphoreHandle_t scan_lock_get(void)
@@ -112,6 +172,65 @@ static twai_timing_config_t can_timing_config(void)
 #else
     return (twai_timing_config_t)TWAI_TIMING_CONFIG_250KBITS();
 #endif
+}
+
+static void can_master_stats_note_rx(bool ok)
+{
+    SemaphoreHandle_t lock = stats_lock_get();
+    if (!lock) {
+        return;
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (ok) {
+        s_bus_stats.rx_ok++;
+    } else {
+        s_bus_stats.rx_err++;
+    }
+    s_bus_stats.last_activity_ms = now_ms();
+    xSemaphoreGive(lock);
+}
+
+static void can_master_stats_note_tx(bool ok)
+{
+    SemaphoreHandle_t lock = stats_lock_get();
+    if (!lock) {
+        return;
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (ok) {
+        s_bus_stats.tx_ok++;
+    } else {
+        s_bus_stats.tx_err++;
+    }
+    s_bus_stats.last_activity_ms = now_ms();
+    xSemaphoreGive(lock);
+}
+
+static void can_master_stats_note_offline(void)
+{
+    SemaphoreHandle_t lock = stats_lock_get();
+    if (!lock) {
+        return;
+    }
+    xSemaphoreTake(lock, portMAX_DELAY);
+    s_bus_stats.offline_events++;
+    xSemaphoreGive(lock);
+}
+
+static void can_master_log_offline(uint8_t node_id, const char *reason, uint64_t now_ms)
+{
+    (void)now_ms;
+    const char *why = (reason && reason[0] != '\0') ? reason : "motivo sconosciuto";
+    roster_node_t snapshot = {0};
+    const char *label = NULL;
+    if (roster_get_node_snapshot(node_id, &snapshot) && snapshot.label[0] != '\0') {
+        label = snapshot.label;
+    }
+    if (label) {
+        log_add("CAN nodo %u \"%s\" offline (%s)", (unsigned)node_id, label, why);
+    } else {
+        log_add("CAN nodo %u offline (%s)", (unsigned)node_id, why);
+    }
 }
 
 static esp_err_t can_master_driver_start_internal(void)
@@ -156,6 +275,13 @@ static esp_err_t can_master_driver_start_internal(void)
     }
 
     memset(s_nodes, 0, sizeof(s_nodes));
+    SemaphoreHandle_t stats = stats_lock_get();
+    if (stats) {
+        xSemaphoreTake(stats, portMAX_DELAY);
+        memset(&s_bus_stats, 0, sizeof(s_bus_stats));
+        s_bus_stats.last_activity_ms = now_ms();
+        xSemaphoreGive(stats);
+    }
     s_driver_started = true;
 
     if (!s_rx_task) {
@@ -241,6 +367,16 @@ static void can_master_notify_online(uint8_t node_id, bool is_new, uint64_t now_
 {
     (void)pdo_send_led_oneshot(node_id, 1, 1000);
 
+    SemaphoreHandle_t lock = state_lock_get();
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        if (node_id <= CAN_MAX_NODE_ID) {
+            can_master_node_t *node = &s_nodes[node_id];
+            node->last_online_ms = now_ms;
+        }
+        xSemaphoreGive(lock);
+    }
+
     if (is_new) {
         cJSON *node_obj = roster_node_to_json(node_id);
         if (node_obj) {
@@ -256,9 +392,22 @@ static void can_master_notify_online(uint8_t node_id, bool is_new, uint64_t now_
     }
 }
 
-static void can_master_notify_offline(uint8_t node_id, uint64_t now_ms)
+static void can_master_notify_offline(uint8_t node_id, uint64_t now_ms, const char *reason)
 {
     (void)pdo_send_led_oneshot(node_id, 2, 1500);
+
+    SemaphoreHandle_t lock = state_lock_get();
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        if (node_id <= CAN_MAX_NODE_ID) {
+            can_master_node_t *node = &s_nodes[node_id];
+            node->offline_events++;
+        }
+        xSemaphoreGive(lock);
+    }
+
+    can_master_stats_note_offline();
+    can_master_log_offline(node_id, reason, now_ms);
 
     cJSON *evt = cJSON_CreateObject();
     if (evt) {
@@ -327,7 +476,7 @@ static void can_master_check_timeouts(void)
     for (size_t i = 0; i < offline_count; ++i) {
         uint8_t node_id = offline[i];
         if (roster_mark_offline(node_id, now) == ESP_OK) {
-            can_master_notify_offline(node_id, now);
+            can_master_notify_offline(node_id, now, "timeout heartbeat");
         }
     }
 }
@@ -364,6 +513,7 @@ static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbe
     node->last_state = payload->node_state;
     node->change_counter = payload->change_counter;
     node->inputs_valid = true;
+    node->heartbeat_count++;
     outputs_bitmap = node->outputs_bitmap;
     outputs_flags = node->outputs_flags;
     outputs_pwm = node->outputs_pwm;
@@ -451,6 +601,7 @@ static void can_master_handle_info(uint8_t node_id, const can_proto_info_t *payl
         node->used = true;
         node->online = true;
         node->last_seen_ms = now;
+        node->info_count++;
         xSemaphoreGive(lock);
     }
 
@@ -608,8 +759,10 @@ static void can_master_rx_task(void *arg)
         twai_message_t msg = {0};
         esp_err_t err = twai_receive(&msg, pdMS_TO_TICKS(100));
         if (err == ESP_OK) {
+            can_master_stats_note_rx(true);
             can_master_handle_frame(&msg);
         } else if (err != ESP_ERR_TIMEOUT) {
+            can_master_stats_note_rx(false);
             ESP_LOGW(TAG, "twai_receive failed: %s", esp_err_to_name(err));
             vTaskDelay(pdMS_TO_TICKS(50));
         }
@@ -675,6 +828,7 @@ esp_err_t can_master_send_raw(uint32_t cob_id, const void *payload, uint8_t len)
                  cob_id & 0x7FFu,
                  esp_err_to_name(err));
     }
+    can_master_stats_note_tx(err == ESP_OK);
     return err;
 }
 
@@ -724,6 +878,14 @@ esp_err_t can_master_set_node_outputs(uint8_t node_id,
                                         &payload,
                                         sizeof(payload));
     if (err != ESP_OK) {
+        SemaphoreHandle_t lock = state_lock_get();
+        if (lock) {
+            xSemaphoreTake(lock, portMAX_DELAY);
+            can_master_node_t *node = &s_nodes[node_id];
+            node->used = true;
+            node->command_errors++;
+            xSemaphoreGive(lock);
+        }
         return err;
     }
 
@@ -742,6 +904,7 @@ esp_err_t can_master_set_node_outputs(uint8_t node_id,
         node->outputs_flags = flags;
         node->outputs_pwm = pwm_level;
         node->outputs_valid = true;
+        node->command_count++;
         inputs_bitmap = node->last_inputs;
         change_counter = node->change_counter;
         node_state_flags = node->last_state;
@@ -770,6 +933,116 @@ esp_err_t can_master_set_node_outputs(uint8_t node_id,
                                flags,
                                pwm_level,
                                timestamp);
+
+    return ESP_OK;
+}
+
+esp_err_t can_master_get_bus_telemetry(can_master_bus_telemetry_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    SemaphoreHandle_t stats = stats_lock_get();
+    SemaphoreHandle_t lock = state_lock_get();
+    if (!stats || !lock) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    can_master_bus_stats_t stats_copy = {0};
+    xSemaphoreTake(stats, portMAX_DELAY);
+    stats_copy = s_bus_stats;
+    xSemaphoreGive(stats);
+
+    uint32_t nodes_known = 0;
+    uint32_t nodes_online = 0;
+    bool driver_started = false;
+
+    xSemaphoreTake(lock, portMAX_DELAY);
+    driver_started = s_driver_started;
+    for (uint32_t node_id = 1; node_id <= CAN_MAX_NODE_ID; ++node_id) {
+        const can_master_node_t *node = &s_nodes[node_id];
+        if (!node->used) {
+            continue;
+        }
+        ++nodes_known;
+        if (node->online) {
+            ++nodes_online;
+        }
+    }
+    xSemaphoreGive(lock);
+
+    uint64_t now_monotonic_ms = now_ms();
+    uint64_t now_wall_ms = utils_wall_time_ms();
+
+    out->timestamp_ms = wall_time_from_monotonic(now_monotonic_ms,
+                                                 now_monotonic_ms,
+                                                 now_wall_ms);
+    out->last_activity_ms = wall_time_from_monotonic(stats_copy.last_activity_ms,
+                                                     now_monotonic_ms,
+                                                     now_wall_ms);
+    out->packets_sent = stats_copy.tx_ok;
+    out->packets_received = stats_copy.rx_ok;
+    out->tx_errors = stats_copy.tx_err;
+    out->rx_errors = stats_copy.rx_err;
+    out->packets_lost = stats_copy.tx_err + stats_copy.rx_err;
+    out->offline_events = stats_copy.offline_events;
+    out->nodes_known = nodes_known;
+    out->nodes_online = nodes_online;
+    out->driver_started = driver_started;
+
+    return ESP_OK;
+}
+
+esp_err_t can_master_get_node_telemetry(uint8_t node_id, can_master_node_telemetry_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (node_id == 0 || node_id > CAN_MAX_NODE_ID) {
+        memset(out, 0, sizeof(*out));
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    SemaphoreHandle_t lock = state_lock_get();
+    if (!lock) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    can_master_node_t snapshot = {0};
+    bool exists = false;
+    xSemaphoreTake(lock, portMAX_DELAY);
+    if (s_nodes[node_id].used) {
+        snapshot = s_nodes[node_id];
+        exists = true;
+    }
+    xSemaphoreGive(lock);
+
+    if (!exists) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    out->node_id = node_id;
+    out->exists = true;
+    out->online = snapshot.online;
+    uint64_t now_monotonic_ms = now_ms();
+    uint64_t now_wall_ms = utils_wall_time_ms();
+
+    out->last_seen_ms = wall_time_from_monotonic(snapshot.last_seen_ms,
+                                                 now_monotonic_ms,
+                                                 now_wall_ms);
+    out->last_online_ms = wall_time_from_monotonic(snapshot.last_online_ms,
+                                                  now_monotonic_ms,
+                                                  now_wall_ms);
+    out->heartbeat_count = snapshot.heartbeat_count;
+    out->info_count = snapshot.info_count;
+    out->command_count = snapshot.command_count;
+    out->command_errors = snapshot.command_errors;
+    out->offline_events = snapshot.offline_events;
 
     return ESP_OK;
 }
@@ -904,6 +1177,23 @@ esp_err_t can_master_set_node_outputs(uint8_t node_id,
     (void)outputs_bitmap;
     (void)flags;
     (void)pwm_level;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t can_master_get_bus_telemetry(can_master_bus_telemetry_t *out)
+{
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t can_master_get_node_telemetry(uint8_t node_id, can_master_node_telemetry_t *out)
+{
+    (void)node_id;
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
     return ESP_ERR_NOT_SUPPORTED;
 }
 

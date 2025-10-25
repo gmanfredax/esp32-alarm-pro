@@ -140,6 +140,12 @@
     lastRequestAt: 0,
   };
 
+  const TELEMETRY_REFRESH_MS = 1500;
+  let telemetryTimer = null;
+  let telemetryNodeId = null;
+  let telemetryFetchPending = false;
+  const modalCleanupHandlers = new Set();
+
   function formatDateTime(ts){
     if (ts == null) return "";
     let date;
@@ -150,6 +156,16 @@
     if (Number.isNaN(date.getTime())) return "";
     try { return date.toLocaleString("it-IT"); }
     catch { return date.toISOString(); }
+  }
+
+  function formatInteger(value){
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "—";
+    try {
+      return num.toLocaleString("it-IT");
+    } catch {
+      return String(num);
+    }
   }
 
   const normalizeRole = (roleValue) => {
@@ -361,9 +377,12 @@
         const assocLabel = nodeId === 0 ? "Registrata il" : "Associata il";
         if (association !== "—") metaParts.push(`${assocLabel}: ${association}`);
         const meta = metaParts.filter(Boolean).map((part)=>escapeHtml(String(part))).join(' · ');
+        const telemetryBtn = nodeId === 0
+          ? ''
+          : `<button class="btn btn-sm" type="button" data-node-telemetry="${nodeId}">Telemetria</button>`;
         const actions = nodeId === 0
           ? '<span class="muted">Master</span>'
-          : `<button class="btn btn-sm outline" type="button" data-node-actions="${nodeId}">Azioni</button>`;
+          : `${telemetryBtn}<button class="btn btn-sm outline" type="button" data-node-actions="${nodeId}">Azioni</button>`;
         return `<li class="expansion-item" data-node-id="${nodeId}">
             <div class="expansion-info">
               <div class="expansion-title">${title}</div>
@@ -405,6 +424,242 @@
     if (scanBtn) scanBtn.disabled = disableActions;
     const refreshBtn = $("#adminExpansionRefreshBtn");
     if (refreshBtn) refreshBtn.disabled = disableActions;
+  }
+
+  function setTelemetryValue(key, value, { warn = false } = {}){
+    const el = document.querySelector(`[data-telemetry="${key}"]`);
+    if (!el) return;
+    const display = (value == null || value === '') ? '—' : value;
+    el.textContent = display;
+    el.classList.toggle('warn', !!warn);
+  }
+
+  function formatTelemetryTimestamp(ts){
+    if (ts == null) return '—';
+    const num = Number(ts);
+    if (!Number.isFinite(num) || num <= 0) return '—';
+    return formatDateTime(num);
+  }
+
+  function updateTelemetryUI(payload){
+    if (!payload || typeof payload !== 'object') {
+      return;
+    }
+    const node = payload.node || {};
+    const bus = payload.bus || {};
+    const exists = node.exists !== false;
+    const online = !!node.online;
+    setTelemetryValue('node_state', exists ? (online ? 'Online' : 'Offline') : 'Non registrato', { warn: exists && !online });
+    setTelemetryValue('node_last_seen', formatTelemetryTimestamp(node.last_seen_ms));
+    setTelemetryValue('node_last_online', formatTelemetryTimestamp(node.last_online_ms));
+    setTelemetryValue('node_heartbeat', formatInteger(node.heartbeat_count));
+    setTelemetryValue('node_info', formatInteger(node.info_count));
+    setTelemetryValue('node_commands', formatInteger(node.command_count));
+    setTelemetryValue('node_command_errors', formatInteger(node.command_errors), { warn: Number(node.command_errors) > 0 });
+    setTelemetryValue('node_offline_events', formatInteger(node.offline_events), { warn: Number(node.offline_events) > 0 });
+
+    const supported = !!bus.supported;
+    setTelemetryValue('bus_supported', supported ? 'Disponibile' : 'Non disponibile', { warn: !supported });
+    if (supported) {
+      setTelemetryValue('bus_driver', bus.driver_started ? 'Attivo' : 'Spento', { warn: !bus.driver_started });
+      setTelemetryValue('bus_last_activity', formatTelemetryTimestamp(bus.last_activity_ms));
+      setTelemetryValue('bus_packets_sent', formatInteger(bus.packets_sent));
+      setTelemetryValue('bus_packets_received', formatInteger(bus.packets_received));
+      setTelemetryValue('bus_packets_lost', formatInteger(bus.packets_lost), { warn: Number(bus.packets_lost) > 0 });
+      setTelemetryValue('bus_tx_errors', formatInteger(bus.tx_errors), { warn: Number(bus.tx_errors) > 0 });
+      setTelemetryValue('bus_rx_errors', formatInteger(bus.rx_errors), { warn: Number(bus.rx_errors) > 0 });
+      setTelemetryValue('bus_offline_events', formatInteger(bus.offline_events), { warn: Number(bus.offline_events) > 0 });
+      setTelemetryValue('bus_nodes_online', formatInteger(bus.nodes_online));
+      setTelemetryValue('bus_nodes_known', formatInteger(bus.nodes_known));
+    } else {
+      [
+        'bus_driver',
+        'bus_last_activity',
+        'bus_packets_sent',
+        'bus_packets_received',
+        'bus_packets_lost',
+        'bus_tx_errors',
+        'bus_rx_errors',
+        'bus_offline_events',
+        'bus_nodes_online',
+        'bus_nodes_known',
+      ].forEach((key) => setTelemetryValue(key, '—', { warn: false }));
+    }
+  }
+
+  async function fetchNodeTelemetry(nodeId){
+    if (!telemetryNodeId || telemetryNodeId !== nodeId) {
+      telemetryFetchPending = false;
+      return;
+    }
+    if (telemetryFetchPending) return;
+    telemetryFetchPending = true;
+    const statusEl = $("#telemetryStatus");
+    try {
+      const payload = await apiGet(`/api/can/node/${nodeId}/telemetry`);
+      if (!telemetryNodeId || telemetryNodeId !== nodeId) {
+        return;
+      }
+      updateTelemetryUI(payload);
+      if (statusEl && document.body.contains(statusEl)) {
+        statusEl.textContent = `Aggiornato alle ${formatDateTime(Date.now())}`;
+        statusEl.classList.remove("error");
+      }
+    } catch (err){
+      const message = err?.message || "telemetria non disponibile";
+      if (statusEl && document.body.contains(statusEl)) {
+        statusEl.textContent = `Errore: ${message}`;
+        statusEl.classList.add("error");
+      }
+      if (err?.status === 404 && telemetryNodeId === nodeId) {
+        stopTelemetryWatcher();
+      }
+    } finally {
+      if (telemetryNodeId === nodeId) {
+        telemetryFetchPending = false;
+      }
+    }
+  }
+
+  function stopTelemetryWatcher(){
+    if (telemetryTimer) {
+      clearInterval(telemetryTimer);
+      telemetryTimer = null;
+    }
+    telemetryNodeId = null;
+    telemetryFetchPending = false;
+  }
+
+  function startTelemetryWatcher(nodeId){
+    stopTelemetryWatcher();
+    const normalized = Number(nodeId);
+    if (!Number.isFinite(normalized) || normalized <= 0) {
+      telemetryNodeId = null;
+      return;
+    }
+    telemetryNodeId = normalized;
+    const statusEl = $("#telemetryStatus");
+    if (statusEl) {
+      statusEl.textContent = "Caricamento telemetria…";
+      statusEl.classList.remove("error");
+    }
+    fetchNodeTelemetry(telemetryNodeId);
+    telemetryTimer = window.setInterval(() => {
+      if (telemetryNodeId) {
+        fetchNodeTelemetry(telemetryNodeId);
+      }
+    }, TELEMETRY_REFRESH_MS);
+  }
+
+  function openNodeTelemetry(nodeId){
+    const nodes = getExpansionItems();
+    const node = nodes.find((item) => Number(item?.node_id) === nodeId) || null;
+    const title = escapeHtml(nodeTitle(node) || `Nodo ${nodeId}`);
+    const metaParts = [];
+    if (node?.kind) metaParts.push(escapeHtml(String(node.kind)));
+    const inputsCount = Number(node?.inputs_count);
+    const outputsCount = Number(node?.outputs_count);
+    const ioParts = [];
+    if (Number.isFinite(inputsCount)) ioParts.push(`${inputsCount} ingressi`);
+    if (Number.isFinite(outputsCount)) ioParts.push(`${outputsCount} uscite`);
+    if (ioParts.length) metaParts.push(ioParts.join(' · '));
+    const metaLine = metaParts.length ? `<p class="muted small">${metaParts.join(' · ')}</p>` : '';
+    modal(`
+      <div class="card-head row" style="justify-content:space-between;align-items:center">
+        <h3>Telemetria nodo CAN</h3>
+        <button class="btn" id="telemetryCloseBtn" type="button">Chiudi</button>
+      </div>
+      <p class="muted">Monitoraggio in tempo reale per <strong>${title}</strong> (ID ${escapeHtml(String(nodeId))}).</p>
+      ${metaLine}
+      <div id="telemetryStatus" class="telemetry-status">Caricamento telemetria…</div>
+      <div class="telemetry-grid">
+        <section class="telemetry-card">
+          <h4>Stato nodo</h4>
+          <div class="telemetry-metric">
+            <span>Stato</span>
+            <strong data-telemetry="node_state">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Ultimo pacchetto</span>
+            <strong data-telemetry="node_last_seen">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Ultimo online</span>
+            <strong data-telemetry="node_last_online">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Heartbeat ricevuti</span>
+            <strong data-telemetry="node_heartbeat">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Info ricevute</span>
+            <strong data-telemetry="node_info">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Comandi inviati</span>
+            <strong data-telemetry="node_commands">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Errori comando</span>
+            <strong data-telemetry="node_command_errors">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Offline rilevati</span>
+            <strong data-telemetry="node_offline_events">—</strong>
+          </div>
+        </section>
+        <section class="telemetry-card">
+          <h4>Bus CAN</h4>
+          <div class="telemetry-metric">
+            <span>Supporto</span>
+            <strong data-telemetry="bus_supported">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Driver</span>
+            <strong data-telemetry="bus_driver">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Ultima attività</span>
+            <strong data-telemetry="bus_last_activity">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Pacchetti inviati</span>
+            <strong data-telemetry="bus_packets_sent">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Pacchetti ricevuti</span>
+            <strong data-telemetry="bus_packets_received">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Pacchetti perduti</span>
+            <strong data-telemetry="bus_packets_lost">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Errori TX</span>
+            <strong data-telemetry="bus_tx_errors">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Errori RX</span>
+            <strong data-telemetry="bus_rx_errors">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Offline bus</span>
+            <strong data-telemetry="bus_offline_events">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Nodi online</span>
+            <strong data-telemetry="bus_nodes_online">—</strong>
+          </div>
+          <div class="telemetry-metric">
+            <span>Nodi totali</span>
+            <strong data-telemetry="bus_nodes_known">—</strong>
+          </div>
+        </section>
+      </div>
+    `);
+    $("#telemetryCloseBtn")?.addEventListener("click", () => closeModal());
+    registerModalCleanup(() => stopTelemetryWatcher());
+    startTelemetryWatcher(nodeId);
   }
 
   function updateCanTestBroadcastUI(){
@@ -754,9 +1009,20 @@
     const list = $("#adminExpansionList");
     if (list){
       list.addEventListener("click", (event) => {
-        const btn = event.target.closest("[data-node-actions]");
-        if (!btn) return;
-        const nodeId = Number(btn.getAttribute("data-node-actions"));
+        const telemetryBtn = event.target.closest("[data-node-telemetry]");
+        if (telemetryBtn){
+          const telemetryId = Number(telemetryBtn.getAttribute("data-node-telemetry"));
+          if (!Number.isFinite(telemetryId) || telemetryId <= 0){
+            toast("Telemetria disponibile solo per le espansioni", false);
+            return;
+          }
+          event.preventDefault();
+          openNodeTelemetry(telemetryId);
+          return;
+        }
+        const actionsBtn = event.target.closest("[data-node-actions]");
+        if (!actionsBtn) return;
+        const nodeId = Number(actionsBtn.getAttribute("data-node-actions"));
         if (!Number.isFinite(nodeId) || nodeId <= 0){
           toast("Nodo master non modificabile", false);
           return;
@@ -838,17 +1104,55 @@
   }
 
   // ---- Modals
-  function closeModal(){ $("#modals-root").innerHTML = ""; }
+  function registerModalCleanup(fn){
+    if (typeof fn === "function") {
+      modalCleanupHandlers.add(fn);
+    }
+  }
+
+  function runModalCleanup(){
+    if (!modalCleanupHandlers.size) return;
+    modalCleanupHandlers.forEach((fn) => {
+      try { fn(); } catch (err) { console.warn('modal cleanup', err); }
+    });
+    modalCleanupHandlers.clear();
+  }
+
+  function closeModal(){
+    runModalCleanup();
+    const root = $("#modals-root");
+    if (root) {
+      root.innerHTML = "";
+    }
+  }
+
   function modal(html){
     const root = $("#modals-root");
+    if (!root) return;
+    closeModal();
     root.innerHTML = `
       <div class="modal-overlay" style="position:fixed;inset:0;background:rgba(0,0,0,.45);backdrop-filter:blur(1px);display:grid;place-items:center;z-index:1500">
         <div class="modal card" style="width:min(720px, 96vw);max-height:88vh;overflow:auto">
           ${html}
         </div>
       </div>`;
-    root.querySelector(".modal-overlay").addEventListener("click", (e)=>{ if(e.target.classList.contains("modal-overlay")) closeModal(); });
-    window.addEventListener("keydown", function onK(e){ if(e.key==="Escape"){ closeModal(); window.removeEventListener("keydown", onK); } });
+    const overlay = root.querySelector(".modal-overlay");
+    if (overlay){
+      const handleClick = (e) => {
+        if (e.target.classList.contains("modal-overlay")) {
+          closeModal();
+        }
+      };
+      overlay.addEventListener("click", handleClick);
+      registerModalCleanup(() => overlay.removeEventListener("click", handleClick));
+    }
+    function onKey(e){
+      if (e.key === "Escape") {
+        closeModal();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    registerModalCleanup(() => window.removeEventListener("keydown", onKey));
   }
 
   function newUserModal(){
