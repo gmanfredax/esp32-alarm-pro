@@ -26,8 +26,15 @@ extern "C" {
 #define CAN_PROTO_ID_COMMAND(node_id)       (CAN_PROTO_ID_COMMAND_BASE + (node_id))
 #define CAN_PROTO_ID_DIAG(node_id)          (CAN_PROTO_ID_DIAG_BASE + (node_id))
 
-#define CAN_PROTO_ID_EXT_HEARTBEAT(node_id) (0x100u + (node_id))
+#define CAN_PROTO_ID_EXT_HEARTBEAT(node_id)  (0x100u + (node_id))
 #define CAN_PROTO_ID_EXT_ZONE_EVENT(node_id) (0x120u + (node_id))
+
+#define CAN_PROTO_EXT_ZONE_STATE_ALARM      0x01u
+#define CAN_PROTO_EXT_ZONE_STATE_SHORT      0x02u
+#define CAN_PROTO_EXT_ZONE_STATE_OPEN       0x04u
+#define CAN_PROTO_EXT_ZONE_STATE_TAMPER     0x08u
+#define CAN_PROTO_EXT_ZONE_STATE_PRESENT    0x10u
+#define CAN_PROTO_EXT_ZONE_STATE_CONTACT_NO 0x20u
 
 #define CAN_PROTO_ID_BROADCAST_SCAN        0x070u
 #define CAN_PROTO_ID_BROADCAST_TEST        0x071u

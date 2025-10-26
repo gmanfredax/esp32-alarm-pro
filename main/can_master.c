@@ -83,6 +83,8 @@ static SemaphoreHandle_t scan_lock_get(void);
 static void can_master_rx_task(void *arg);
 static void can_master_handle_frame(const twai_message_t *msg);
 static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbeat_t *payload);
+static void can_master_handle_ext_heartbeat(uint8_t node_id, const twai_message_t *msg);
+static void can_master_handle_zone_event(uint8_t node_id, const twai_message_t *msg);
 static void can_master_handle_info(uint8_t node_id, const can_proto_info_t *payload);
 static void can_master_check_timeouts(void);
 static void can_master_notify_online(uint8_t node_id, bool is_new, uint64_t now_ms);
@@ -106,6 +108,7 @@ static void can_master_stats_note_rx(bool ok);
 static void can_master_stats_note_tx(bool ok);
 static void can_master_stats_note_offline(void);
 static void can_master_log_offline(uint8_t node_id, const char *reason, uint64_t now_ms);
+static const char *can_master_zone_state_string(uint8_t state_bits);
 
 static inline uint64_t now_ms(void)
 {
@@ -231,6 +234,26 @@ static void can_master_log_offline(uint8_t node_id, const char *reason, uint64_t
     } else {
         log_add("CAN nodo %u offline (%s)", (unsigned)node_id, why);
     }
+}
+
+static const char *can_master_zone_state_string(uint8_t state_bits)
+{
+    if (state_bits & CAN_PROTO_EXT_ZONE_STATE_TAMPER) {
+        return "TAMPER";
+    }
+    if (state_bits & CAN_PROTO_EXT_ZONE_STATE_SHORT) {
+        return "FAULT_SHORT";
+    }
+    if (state_bits & CAN_PROTO_EXT_ZONE_STATE_OPEN) {
+        return "FAULT_OPEN";
+    }
+    if (state_bits & CAN_PROTO_EXT_ZONE_STATE_ALARM) {
+        return "ALARM";
+    }
+    if (state_bits & CAN_PROTO_EXT_ZONE_STATE_PRESENT) {
+        return "NORMAL";
+    }
+    return "UNKNOWN";
 }
 
 static esp_err_t can_master_driver_start_internal(void)
@@ -479,6 +502,115 @@ static void can_master_check_timeouts(void)
             can_master_notify_offline(node_id, now, "timeout heartbeat");
         }
     }
+}
+
+static void can_master_handle_ext_heartbeat(uint8_t node_id, const twai_message_t *msg)
+{
+    if (!msg || msg->data_length_code < 8) {
+        return;
+    }
+
+    uint8_t alarm_bitmap = msg->data[0];
+    uint8_t short_bitmap = msg->data[1];
+    uint8_t open_bitmap = msg->data[2];
+    uint8_t tamper_bitmap = msg->data[3];
+    uint16_t vdda_10mv = msg->data[4];
+    uint16_t vbias_100mv = msg->data[5];
+    uint8_t temp_raw = msg->data[6];
+    uint8_t fw_version = msg->data[7];
+    int16_t temp_c = (int16_t)((int)temp_raw) - 40;
+    uint64_t ts = now_ms();
+
+    (void)roster_note_ext_status(node_id,
+                                 alarm_bitmap,
+                                 short_bitmap,
+                                 open_bitmap,
+                                 tamper_bitmap,
+                                 vdda_10mv,
+                                 vbias_100mv,
+                                 temp_c,
+                                 fw_version,
+                                 ts);
+
+    SemaphoreHandle_t lock = state_lock_get();
+    if (lock && node_id > 0 && node_id <= CAN_MAX_NODE_ID) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        can_master_node_t *node = &s_nodes[node_id];
+        if (node->used && node->online) {
+            node->last_seen_ms = ts;
+        }
+        xSemaphoreGive(lock);
+    }
+
+    cJSON *evt = cJSON_CreateObject();
+    if (!evt) {
+        return;
+    }
+    cJSON_AddNumberToObject(evt, "node_id", node_id);
+    cJSON_AddNumberToObject(evt, "ts_ms", (double)ts);
+    cJSON_AddNumberToObject(evt, "alarm_bitmap", alarm_bitmap);
+    cJSON_AddNumberToObject(evt, "short_bitmap", short_bitmap);
+    cJSON_AddNumberToObject(evt, "open_bitmap", open_bitmap);
+    cJSON_AddNumberToObject(evt, "tamper_bitmap", tamper_bitmap);
+    cJSON_AddNumberToObject(evt, "vdda_10mv", vdda_10mv);
+    cJSON_AddNumberToObject(evt, "vdda_volts", (double)vdda_10mv / 100.0);
+    cJSON_AddNumberToObject(evt, "vbias_100mv", vbias_100mv);
+    cJSON_AddNumberToObject(evt, "vbias_volts", (double)vbias_100mv / 10.0);
+    cJSON_AddNumberToObject(evt, "temp_c", temp_c);
+    cJSON_AddNumberToObject(evt, "fw_version", fw_version);
+    web_server_ws_broadcast_event("node_ext_status", evt);
+}
+
+static void can_master_handle_zone_event(uint8_t node_id, const twai_message_t *msg)
+{
+    if (!msg || msg->data_length_code < 8) {
+        return;
+    }
+
+    uint8_t zone_index = msg->data[0];
+    if (zone_index >= ROSTER_MAX_ZONES) {
+        return;
+    }
+
+    uint8_t state_bits = msg->data[1];
+    uint16_t adc_raw = (uint16_t)msg->data[2] | ((uint16_t)msg->data[3] << 8);
+    uint16_t rloop_ohm_div100 = (uint16_t)msg->data[4] | ((uint16_t)msg->data[5] << 8);
+    uint16_t vbias_100mv = msg->data[6];
+    uint8_t seq = msg->data[7];
+    uint64_t ts = now_ms();
+
+    (void)roster_note_zone_event(node_id,
+                                 zone_index,
+                                 state_bits,
+                                 adc_raw,
+                                 rloop_ohm_div100,
+                                 vbias_100mv,
+                                 seq,
+                                 ts);
+
+    cJSON *evt = cJSON_CreateObject();
+    if (!evt) {
+        return;
+    }
+
+    cJSON_AddNumberToObject(evt, "node_id", node_id);
+    cJSON_AddNumberToObject(evt, "zone", zone_index);
+    cJSON_AddNumberToObject(evt, "ts_ms", (double)ts);
+    cJSON_AddNumberToObject(evt, "state_bits", state_bits);
+    cJSON_AddStringToObject(evt, "state", can_master_zone_state_string(state_bits));
+    cJSON_AddBoolToObject(evt, "present", (state_bits & CAN_PROTO_EXT_ZONE_STATE_PRESENT) != 0);
+    cJSON_AddBoolToObject(evt, "alarm", (state_bits & CAN_PROTO_EXT_ZONE_STATE_ALARM) != 0);
+    cJSON_AddBoolToObject(evt, "fault_short", (state_bits & CAN_PROTO_EXT_ZONE_STATE_SHORT) != 0);
+    cJSON_AddBoolToObject(evt, "fault_open", (state_bits & CAN_PROTO_EXT_ZONE_STATE_OPEN) != 0);
+    cJSON_AddBoolToObject(evt, "tamper", (state_bits & CAN_PROTO_EXT_ZONE_STATE_TAMPER) != 0);
+    cJSON_AddBoolToObject(evt, "contact_no", (state_bits & CAN_PROTO_EXT_ZONE_STATE_CONTACT_NO) != 0);
+    cJSON_AddNumberToObject(evt, "adc_raw", adc_raw);
+    cJSON_AddNumberToObject(evt, "rloop_ohm_div100", rloop_ohm_div100);
+    cJSON_AddNumberToObject(evt, "rloop_ohm", (double)rloop_ohm_div100 * 100.0);
+    cJSON_AddNumberToObject(evt, "vbias_100mv", vbias_100mv);
+    cJSON_AddNumberToObject(evt, "vbias_volts", (double)vbias_100mv / 10.0);
+    cJSON_AddNumberToObject(evt, "seq", seq);
+    web_server_ws_broadcast_event("zone_event", evt);
 }
 
 static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbeat_t *payload)
@@ -746,6 +878,20 @@ static void can_master_handle_frame(const twai_message_t *msg)
                 can_master_handle_info(node_id, payload);
             }
         }
+        return;
+    }
+
+    if (cob_id >= CAN_PROTO_ID_EXT_HEARTBEAT(0) &&
+        cob_id < (CAN_PROTO_ID_EXT_HEARTBEAT(0) + CAN_MAX_NODE_ID + 1)) {
+        uint8_t node_id = (uint8_t)(cob_id - CAN_PROTO_ID_EXT_HEARTBEAT(0));
+        can_master_handle_ext_heartbeat(node_id, msg);
+        return;
+    }
+
+    if (cob_id >= CAN_PROTO_ID_EXT_ZONE_EVENT(0) &&
+        cob_id < (CAN_PROTO_ID_EXT_ZONE_EVENT(0) + CAN_MAX_NODE_ID + 1)) {
+        uint8_t node_id = (uint8_t)(cob_id - CAN_PROTO_ID_EXT_ZONE_EVENT(0));
+        can_master_handle_zone_event(node_id, msg);
         return;
     }
 }

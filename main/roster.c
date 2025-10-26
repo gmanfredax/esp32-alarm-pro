@@ -1,5 +1,6 @@
 #include "roster.h"
 #include "alarm_core.h"
+#include "can_bus_protocol.h"
 #include "device_identity.h"
 #include "utils.h"
 
@@ -763,6 +764,10 @@ static void node_init_defaults(roster_node_t *node, uint8_t node_id)
     node->outputs_flags = 0;
     node->outputs_pwm = 0;
     node->associated_at_ms = 0;
+    for (uint32_t i = 0; i < ROSTER_MAX_ZONES; ++i) {
+        node->zones[i].zone_index = (uint8_t)i;
+        node->zones[i].valid = false;
+    }
     node_set_default_label(node);
     label_map_apply(node);
     node_apply_uid(node);
@@ -1225,6 +1230,98 @@ void roster_stats(size_t *out_total, size_t *out_online)
     if (out_online) *out_online = online;
 }
 
+static const char *zone_state_to_string(uint8_t state_bits)
+{
+    if (state_bits & CAN_PROTO_EXT_ZONE_STATE_TAMPER) {
+        return "TAMPER";
+    }
+    if (state_bits & CAN_PROTO_EXT_ZONE_STATE_SHORT) {
+        return "FAULT_SHORT";
+    }
+    if (state_bits & CAN_PROTO_EXT_ZONE_STATE_OPEN) {
+        return "FAULT_OPEN";
+    }
+    if (state_bits & CAN_PROTO_EXT_ZONE_STATE_ALARM) {
+        return "ALARM";
+    }
+    if (state_bits & CAN_PROTO_EXT_ZONE_STATE_PRESENT) {
+        return "NORMAL";
+    }
+    return "UNKNOWN";
+}
+
+static void add_ext_status_json(cJSON *obj, const roster_node_t *node)
+{
+    if (!obj || !node || !node->ext_status.valid) {
+        return;
+    }
+
+    const roster_ext_status_t *status = &node->ext_status;
+    cJSON *ext = cJSON_CreateObject();
+    if (!ext) {
+        return;
+    }
+
+    cJSON_AddNumberToObject(ext, "alarm_bitmap", status->alarm_bitmap);
+    cJSON_AddNumberToObject(ext, "short_bitmap", status->short_bitmap);
+    cJSON_AddNumberToObject(ext, "open_bitmap", status->open_bitmap);
+    cJSON_AddNumberToObject(ext, "tamper_bitmap", status->tamper_bitmap);
+    cJSON_AddNumberToObject(ext, "vdda_10mv", status->vdda_10mv);
+    cJSON_AddNumberToObject(ext, "vdda_volts", (double)status->vdda_10mv / 100.0);
+    cJSON_AddNumberToObject(ext, "vbias_100mv", status->vbias_100mv);
+    cJSON_AddNumberToObject(ext, "vbias_volts", (double)status->vbias_100mv / 10.0);
+    cJSON_AddNumberToObject(ext, "temp_c", status->temp_c);
+    cJSON_AddNumberToObject(ext, "fw_version", status->fw_version);
+    cJSON_AddNumberToObject(ext, "last_update_ms", (double)status->last_update_ms);
+    cJSON_AddItemToObject(obj, "analog_status", ext);
+}
+
+static void add_zone_telemetry_json(cJSON *obj, const roster_node_t *node)
+{
+    if (!obj || !node) {
+        return;
+    }
+
+    cJSON *zones = NULL;
+    for (size_t i = 0; i < ROSTER_MAX_ZONES; ++i) {
+        const roster_zone_telemetry_t *zone = &node->zones[i];
+        if (!zone->valid) {
+            continue;
+        }
+        if (!zones) {
+            zones = cJSON_CreateArray();
+            if (!zones) {
+                return;
+            }
+        }
+        cJSON *z = cJSON_CreateObject();
+        if (!z) {
+            continue;
+        }
+        cJSON_AddNumberToObject(z, "zone", (double)zone->zone_index);
+        cJSON_AddNumberToObject(z, "state_bits", zone->state_bits);
+        cJSON_AddStringToObject(z, "state", zone_state_to_string(zone->state_bits));
+        cJSON_AddBoolToObject(z, "present", (zone->state_bits & CAN_PROTO_EXT_ZONE_STATE_PRESENT) != 0);
+        cJSON_AddBoolToObject(z, "alarm", (zone->state_bits & CAN_PROTO_EXT_ZONE_STATE_ALARM) != 0);
+        cJSON_AddBoolToObject(z, "fault_short", (zone->state_bits & CAN_PROTO_EXT_ZONE_STATE_SHORT) != 0);
+        cJSON_AddBoolToObject(z, "fault_open", (zone->state_bits & CAN_PROTO_EXT_ZONE_STATE_OPEN) != 0);
+        cJSON_AddBoolToObject(z, "tamper", (zone->state_bits & CAN_PROTO_EXT_ZONE_STATE_TAMPER) != 0);
+        cJSON_AddBoolToObject(z, "contact_no", (zone->state_bits & CAN_PROTO_EXT_ZONE_STATE_CONTACT_NO) != 0);
+        cJSON_AddNumberToObject(z, "adc_raw", (double)zone->adc_raw);
+        cJSON_AddNumberToObject(z, "rloop_ohm", (double)zone->rloop_ohm_div100 * 100.0);
+        cJSON_AddNumberToObject(z, "rloop_ohm_div100", (double)zone->rloop_ohm_div100);
+        cJSON_AddNumberToObject(z, "vbias_100mv", (double)zone->vbias_100mv);
+        cJSON_AddNumberToObject(z, "vbias_volts", (double)zone->vbias_100mv / 10.0);
+        cJSON_AddNumberToObject(z, "seq", (double)zone->seq);
+        cJSON_AddNumberToObject(z, "last_update_ms", (double)zone->last_update_ms);
+        cJSON_AddItemToArray(zones, z);
+    }
+
+    if (zones) {
+        cJSON_AddItemToObject(obj, "zones", zones);
+    }
+}
+
 static void add_common_fields(cJSON *obj, const roster_node_t *node)
 {
     cJSON_AddNumberToObject(obj, "node_id", node->node_id);
@@ -1259,6 +1356,8 @@ static void add_common_fields(cJSON *obj, const roster_node_t *node)
     cJSON_AddNumberToObject(obj, "last_seen_ms", (double)node->last_seen_ms);
     cJSON_AddNumberToObject(obj, "associated_at_ms", (double)node->associated_at_ms);
     cJSON_AddBoolToObject(obj, "identify_active", node->identify_active);
+    add_ext_status_json(obj, node);
+    add_zone_telemetry_json(obj, node);
 }
 
 void roster_to_json(cJSON *out_array)
@@ -1436,6 +1535,143 @@ esp_err_t roster_note_outputs(uint8_t node_id,
     return ESP_OK;
 }
 
+esp_err_t roster_note_ext_status(uint8_t node_id,
+                                 uint8_t alarm_bitmap,
+                                 uint8_t short_bitmap,
+                                 uint8_t open_bitmap,
+                                 uint8_t tamper_bitmap,
+                                 uint16_t vdda_10mv,
+                                 uint16_t vbias_100mv,
+                                 int16_t temp_c,
+                                 uint8_t fw_version,
+                                 uint64_t timestamp_ms)
+{
+    if (node_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    if (!node) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!node->used) {
+        node_init_defaults(node, node_id);
+    }
+
+    uint32_t combined_faults = (uint32_t)alarm_bitmap |
+                               (uint32_t)short_bitmap |
+                               (uint32_t)open_bitmap |
+                               (uint32_t)tamper_bitmap;
+    const uint32_t zone_mask = (ROSTER_MAX_ZONES >= 32u) ? UINT32_MAX : ((1u << ROSTER_MAX_ZONES) - 1u);
+    combined_faults &= zone_mask;
+
+    uint8_t inferred_count = node->inputs_count;
+    for (uint8_t bit = 0; bit < ROSTER_MAX_ZONES; ++bit) {
+        if (combined_faults & (1u << bit)) {
+            uint8_t candidate = (uint8_t)(bit + 1u);
+            if (candidate > inferred_count) {
+                inferred_count = candidate;
+            }
+        }
+    }
+
+    if (inferred_count == 0u && vbias_100mv != 0u) {
+        inferred_count = ROSTER_MAX_ZONES;
+    }
+    if (inferred_count > ROSTER_MAX_ZONES) {
+        inferred_count = ROSTER_MAX_ZONES;
+    }
+
+    roster_ext_status_t *status = &node->ext_status;
+    uint32_t prev_inputs = node->inputs_bitmap;
+    status->valid = true;
+    status->alarm_bitmap = alarm_bitmap;
+    status->short_bitmap = short_bitmap;
+    status->open_bitmap = open_bitmap;
+    status->tamper_bitmap = tamper_bitmap;
+    status->vdda_10mv = vdda_10mv;
+    status->vbias_100mv = vbias_100mv;
+    status->temp_c = temp_c;
+    status->fw_version = fw_version;
+    status->last_update_ms = timestamp_ms;
+
+    node->inputs_valid = true;
+    if (combined_faults != prev_inputs) {
+        node->change_counter++;
+    }
+    node->inputs_bitmap = combined_faults;
+    if (node->inputs_count < inferred_count) {
+        node->inputs_count = inferred_count;
+    }
+    xSemaphoreGive(s_roster_lock);
+    return ESP_OK;
+}
+
+esp_err_t roster_note_zone_event(uint8_t node_id,
+                                 uint8_t zone_index,
+                                 uint8_t state_bits,
+                                 uint16_t adc_raw,
+                                 uint16_t rloop_ohm_div100,
+                                 uint16_t vbias_100mv,
+                                 uint8_t seq,
+                                 uint64_t timestamp_ms)
+{
+    if (node_id == 0 || zone_index >= ROSTER_MAX_ZONES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    if (!node) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!node->used) {
+        node_init_defaults(node, node_id);
+    }
+
+    roster_zone_telemetry_t *zone = &node->zones[zone_index];
+    zone->valid = true;
+    zone->zone_index = zone_index;
+    zone->state_bits = state_bits;
+    zone->adc_raw = adc_raw;
+    zone->rloop_ohm_div100 = rloop_ohm_div100;
+    zone->vbias_100mv = vbias_100mv;
+    zone->seq = seq;
+    zone->last_update_ms = timestamp_ms;
+
+    uint32_t mask = (zone_index < 32u) ? (1u << zone_index) : 0u;
+    bool triggered = (state_bits & (CAN_PROTO_EXT_ZONE_STATE_ALARM |
+                                   CAN_PROTO_EXT_ZONE_STATE_SHORT |
+                                   CAN_PROTO_EXT_ZONE_STATE_OPEN |
+                                   CAN_PROTO_EXT_ZONE_STATE_TAMPER)) != 0;
+    if (mask != 0u) {
+        uint32_t prev_inputs = node->inputs_bitmap;
+        if (triggered) {
+            node->inputs_bitmap |= mask;
+        } else {
+            node->inputs_bitmap &= ~mask;
+        }
+        if (node->inputs_bitmap != prev_inputs) {
+            node->change_counter++;
+        }
+    }
+    node->inputs_valid = true;
+    uint8_t minimum_count = (uint8_t)(zone_index + 1u);
+    if (minimum_count > ROSTER_MAX_ZONES) {
+        minimum_count = ROSTER_MAX_ZONES;
+    }
+    if (node->inputs_count < minimum_count) {
+        node->inputs_count = minimum_count;
+    }
+    xSemaphoreGive(s_roster_lock);
+    return ESP_OK;
+}
+
 bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state)
 {
     if (!out_state) {
@@ -1470,6 +1706,56 @@ bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state)
         out_state->exists = false;
         out_state->state = ROSTER_NODE_STATE_OFFLINE;
     }
+    return ok;
+}
+
+bool roster_get_ext_status(uint8_t node_id, roster_ext_status_t *out_status)
+{
+    if (!out_status) {
+        return false;
+    }
+
+    if (node_id == 0) {
+        memset(out_status, 0, sizeof(*out_status));
+        return false;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    bool ok = (node && node->used && node->ext_status.valid);
+    if (ok) {
+        *out_status = node->ext_status;
+    } else {
+        memset(out_status, 0, sizeof(*out_status));
+    }
+    xSemaphoreGive(s_roster_lock);
+    return ok;
+}
+
+bool roster_get_zone_telemetry(uint8_t node_id,
+                               uint8_t zone_index,
+                               roster_zone_telemetry_t *out_zone)
+{
+    if (!out_zone) {
+        return false;
+    }
+
+    if (node_id == 0 || zone_index >= ROSTER_MAX_ZONES) {
+        memset(out_zone, 0, sizeof(*out_zone));
+        return false;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    bool ok = (node && node->used && node->zones[zone_index].valid);
+    if (ok) {
+        *out_zone = node->zones[zone_index];
+    } else {
+        memset(out_zone, 0, sizeof(*out_zone));
+    }
+    xSemaphoreGive(s_roster_lock);
     return ok;
 }
 
