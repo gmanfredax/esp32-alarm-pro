@@ -89,6 +89,7 @@
             <li><button class="btn w-100" data-view="view-mqtt">MQTT</button></li>
             <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
             <li><button class="btn w-100" data-view="view-expansions">Espansioni CAN</button></li>
+            <li><button class="btn w-100" data-view="view-diagnostics">Diagnostica sistema</button></li>
           </ul>
         </aside>
 
@@ -204,6 +205,48 @@
               <p id="adminExpansionStatus" class="status-line muted hidden" role="status"></p>
               <ul id="adminExpansionList" class="expansion-list"></ul>
               <p id="adminExpansionEmpty" class="expansion-empty hidden">Nessuna scheda rilevata.</p>
+            </div>
+          </section>
+
+          <!-- DIAGNOSTICA SISTEMA -->
+          <section id="view-diagnostics" class="view">
+            <div class="card">
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap">
+                <h3>Backend zone</h3>
+                <div class="row" style="gap:.5rem;align-items:center;flex-wrap:wrap">
+                  <label for="backendSelect" class="muted">Seleziona backend</label>
+                  <select id="backendSelect">
+                    <option value="digital">MCP23017 digitale</option>
+                    <option value="ads">ADS1115 analogico</option>
+                  </select>
+                  <button class="btn" id="backendApply" type="button">Applica</button>
+                </div>
+              </div>
+              <div id="backendStatus" class="status-line muted" style="margin-top:.5rem"></div>
+            </div>
+
+            <div class="card" style="margin-top:1rem">
+              <h3>Telemetria zone</h3>
+              <div id="diagnosticsError" class="status-line error hidden"></div>
+              <div class="table-wrap" style="margin-top:.5rem;overflow:auto">
+                <table class="table" id="diagnosticsTable">
+                  <thead>
+                    <tr>
+                      <th>Zona</th>
+                      <th>Stato</th>
+                      <th>Vz [V]</th>
+                      <th>Vbias [V]</th>
+                      <th>Rloop [Ω]</th>
+                      <th>Modalità</th>
+                      <th>Fault</th>
+                      <th>Valori attesi [V]</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr><td colspan="8">Caricamento…</td></tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </section>
         </section>

@@ -53,6 +53,7 @@
 #include "pdo.h"
 #include "web_server.h"
 #include "cJSON.h"
+#include "zone_backend.h"
 
 //#ifndef TWAI_FRAME_MAX_DLC
 //#define TWAI_FRAME_MAX_DLC 8
@@ -80,6 +81,9 @@ static void sntp_start_and_wait(void){
 }
 
 static const char *TAG = "app";
+
+#define ROSTER_CACHE_MAX_NODES 32
+static roster_node_inputs_t s_zone_mask_nodes[ROSTER_CACHE_MAX_NODES];
 
 // #if defined(CONFIG_APP_CAN_ENABLED)
 // static const char *TAG_CAN = "can";
@@ -1374,7 +1378,7 @@ static void nvs_init_safe(void)
     }
 }
 
-static void compose_zone_mask(uint16_t master_gpio, uint16_t zones_total, zone_mask_t *out_mask)
+static void compose_zone_mask(const zone_backend_snapshot_t *snapshot, uint16_t zones_total, zone_mask_t *out_mask)
 {
     if (!out_mask) {
         return;
@@ -1384,34 +1388,57 @@ static void compose_zone_mask(uint16_t master_gpio, uint16_t zones_total, zone_m
     }
 
     zone_mask_clear(out_mask);
-    uint16_t master_limit = INPUT_ZONES_COUNT;
+    uint16_t master_limit = snapshot ? snapshot->zone_count : INPUT_ZONES_COUNT;
+    if (master_limit > INPUT_ZONES_COUNT) {
+        master_limit = INPUT_ZONES_COUNT;
+    }
     if (master_limit > zones_total) {
         master_limit = zones_total;
     }
 
     for (uint16_t i = 1; i <= master_limit; ++i) {
-        if (inputs_zone_bit(master_gpio, i)) {
+        bool alarm = false;
+        if (snapshot && i <= snapshot->zone_count) {
+            const zone_backend_zone_state_t *zone = &snapshot->zones[i - 1];
+            alarm = zone->present && zone->alarm;
+        } else {
+            uint16_t gpioab = 0;
+            if (snapshot) {
+                gpioab = snapshot->gpio_raw;
+            }
+            alarm = inputs_zone_bit(gpioab, i);
+        }
+        if (alarm) {
             zone_mask_set(out_mask, (uint16_t)(i - 1u));
         }
     }
 
-    if (zones_total <= INPUT_ZONES_COUNT) {
+    if (zones_total <= master_limit) {
         zone_mask_limit(out_mask, zones_total);
         return;
     }
 
-    roster_node_inputs_t nodes[32];
-    size_t node_count = roster_collect_nodes(nodes, sizeof(nodes) / sizeof(nodes[0]));
-    uint16_t offset = INPUT_ZONES_COUNT;
+    size_t node_count = roster_collect_nodes(s_zone_mask_nodes,
+                                            sizeof(s_zone_mask_nodes) / sizeof(s_zone_mask_nodes[0]));
+    uint16_t offset = master_limit;
     if (offset > zones_total) {
         offset = zones_total;
     }
 
     for (size_t idx = 0; idx < node_count && offset < zones_total && offset < ALARM_MAX_ZONES; ++idx) {
-        const roster_node_inputs_t *node = &nodes[idx];
-        const uint8_t inputs = node->inputs_count;
-        for (uint8_t bit = 0; bit < inputs && offset < zones_total && offset < ALARM_MAX_ZONES; ++bit, ++offset) {
-            bool active = node->inputs_valid && ((node->inputs_bitmap & (1u << bit)) != 0u);
+        const roster_node_inputs_t *node = &s_zone_mask_nodes[idx];
+        uint8_t slots = node->inputs_count;
+        if (slots == 0 && node->backend_zone_count > 0) {
+            slots = node->backend_zone_count;
+        }
+        for (uint8_t bit = 0; bit < slots && offset < zones_total && offset < ALARM_MAX_ZONES; ++bit, ++offset) {
+            bool active = false;
+            if (node->backend_ready && bit < node->backend_zone_count) {
+                const zone_backend_zone_state_t *st = &node->backend_zones[bit];
+                active = st->present && st->alarm;
+            } else {
+                active = node->inputs_valid && ((node->inputs_bitmap & (1u << bit)) != 0u);
+            }
             if (active) {
                 zone_mask_set(out_mask, offset);
             }
@@ -1527,15 +1554,16 @@ static void system_main_task(void *arg)
     mqtt_publish_state();
     mqtt_publish_scenes();
 
-    uint16_t initial_gpio = 0;
+    zone_backend_snapshot_t initial_snapshot;
+    memset(&initial_snapshot, 0, sizeof(initial_snapshot));
     uint16_t last_zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
     zone_mask_t last_mask;
     zone_mask_clear(&last_mask);
     bool first_cycle = true;
-    if (inputs_read_all(&initial_gpio) == ESP_OK) {
+    if (inputs_poll_snapshot(&initial_snapshot) == ESP_OK) {
         uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
         zone_mask_t init_mask;
-        compose_zone_mask(initial_gpio, zones_total, &init_mask);
+        compose_zone_mask(&initial_snapshot, zones_total, &init_mask);
         mqtt_publish_zones(&init_mask);
         zone_mask_copy(&last_mask, &init_mask);
         last_zones_total = zones_total;
@@ -1565,15 +1593,21 @@ static void system_main_task(void *arg)
     // Main loop: leggi ingressi e alimenta la logica d’allarme
     
     while (true) {
-        uint16_t ab = 0;
-        inputs_read_all(&ab);
-
+        zone_backend_snapshot_t snapshot;
+        esp_err_t snap_err = inputs_poll_snapshot(&snapshot);
         uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
         zone_mask_t zmask;
-        compose_zone_mask(ab, zones_total, &zmask);
+        compose_zone_mask((snap_err == ESP_OK) ? &snapshot : NULL, zones_total, &zmask);
 
         // esempio: tamper su bit (8+4) come da tuo codice
-        bool tamper = inputs_tamper(ab);
+        bool tamper = false;
+        if (snap_err == ESP_OK) {
+            tamper = snapshot.tamper_input;
+        } else {
+            uint16_t ab = 0;
+            inputs_read_all(&ab);
+            tamper = inputs_tamper(ab);
+        }
 
         if (first_cycle || !zone_mask_equal(&zmask, &last_mask) || zones_total != last_zones_total) {
             mqtt_publish_zones(&zmask);

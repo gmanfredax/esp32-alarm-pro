@@ -2,12 +2,13 @@
 
 #include "pins.h"
 #include "esp_err.h"
+#include "zone_backend.h"
 #include <stdint.h>
 #include <stdbool.h>
 
 // Numero di zone esposte al web: A0..A7 (8) + B0..B3 (4) = 12
 // (Se vuoi usare anche B4 come Z13, cambia a 13)
-#define INPUT_ZONES_COUNT 12
+#define INPUT_ZONES_COUNT ZONE_BACKEND_MAX_ZONES
 
 
 /**
@@ -24,6 +25,10 @@ esp_err_t inputs_init(void);
  * @return ESP_OK se tutto ok
  */
 esp_err_t inputs_read_all(uint16_t* gpioab);
+
+zone_backend_type_t inputs_backend_get(void);
+esp_err_t           inputs_backend_set(zone_backend_type_t backend, bool persist);
+esp_err_t           inputs_poll_snapshot(zone_backend_snapshot_t *snapshot);
 
 /**
  * @brief Helper: ritorna true se la zona z (1..12) è attiva.

@@ -72,7 +72,24 @@
       __skipAuthRedirect: opts.skipAuthRedirect === true
     });
     if (r.status === 401) { needLogin(); throw new Error("401"); }
-    if (!r.ok) throw new Error(await r.text());
+    if (!r.ok) {
+      let detail = "";
+      try {
+        const ct = r.headers.get("content-type") || "";
+        if (ct.includes("application/json")) {
+          const data = await r.json();
+          detail = data?.message || data?.error || JSON.stringify(data);
+        } else {
+          detail = await r.text();
+        }
+      } catch (err) {
+        detail = err?.message || "";
+      }
+      if (!detail) {
+        detail = `${r.status} ${r.statusText}`;
+      }
+      throw new Error(detail);
+    }
     try { return await r.json(); } catch { return {}; }
   }
 
@@ -146,6 +163,18 @@
   let telemetryFetchPending = false;
   const modalCleanupHandlers = new Set();
 
+  const diagnosticsState = {
+    backend: 'digital',
+    backendReady: false,
+    vbias: 0,
+    zoneCount: 0,
+    zones: [],
+    loading: false,
+    error: '',
+    lastRefreshPromise: null,
+  };
+  let diagnosticsTimer = null;
+
   function formatDateTime(ts){
     if (ts == null) return "";
     let date;
@@ -166,6 +195,221 @@
     } catch {
       return String(num);
     }
+  }
+
+  function formatFloat(value, digits = 3){
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "—";
+    return num.toFixed(digits);
+  }
+
+  function formatVoltage(value){
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "—";
+    if (Math.abs(num) >= 10) return num.toFixed(2);
+    return num.toFixed(3);
+  }
+
+  function formatOhm(value){
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "—";
+    if (Math.abs(num) >= 1000) {
+      try { return num.toLocaleString("it-IT", { maximumFractionDigits: 0 }); }
+      catch { return Math.round(num).toString(); }
+    }
+    return num.toFixed(1);
+  }
+
+  function formatExpectedValues(expected){
+    if (!expected || typeof expected !== 'object') return '—';
+    const parts = [];
+    const pushIfFinite = (key, label) => {
+      const value = Number(expected[key]);
+      if (Number.isFinite(value)) {
+        parts.push(`${label}=${formatVoltage(value)}`);
+      }
+    };
+    pushIfFinite('normal_v', 'N');
+    pushIfFinite('alarm_v', 'A');
+    pushIfFinite('tamper_v', 'T');
+    pushIfFinite('open_v', 'O');
+    pushIfFinite('short_v', 'S');
+    return parts.length ? parts.join(', ') : '—';
+  }
+
+  function renderDiagnostics(){
+    const select = $('#backendSelect');
+    if (select) {
+      const current = diagnosticsState.backend || 'digital';
+      if (select.value !== current) {
+        select.value = current;
+      }
+    }
+    const statusEl = $('#backendStatus');
+    if (statusEl) {
+      const modeLabel = diagnosticsState.backend === 'ads'
+        ? 'ADS1115 analogico'
+        : 'MCP23017 digitale';
+      let text = `Backend attivo: ${modeLabel}`;
+      if (diagnosticsState.backendReady) {
+        text += ` • Vbias ${formatVoltage(diagnosticsState.vbias)} V`;
+      } else {
+        text += ' • backend non inizializzato';
+      }
+      statusEl.textContent = text;
+    }
+
+    const errorBox = $('#diagnosticsError');
+    if (errorBox) {
+      if (diagnosticsState.error) {
+        errorBox.textContent = diagnosticsState.error;
+        errorBox.classList.remove('hidden');
+      } else {
+        errorBox.textContent = '';
+        errorBox.classList.add('hidden');
+      }
+    }
+
+    const tableBody = $('#diagnosticsTable tbody');
+    if (!tableBody) {
+      return;
+    }
+    tableBody.innerHTML = '';
+
+    if (diagnosticsState.loading && diagnosticsState.zones.length === 0) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="8">Caricamento…</td>';
+      tableBody.appendChild(tr);
+      return;
+    }
+
+    if (diagnosticsState.error && diagnosticsState.zones.length === 0) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td colspan="8">${escapeHtml(diagnosticsState.error)}</td>`;
+      tableBody.appendChild(tr);
+      return;
+    }
+
+    if (!diagnosticsState.zones.length) {
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td colspan="8">Nessuna zona rilevata.</td>';
+      tableBody.appendChild(tr);
+      return;
+    }
+
+    diagnosticsState.zones.forEach((zone) => {
+      const tr = document.createElement('tr');
+      const zoneId = Number.isFinite(Number(zone?.id)) ? Number(zone.id) : null;
+      const zoneLabel = zoneId ? `Z${zoneId}` : 'Zona';
+      const name = (zone?.name && String(zone.name).trim()) || '';
+      const present = zone?.present !== false;
+      const active = zone?.active === true;
+      const tamper = zone?.tamper_backend === true;
+      const faults = [];
+      if (zone?.fault_short) faults.push('SHORT');
+      if (zone?.fault_open) faults.push('OPEN');
+      if (tamper) faults.push('TAMPER');
+      if (!present) faults.push('ASSENTE');
+      const faultText = faults.length ? faults.join(', ') : '—';
+      let stateLabel = '—';
+      if (!present) {
+        stateLabel = 'Assente';
+      } else if (tamper) {
+        stateLabel = 'TAMPER';
+      } else if (active) {
+        stateLabel = 'ALLARME';
+      } else {
+        stateLabel = 'Normale';
+      }
+      const vbiasValue = Number.isFinite(Number(zone?.vbias_v)) ? Number(zone.vbias_v) : diagnosticsState.vbias;
+      const modeLabel = (zone?.mode_backend || '').toString().toUpperCase() || '—';
+      const expectedText = formatExpectedValues(zone?.expected);
+      tr.innerHTML = `
+        <td>${escapeHtml(zoneLabel)} <span class="muted">${escapeHtml(name)}</span></td>
+        <td>${escapeHtml(stateLabel)}</td>
+        <td>${formatVoltage(zone?.vz_v)}</td>
+        <td>${formatVoltage(vbiasValue)}</td>
+        <td>${formatOhm(zone?.rloop_ohm)}</td>
+        <td>${escapeHtml(modeLabel)}</td>
+        <td>${escapeHtml(faultText)}</td>
+        <td>${escapeHtml(expectedText)}</td>`;
+      tableBody.appendChild(tr);
+    });
+  }
+
+  async function refreshDiagnostics(options = {}){
+    if (diagnosticsState.loading) {
+      return diagnosticsState.lastRefreshPromise || Promise.resolve();
+    }
+    diagnosticsState.loading = true;
+    if (!options.keepError) {
+      diagnosticsState.error = '';
+    }
+    if (options.showLoading) {
+      renderDiagnostics();
+    }
+    const promise = Promise.all([
+      apiGet('/api/sys/backend'),
+      apiGet('/api/zones')
+    ]).then(([backendInfo, zonesInfo]) => {
+      const backend = backendInfo?.backend || zonesInfo?.backend || diagnosticsState.backend;
+      diagnosticsState.backend = backend || 'digital';
+      diagnosticsState.backendReady = Boolean(backendInfo?.ready ?? zonesInfo?.backend_ready);
+      const vbiasValue = Number(backendInfo?.vbias_v ?? zonesInfo?.vbias_v);
+      diagnosticsState.vbias = Number.isFinite(vbiasValue) ? vbiasValue : diagnosticsState.vbias;
+      diagnosticsState.zoneCount = Number.isFinite(Number(zonesInfo?.total)) ? Number(zonesInfo.total) : diagnosticsState.zoneCount;
+      diagnosticsState.zones = Array.isArray(zonesInfo?.zones) ? zonesInfo.zones : [];
+      diagnosticsState.error = '';
+    }).catch((err) => {
+      diagnosticsState.error = err?.message || 'Errore aggiornando la diagnostica';
+    }).finally(() => {
+      diagnosticsState.loading = false;
+      diagnosticsState.lastRefreshPromise = null;
+      renderDiagnostics();
+    });
+    diagnosticsState.lastRefreshPromise = promise;
+    return promise;
+  }
+
+  function startDiagnosticsUpdates(){
+    if (diagnosticsTimer) return;
+    refreshDiagnostics({ showLoading: diagnosticsState.zones.length === 0 }).catch(() => {});
+    diagnosticsTimer = window.setInterval(() => {
+      if (document.hidden) return;
+      refreshDiagnostics().catch(() => {});
+    }, 2000);
+  }
+
+  function stopDiagnosticsUpdates(){
+    if (diagnosticsTimer){
+      clearInterval(diagnosticsTimer);
+      diagnosticsTimer = null;
+    }
+  }
+
+  function setupDiagnosticsSection(){
+    const applyBtn = $('#backendApply');
+    if (applyBtn){
+      applyBtn.addEventListener('click', async () => {
+        const select = $('#backendSelect');
+        const value = select ? String(select.value || '').trim() || 'digital' : 'digital';
+        const previous = applyBtn.textContent;
+        applyBtn.disabled = true;
+        applyBtn.textContent = 'Salvataggio…';
+        try {
+          await apiPost('/api/sys/backend', { backend: value });
+          toast('Backend aggiornato');
+          await refreshDiagnostics({ showLoading: true });
+        } catch (err) {
+          toast(`Backend: ${err?.message || 'errore'}`, false);
+        } finally {
+          applyBtn.disabled = false;
+          applyBtn.textContent = previous;
+        }
+      });
+    }
+    renderDiagnostics();
+    return refreshDiagnostics({ showLoading: true });
   }
 
   const normalizeRole = (roleValue) => {
@@ -248,12 +492,25 @@
           if (current) current.classList.add("active");
         }
         if (id !== "view-mqtt") maskMqttPassword();
+        if (id === 'view-diagnostics') {
+          startDiagnosticsUpdates();
+        } else {
+          stopDiagnosticsUpdates();
+        }
       });
     });
   }
 
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) maskMqttPassword();
+    if (document.hidden) {
+      maskMqttPassword();
+      stopDiagnosticsUpdates();
+    } else {
+      const diag = document.getElementById('view-diagnostics');
+      if (diag && diag.classList.contains('active')) {
+        startDiagnosticsUpdates();
+      }
+    }
   });
 
   function getExpansionItems(){
@@ -1813,7 +2070,7 @@
     mountUserMenu();
     updateAdminVisibility();
     setupSidebar();
-    const setupPromises = [setupNetMqttForms(), setupWebSecForm(), setupExpansionsSection()];
+    const setupPromises = [setupNetMqttForms(), setupWebSecForm(), setupExpansionsSection(), setupDiagnosticsSection()];
     document.querySelector('[data-tab="home"]')?.addEventListener('click', (e) => {
       e.preventDefault();
       location.href = "/index.html";
