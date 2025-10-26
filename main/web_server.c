@@ -97,7 +97,6 @@ static bool parse_can_node_id(const char *uri, uint8_t *out_node);
 static bool parse_can_node_outputs_uri(const char *uri, uint8_t *out_node);
 static bool parse_can_node_assign_uri(const char *uri, uint8_t *out_node);
 static bool parse_can_node_label_uri(const char *uri, uint8_t *out_node);
-static bool parse_can_node_telemetry_uri(const char *uri, uint8_t *out_node);
 static bool web_uri_match(const char *reference_uri,
                           const char *uri_to_match,
                           size_t match_upto);
@@ -687,35 +686,6 @@ static bool parse_can_node_label_uri(const char *uri, uint8_t *out_node)
     return true;
 }
 
-static bool parse_can_node_telemetry_uri(const char *uri, uint8_t *out_node)
-{
-    const char *prefix = "/api/can/node/";
-    size_t prefix_len = strlen(prefix);
-    if (strncmp(uri, prefix, prefix_len) != 0) {
-        return false;
-    }
-    const char *p = uri + prefix_len;
-    if (!isdigit((unsigned char)*p)) {
-        return false;
-    }
-    char *end = NULL;
-    long node = strtol(p, &end, 10);
-    if (end == p || node < 0 || node > 255) {
-        return false;
-    }
-    if (strncmp(end, "/telemetry", 10) != 0) {
-        return false;
-    }
-    end += 10;
-    if (*end != '\0' && *end != '?') {
-        return false;
-    }
-    if (out_node) {
-        *out_node = (uint8_t)node;
-    }
-    return true;
-}
-
 static bool parse_can_nodes_uri(const char *uri, uint8_t *out_node)
 {
     const char *prefix = "/api/can/nodes/";
@@ -741,21 +711,6 @@ static bool parse_can_nodes_uri(const char *uri, uint8_t *out_node)
     return true;
 }
 
-static void can_log_node_offline(uint8_t node_id, const char *reason)
-{
-    const char *why = (reason && reason[0] != '\0') ? reason : "motivo sconosciuto";
-    roster_node_t snapshot = {0};
-    const char *label = NULL;
-    if (roster_get_node_snapshot(node_id, &snapshot) && snapshot.label[0] != '\0') {
-        label = snapshot.label;
-    }
-    if (label) {
-        log_add("CAN nodo %u \"%s\" offline (%s)", (unsigned)node_id, label, why);
-    } else {
-        log_add("CAN nodo %u offline (%s)", (unsigned)node_id, why);
-    }
-}
-
 static bool web_uri_match(const char *reference_uri,
                           const char *uri_to_match,
                           size_t match_upto)
@@ -777,8 +732,6 @@ static bool web_uri_match(const char *reference_uri,
         can_match_kind = 3;
     } else if (strcmp(reference_uri, "/api/can/node/*/label") == 0) {
         can_match_kind = 4;
-    } else if (strcmp(reference_uri, "/api/can/node/*/telemetry") == 0) {
-        can_match_kind = 5;
     } else {
         return false;
     }
@@ -814,9 +767,6 @@ static bool web_uri_match(const char *reference_uri,
             break;
         case 4:
             matched = parse_can_node_label_uri(path, NULL);
-            break;
-        case 5:
-            matched = parse_can_node_telemetry_uri(path, NULL);
             break;
         default:
             matched = false;
@@ -1045,13 +995,6 @@ static esp_err_t api_can_node_delete(httpd_req_t *req)
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "roster");
         return ESP_FAIL;
     }
-
-    if (hard) {
-        can_log_node_offline(node_id, "dimenticato");
-    } else {
-        can_log_node_offline(node_id, "richiesta amministratore");
-    }
-
     cJSON *resp = cJSON_CreateObject();
     if (!resp) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
@@ -1398,109 +1341,6 @@ static esp_err_t api_can_node_label_post(httpd_req_t *req)
 }
 
 static esp_err_t api_can_node_label_options(httpd_req_t *req)
-{
-    return cors_handle_options(req);
-}
-
-static esp_err_t api_can_node_telemetry_get(httpd_req_t *req)
-{
-    if (!check_bearer(req) || !is_admin_user(req)) {
-        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
-        return ESP_FAIL;
-    }
-
-    uint8_t node_id = 0;
-    if (!parse_can_node_telemetry_uri(req->uri, &node_id) || node_id == 0) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
-        return ESP_FAIL;
-    }
-
-    cors_apply(req);
-
-    can_master_node_telemetry_t node_stats = {0};
-    esp_err_t node_err = can_master_get_node_telemetry(node_id, &node_stats);
-    if (node_err == ESP_ERR_NOT_SUPPORTED) {
-        return json_error_reply(req, "503 Service Unavailable", "can_not_supported");
-    }
-    if (node_err == ESP_ERR_NOT_FOUND) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "node");
-        return ESP_FAIL;
-    }
-    if (node_err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "telemetry");
-        return ESP_FAIL;
-    }
-
-    can_master_bus_telemetry_t bus_stats = {0};
-    esp_err_t bus_err = can_master_get_bus_telemetry(&bus_stats);
-    if (bus_err != ESP_OK && bus_err != ESP_ERR_NOT_SUPPORTED) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "telemetry_bus");
-        return ESP_FAIL;
-    }
-
-    roster_node_t snapshot = {0};
-    bool have_snapshot = roster_get_node_snapshot(node_id, &snapshot);
-
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
-        return ESP_FAIL;
-    }
-
-    cJSON *node_obj = cJSON_CreateObject();
-    cJSON *bus_obj = cJSON_CreateObject();
-    if (!node_obj || !bus_obj) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
-        return ESP_FAIL;
-    }
-    cJSON_AddItemToObject(root, "node", node_obj);
-    cJSON_AddItemToObject(root, "bus", bus_obj);
-
-    cJSON_AddNumberToObject(node_obj, "id", node_stats.node_id);
-    cJSON_AddBoolToObject(node_obj, "exists", node_stats.exists);
-    cJSON_AddBoolToObject(node_obj, "online", node_stats.online);
-    cJSON_AddNumberToObject(node_obj, "last_seen_ms", (double)node_stats.last_seen_ms);
-    cJSON_AddNumberToObject(node_obj, "last_online_ms", (double)node_stats.last_online_ms);
-    cJSON_AddNumberToObject(node_obj, "heartbeat_count", (double)node_stats.heartbeat_count);
-    cJSON_AddNumberToObject(node_obj, "info_count", (double)node_stats.info_count);
-    cJSON_AddNumberToObject(node_obj, "command_count", (double)node_stats.command_count);
-    cJSON_AddNumberToObject(node_obj, "command_errors", (double)node_stats.command_errors);
-    cJSON_AddNumberToObject(node_obj, "offline_events", (double)node_stats.offline_events);
-
-    if (have_snapshot) {
-        if (snapshot.label[0] != '\0') {
-            cJSON_AddStringToObject(node_obj, "label", snapshot.label);
-        }
-        if (snapshot.kind[0] != '\0') {
-            cJSON_AddStringToObject(node_obj, "kind", snapshot.kind);
-        }
-        cJSON_AddNumberToObject(node_obj, "inputs_count", (double)snapshot.inputs_count);
-        cJSON_AddNumberToObject(node_obj, "outputs_count", (double)snapshot.outputs_count);
-        cJSON_AddNumberToObject(node_obj, "state", (double)snapshot.state);
-        cJSON_AddNumberToObject(node_obj, "associated_at_ms", (double)snapshot.associated_at_ms);
-    }
-
-    bool bus_supported = (bus_err == ESP_OK);
-    cJSON_AddBoolToObject(bus_obj, "supported", bus_supported);
-    if (bus_supported) {
-        cJSON_AddBoolToObject(bus_obj, "driver_started", bus_stats.driver_started);
-        cJSON_AddNumberToObject(bus_obj, "timestamp_ms", (double)bus_stats.timestamp_ms);
-        cJSON_AddNumberToObject(bus_obj, "last_activity_ms", (double)bus_stats.last_activity_ms);
-        cJSON_AddNumberToObject(bus_obj, "packets_sent", (double)bus_stats.packets_sent);
-        cJSON_AddNumberToObject(bus_obj, "packets_received", (double)bus_stats.packets_received);
-        cJSON_AddNumberToObject(bus_obj, "packets_lost", (double)bus_stats.packets_lost);
-        cJSON_AddNumberToObject(bus_obj, "tx_errors", (double)bus_stats.tx_errors);
-        cJSON_AddNumberToObject(bus_obj, "rx_errors", (double)bus_stats.rx_errors);
-        cJSON_AddNumberToObject(bus_obj, "offline_events", (double)bus_stats.offline_events);
-        cJSON_AddNumberToObject(bus_obj, "nodes_known", (double)bus_stats.nodes_known);
-        cJSON_AddNumberToObject(bus_obj, "nodes_online", (double)bus_stats.nodes_online);
-    }
-
-    return json_reply_cjson(req, root);
-}
-
-static esp_err_t api_can_node_telemetry_options(httpd_req_t *req)
 {
     return cors_handle_options(req);
 }
@@ -5408,8 +5248,6 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/can/node/*/assign",    .method = HTTP_OPTIONS, .handler = api_can_node_assign_options },
     { .uri = "/api/can/node/*/label",     .method = HTTP_POST,    .handler = api_can_node_label_post },
     { .uri = "/api/can/node/*/label",     .method = HTTP_OPTIONS, .handler = api_can_node_label_options },
-    { .uri = "/api/can/node/*/telemetry", .method = HTTP_GET,     .handler = api_can_node_telemetry_get },
-    { .uri = "/api/can/node/*/telemetry", .method = HTTP_OPTIONS, .handler = api_can_node_telemetry_options },
     { .uri = "/api/can/node/*/identify", .method = HTTP_POST,    .handler = api_can_node_identify_post },
     { .uri = "/api/can/node/*/identify", .method = HTTP_OPTIONS, .handler = api_can_node_identify_options },
     { .uri = "/api/status",             .method = HTTP_GET,  .handler = status_get },

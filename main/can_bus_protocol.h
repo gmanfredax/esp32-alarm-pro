@@ -14,27 +14,16 @@ extern "C" {
 #define CAN_PROTO_PROTOCOL_VERSION 0x01u
 
 #define CAN_PROTO_MODEL_IO8R8_V1   0x0101u
-#define CAN_PROTO_MODEL_IO10R2_V1  0x0102u
 
 #define CAN_PROTO_ID_STATUS_BASE   0x180u
 #define CAN_PROTO_ID_INFO_BASE     0x280u
 #define CAN_PROTO_ID_COMMAND_BASE  0x380u
 #define CAN_PROTO_ID_DIAG_BASE     0x480u
 
-#define CAN_PROTO_ID_STATUS(node_id)        (CAN_PROTO_ID_STATUS_BASE + (node_id))
-#define CAN_PROTO_ID_INFO(node_id)          (CAN_PROTO_ID_INFO_BASE + (node_id))
-#define CAN_PROTO_ID_COMMAND(node_id)       (CAN_PROTO_ID_COMMAND_BASE + (node_id))
-#define CAN_PROTO_ID_DIAG(node_id)          (CAN_PROTO_ID_DIAG_BASE + (node_id))
-
-#define CAN_PROTO_ID_EXT_HEARTBEAT(node_id)  (0x100u + (node_id))
-#define CAN_PROTO_ID_EXT_ZONE_EVENT(node_id) (0x120u + (node_id))
-
-#define CAN_PROTO_EXT_ZONE_STATE_ALARM      0x01u
-#define CAN_PROTO_EXT_ZONE_STATE_SHORT      0x02u
-#define CAN_PROTO_EXT_ZONE_STATE_OPEN       0x04u
-#define CAN_PROTO_EXT_ZONE_STATE_TAMPER     0x08u
-#define CAN_PROTO_EXT_ZONE_STATE_PRESENT    0x10u
-#define CAN_PROTO_EXT_ZONE_STATE_CONTACT_NO 0x20u
+#define CAN_PROTO_ID_STATUS(node_id)  (CAN_PROTO_ID_STATUS_BASE + (node_id))
+#define CAN_PROTO_ID_INFO(node_id)    (CAN_PROTO_ID_INFO_BASE + (node_id))
+#define CAN_PROTO_ID_COMMAND(node_id) (CAN_PROTO_ID_COMMAND_BASE + (node_id))
+#define CAN_PROTO_ID_DIAG(node_id)    (CAN_PROTO_ID_DIAG_BASE + (node_id))
 
 #define CAN_PROTO_ID_BROADCAST_SCAN        0x070u
 #define CAN_PROTO_ID_BROADCAST_TEST        0x071u
@@ -106,8 +95,6 @@ typedef struct __attribute__((packed)) {
     uint8_t node_id;                 /**< Assigned CAN node id */
     uint8_t uid[CAN_PROTO_UID_LENGTH]; /**< Board hardware identifier (LSB first) */
 } can_proto_addr_assign_t;
-
-#define CAN_PROTO_NODE_STATE_WARNING_VBIAS 0x01u
 
 #ifdef __cplusplus
 }
