@@ -14,6 +14,7 @@ extern "C" {
 #define CAN_PROTO_PROTOCOL_VERSION 0x01u
 
 #define CAN_PROTO_MODEL_IO8R8_V1   0x0101u
+#define CAN_PROTO_MODEL_IO10R2_V1  0x0102u
 
 #define CAN_PROTO_ID_STATUS_BASE   0x180u
 #define CAN_PROTO_ID_INFO_BASE     0x280u
@@ -24,6 +25,9 @@ extern "C" {
 #define CAN_PROTO_ID_INFO(node_id)    (CAN_PROTO_ID_INFO_BASE + (node_id))
 #define CAN_PROTO_ID_COMMAND(node_id) (CAN_PROTO_ID_COMMAND_BASE + (node_id))
 #define CAN_PROTO_ID_DIAG(node_id)    (CAN_PROTO_ID_DIAG_BASE + (node_id))
+
+#define CAN_PROTO_ID_EXT_HEARTBEAT(node_id) (0x100u + (node_id))
+#define CAN_PROTO_ID_EXT_ZONE_EVENT(node_id) (0x120u + (node_id))
 
 #define CAN_PROTO_ID_BROADCAST_SCAN        0x070u
 #define CAN_PROTO_ID_BROADCAST_TEST        0x071u
@@ -95,6 +99,8 @@ typedef struct __attribute__((packed)) {
     uint8_t node_id;                 /**< Assigned CAN node id */
     uint8_t uid[CAN_PROTO_UID_LENGTH]; /**< Board hardware identifier (LSB first) */
 } can_proto_addr_assign_t;
+
+#define CAN_PROTO_NODE_STATE_WARNING_VBIAS 0x01u
 
 #ifdef __cplusplus
 }

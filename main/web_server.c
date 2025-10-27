@@ -1162,6 +1162,15 @@ static esp_err_t api_can_node_outputs_post(httpd_req_t *req)
     cJSON_AddBoolToObject(resp, "inputs_known", updated_state.inputs_valid);
     if (updated_state.inputs_valid) {
         cJSON_AddNumberToObject(resp, "inputs_bitmap", (double)updated_state.inputs_bitmap);
+        cJSON_AddNumberToObject(resp,
+                                "inputs_alarm_bitmap",
+                                (double)updated_state.inputs_bitmap);
+        cJSON_AddNumberToObject(resp,
+                                "inputs_tamper_bitmap",
+                                (double)updated_state.inputs_tamper_bitmap);
+        cJSON_AddNumberToObject(resp,
+                                "inputs_fault_bitmap",
+                                (double)updated_state.inputs_fault_bitmap);
         cJSON_AddNumberToObject(resp, "change_counter", updated_state.change_counter);
         cJSON_AddNumberToObject(resp, "node_state_flags", updated_state.node_state_flags);
     }

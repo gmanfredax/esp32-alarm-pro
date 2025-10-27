@@ -17,6 +17,32 @@ typedef enum {
     ROSTER_NODE_STATE_OPERATIONAL,
 } roster_node_state_t;
 
+#define ROSTER_MAX_ZONES 8u
+
+typedef struct {
+    bool valid;
+    uint8_t zone_index;
+    uint8_t state_bits;
+    uint16_t adc_raw;
+    uint16_t rloop_ohm_div100;
+    uint16_t vbias_100mv;
+    uint8_t seq;
+    uint64_t last_update_ms;
+} roster_zone_telemetry_t;
+
+typedef struct {
+    bool valid;
+    uint8_t alarm_bitmap;
+    uint8_t short_bitmap;
+    uint8_t open_bitmap;
+    uint8_t tamper_bitmap;
+    uint16_t vdda_10mv;
+    uint16_t vbias_100mv;
+    int16_t temp_c;
+    uint8_t fw_version;
+    uint64_t last_update_ms;
+} roster_ext_status_t;
+
 typedef struct {
     bool used;
     uint8_t node_id;
@@ -29,6 +55,8 @@ typedef struct {
     uint8_t inputs_count;
     uint8_t outputs_count;
     uint32_t inputs_bitmap;
+    uint32_t inputs_tamper_bitmap;
+    uint32_t inputs_fault_bitmap;
     uint32_t outputs_bitmap;
     uint8_t change_counter;
     uint8_t node_state_flags;
@@ -41,6 +69,8 @@ typedef struct {
     bool info_valid;
     bool inputs_valid;
     bool outputs_valid;
+    roster_ext_status_t ext_status;
+    roster_zone_telemetry_t zones[ROSTER_MAX_ZONES];
 } roster_node_t;
 
 typedef struct {
@@ -60,6 +90,8 @@ typedef struct {
     roster_node_state_t state;
     bool inputs_valid;
     uint32_t inputs_bitmap;
+    uint32_t inputs_tamper_bitmap;
+    uint32_t inputs_fault_bitmap;
     uint8_t change_counter;
     uint8_t node_state_flags;
     bool outputs_valid;
@@ -74,6 +106,9 @@ typedef struct {
     uint8_t outputs_count;
     bool inputs_valid;
     uint32_t inputs_bitmap;
+    uint32_t inputs_tamper_bitmap;
+    uint32_t inputs_fault_bitmap;
+    uint16_t caps;
     roster_node_state_t state;
 } roster_node_inputs_t;
 
@@ -91,16 +126,41 @@ const roster_node_t *roster_get_node(uint8_t node_id);
 bool roster_get_node_snapshot(uint8_t node_id, roster_node_t *out_snapshot);
 esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uint8_t *out_node_id, bool *out_is_new);
 esp_err_t roster_note_inputs(uint8_t node_id,
-                             uint32_t inputs_bitmap,
+                             uint32_t alarm_bitmap,
+                             uint32_t tamper_bitmap,
+                             uint32_t fault_bitmap,
                              uint8_t change_counter,
-                             uint8_t node_state_flags);
+                             uint8_t node_state_flags,
+                             bool has_extended);
 esp_err_t roster_note_outputs(uint8_t node_id,
                               uint32_t outputs_bitmap,
                               uint8_t flags,
                               uint8_t pwm_level,
                               bool known);
+esp_err_t roster_note_ext_status(uint8_t node_id,
+                                 uint8_t alarm_bitmap,
+                                 uint8_t short_bitmap,
+                                 uint8_t open_bitmap,
+                                 uint8_t tamper_bitmap,
+                                 uint16_t vdda_10mv,
+                                 uint16_t vbias_100mv,
+                                 int16_t temp_c,
+                                 uint8_t fw_version,
+                                 uint64_t timestamp_ms);
+esp_err_t roster_note_zone_event(uint8_t node_id,
+                                 uint8_t zone_index,
+                                 uint8_t state_bits,
+                                 uint16_t adc_raw,
+                                 uint16_t rloop_ohm_div100,
+                                 uint16_t vbias_100mv,
+                                 uint8_t seq,
+                                 uint64_t timestamp_ms);
 bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state);
 esp_err_t roster_reassign_node_id(uint8_t current_id, uint8_t new_id);
+bool roster_get_ext_status(uint8_t node_id, roster_ext_status_t *out_status);
+bool roster_get_zone_telemetry(uint8_t node_id,
+                               uint8_t zone_index,
+                               roster_zone_telemetry_t *out_zone);
 esp_err_t roster_set_node_label(uint8_t node_id, const char *label);
 
 size_t roster_collect_nodes(roster_node_inputs_t *out_nodes, size_t max_nodes);
