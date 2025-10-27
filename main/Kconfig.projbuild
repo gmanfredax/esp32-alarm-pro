@@ -1,3 +1,24 @@
+menu "ESP32 Alarm Inputs"
+
+choice APP_INPUT_BACKEND
+    prompt "Master zone input backend"
+    default APP_INPUT_BACKEND_MCP23017
+    help
+        Select the hardware frontend used by the master panel to read its
+        zone inputs. The legacy MCP23017 digital expander exposes 12 digital
+        zones while the new ADS1115 based frontend provides 10 analog zones
+        with resistor supervision.
+
+config APP_INPUT_BACKEND_MCP23017
+    bool "MCP23017 digital expander"
+
+config APP_INPUT_BACKEND_ADS1115
+    bool "ADS1115 analog frontend"
+
+endchoice
+
+endmenu
+
 menu "ESP32 Alarm Cloud Connectivity"
 
 config APP_CLOUD_MQTT_URI

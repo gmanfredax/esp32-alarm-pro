@@ -3,7 +3,6 @@
 
 #include <string.h>
 #include <inttypes.h>
-#include <math.h>
 
 #if CONFIG_APP_CAN_ENABLED
 
@@ -18,7 +17,6 @@
 #include "can_bus_protocol.h"
 #include "pins.h"
 #include "roster.h"
-#include "zone_backend.h"
 #include "pdo.h"
 #include "web_server.h"
 #include "cJSON.h"
@@ -32,9 +30,6 @@
 #define CAN_NODE_TIMEOUT_MS      (2500ULL)
 #define CAN_MAX_NODE_ID          (127u)
 #define CAN_SCAN_WINDOW_US       (2000000ULL)
-#define ADS1115_LSB_V            (4.096f / 32768.0f)
-#define LOOP_FRONTEND_GAIN       5.545f
-#define LOOP_RBIAS_OHM           6800.0f
 
 typedef struct {
     bool used;
@@ -68,7 +63,6 @@ static void can_master_rx_task(void *arg);
 static void can_master_handle_frame(const twai_message_t *msg);
 static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbeat_t *payload);
 static void can_master_handle_info(uint8_t node_id, const can_proto_info_t *payload);
-static void can_master_handle_zone_analog(uint8_t node_id, const can_proto_zone_analog_t *payload);
 static void can_master_check_timeouts(void);
 static void can_master_notify_online(uint8_t node_id, bool is_new, uint64_t now_ms);
 static void can_master_notify_offline(uint8_t node_id, uint64_t now_ms);
@@ -91,21 +85,6 @@ static void can_master_handle_addr_request(const twai_message_t *msg);
 static inline uint64_t now_ms(void)
 {
     return (uint64_t)(esp_timer_get_time() / 1000ULL);
-}
-
-static uint16_t rloop_to_ohm100(float rloop)
-{
-    if (!isfinite(rloop) || rloop <= 0.0f) {
-        return 0;
-    }
-    float scaled = rloop * 100.0f;
-    if (scaled < 0.0f) {
-        scaled = 0.0f;
-    }
-    if (scaled > (float)UINT16_MAX) {
-        scaled = (float)UINT16_MAX;
-    }
-    return (uint16_t)(scaled + 0.5f);
 }
 
 static SemaphoreHandle_t state_lock_get(void)
@@ -486,84 +465,6 @@ static void can_master_handle_info(uint8_t node_id, const can_proto_info_t *payl
     }
 }
 
-static void can_master_handle_zone_analog(uint8_t node_id, const can_proto_zone_analog_t *payload)
-{
-    if (!payload || node_id == 0) {
-        return;
-    }
-    if (payload->zone_index == 0 || payload->zone_index > ZONE_BACKEND_MAX_ZONES) {
-        return;
-    }
-
-    zone_backend_zone_state_t state = {0};
-    uint8_t status = payload->status;
-    state.present = (status & CAN_PROTO_ZONE_STATUS_PRESENT) != 0u;
-    state.alarm = (status & CAN_PROTO_ZONE_STATUS_ALARM) != 0u;
-    state.fault_short = (status & CAN_PROTO_ZONE_STATUS_FAULT_SHORT) != 0u;
-    state.fault_open = (status & CAN_PROTO_ZONE_STATUS_FAULT_OPEN) != 0u;
-    state.tamper = (status & CAN_PROTO_ZONE_STATUS_TAMPER) != 0u;
-    if (payload->mode <= ZONE_MODE_EOL3) {
-        state.mode = (zone_mode_t)payload->mode;
-    } else {
-        state.mode = ZONE_MODE_DIGITAL;
-    }
-    state.adc_raw = payload->adc_raw;
-
-    float vbias = (float)payload->vbias_mv / 1000.0f;
-    if (!isfinite(vbias) || vbias < 0.0f) {
-        vbias = 0.0f;
-    }
-    state.vbias_V = vbias;
-    float vz_adc = (float)payload->adc_raw * ADS1115_LSB_V;
-    float vz = vz_adc * LOOP_FRONTEND_GAIN;
-    state.vz_V = vz;
-
-    if (state.present && !state.fault_open && !state.fault_short && vbias > 0.1f) {
-        float lambda = (vbias > 0.0f) ? (vz / vbias) : 0.0f;
-        if (lambda > 0.0f && lambda < 0.999f) {
-            float rloop = LOOP_RBIAS_OHM * lambda / (1.0f - lambda);
-            state.rloop_ohm_100 = rloop_to_ohm100(rloop);
-        } else {
-            state.rloop_ohm_100 = 0;
-        }
-    } else {
-        state.rloop_ohm_100 = 0;
-    }
-
-    uint64_t now = now_ms();
-    bool was_online = false;
-    SemaphoreHandle_t lock = state_lock_get();
-    if (lock) {
-        xSemaphoreTake(lock, portMAX_DELAY);
-        can_master_node_t *node = &s_nodes[node_id];
-        was_online = node->online;
-        node->used = true;
-        node->online = true;
-        node->last_seen_ms = now;
-        xSemaphoreGive(lock);
-    }
-
-    esp_err_t err = roster_note_backend_zone(node_id,
-                                             payload->zone_index,
-                                             ZONE_BACKEND_ANALOG_3X_ADS1115,
-                                             &state,
-                                             now);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG,
-                 "Unable to store analog zone %u for node %u (err=%s)",
-                 (unsigned)payload->zone_index,
-                 (unsigned)node_id,
-                 esp_err_to_name(err));
-    }
-
-    bool is_new = false;
-    if (roster_mark_online(node_id, now, &is_new) == ESP_OK) {
-        if (!was_online || is_new) {
-            can_master_notify_online(node_id, is_new, now);
-        }
-    }
-}
-
 static void can_master_handle_scan_response(const twai_message_t *msg)
 {
     if (!msg || msg->data_length_code == 0) {
@@ -675,16 +576,11 @@ static void can_master_handle_frame(const twai_message_t *msg)
     if (cob_id >= CAN_PROTO_ID_STATUS_BASE &&
         cob_id < (CAN_PROTO_ID_STATUS_BASE + CAN_MAX_NODE_ID + 1)) {
         uint8_t node_id = (uint8_t)(cob_id - CAN_PROTO_ID_STATUS_BASE);
-        if (msg->data_length_code >= 1) {
-            uint8_t msg_type = msg->data[0];
-            if ((msg_type == CAN_PROTO_MSG_HEARTBEAT || msg_type == CAN_PROTO_MSG_IO_REPORT) &&
-                msg->data_length_code >= sizeof(can_proto_heartbeat_t)) {
-                const can_proto_heartbeat_t *payload = (const can_proto_heartbeat_t *)msg->data;
+        if (msg->data_length_code >= sizeof(can_proto_heartbeat_t)) {
+            const can_proto_heartbeat_t *payload = (const can_proto_heartbeat_t *)msg->data;
+            if (payload->msg_type == CAN_PROTO_MSG_HEARTBEAT ||
+                payload->msg_type == CAN_PROTO_MSG_IO_REPORT) {
                 can_master_handle_heartbeat(node_id, payload);
-            } else if (msg_type == CAN_PROTO_MSG_ZONE_ANALOG &&
-                       msg->data_length_code >= sizeof(can_proto_zone_analog_t)) {
-                const can_proto_zone_analog_t *payload = (const can_proto_zone_analog_t *)msg->data;
-                can_master_handle_zone_analog(node_id, payload);
             }
         }
         return;

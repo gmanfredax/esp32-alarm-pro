@@ -72,24 +72,7 @@
       __skipAuthRedirect: opts.skipAuthRedirect === true
     });
     if (r.status === 401) { needLogin(); throw new Error("401"); }
-    if (!r.ok) {
-      let detail = "";
-      try {
-        const ct = r.headers.get("content-type") || "";
-        if (ct.includes("application/json")) {
-          const data = await r.json();
-          detail = data?.message || data?.error || JSON.stringify(data);
-        } else {
-          detail = await r.text();
-        }
-      } catch (err) {
-        detail = err?.message || "";
-      }
-      if (!detail) {
-        detail = `${r.status} ${r.statusText}`;
-      }
-      throw new Error(detail);
-    }
+    if (!r.ok) throw new Error(await r.text());
     try { return await r.json(); } catch { return {}; }
   }
 
@@ -163,17 +146,12 @@
   let telemetryFetchPending = false;
   const modalCleanupHandlers = new Set();
 
-  const diagnosticsState = {
-    backend: 'digital',
-    backendReady: false,
-    vbias: 0,
-    zoneCount: 0,
+  const analogState = {
+    globals: null,
     zones: [],
-    loading: false,
-    error: '',
-    lastRefreshPromise: null,
+    backend: '',
+    diagnostics: null,
   };
-  let diagnosticsTimer = null;
 
   function formatDateTime(ts){
     if (ts == null) return "";
@@ -197,220 +175,46 @@
     }
   }
 
-  function formatFloat(value, digits = 3){
-    const num = Number(value);
-    if (!Number.isFinite(num)) return "—";
-    return num.toFixed(digits);
-  }
-
   function formatVoltage(value){
     const num = Number(value);
     if (!Number.isFinite(num)) return "—";
-    if (Math.abs(num) >= 10) return num.toFixed(2);
-    return num.toFixed(3);
+    return num.toFixed(3).replace(/\.000$/, '.0');
   }
 
-  function formatOhm(value){
+  function formatOhms(value){
     const num = Number(value);
     if (!Number.isFinite(num)) return "—";
     if (Math.abs(num) >= 1000) {
-      try { return num.toLocaleString("it-IT", { maximumFractionDigits: 0 }); }
-      catch { return Math.round(num).toString(); }
-    }
-    return num.toFixed(1);
-  }
-
-  function formatExpectedValues(expected){
-    if (!expected || typeof expected !== 'object') return '—';
-    const parts = [];
-    const pushIfFinite = (key, label) => {
-      const value = Number(expected[key]);
-      if (Number.isFinite(value)) {
-        parts.push(`${label}=${formatVoltage(value)}`);
-      }
-    };
-    pushIfFinite('normal_v', 'N');
-    pushIfFinite('alarm_v', 'A');
-    pushIfFinite('tamper_v', 'T');
-    pushIfFinite('open_v', 'O');
-    pushIfFinite('short_v', 'S');
-    return parts.length ? parts.join(', ') : '—';
-  }
-
-  function renderDiagnostics(){
-    const select = $('#backendSelect');
-    if (select) {
-      const current = diagnosticsState.backend || 'digital';
-      if (select.value !== current) {
-        select.value = current;
+      try {
+        return `${num.toLocaleString('it-IT', { maximumFractionDigits: 0 })}`;
+      } catch {
+        return String(Math.round(num));
       }
     }
-    const statusEl = $('#backendStatus');
-    if (statusEl) {
-      const modeLabel = diagnosticsState.backend === 'ads'
-        ? 'ADS1115 analogico'
-        : 'MCP23017 digitale';
-      let text = `Backend attivo: ${modeLabel}`;
-      if (diagnosticsState.backendReady) {
-        text += ` • Vbias ${formatVoltage(diagnosticsState.vbias)} V`;
-      } else {
-        text += ' • backend non inizializzato';
-      }
-      statusEl.textContent = text;
-    }
-
-    const errorBox = $('#diagnosticsError');
-    if (errorBox) {
-      if (diagnosticsState.error) {
-        errorBox.textContent = diagnosticsState.error;
-        errorBox.classList.remove('hidden');
-      } else {
-        errorBox.textContent = '';
-        errorBox.classList.add('hidden');
-      }
-    }
-
-    const tableBody = $('#diagnosticsTable tbody');
-    if (!tableBody) {
-      return;
-    }
-    tableBody.innerHTML = '';
-
-    if (diagnosticsState.loading && diagnosticsState.zones.length === 0) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = '<td colspan="8">Caricamento…</td>';
-      tableBody.appendChild(tr);
-      return;
-    }
-
-    if (diagnosticsState.error && diagnosticsState.zones.length === 0) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `<td colspan="8">${escapeHtml(diagnosticsState.error)}</td>`;
-      tableBody.appendChild(tr);
-      return;
-    }
-
-    if (!diagnosticsState.zones.length) {
-      const tr = document.createElement('tr');
-      tr.innerHTML = '<td colspan="8">Nessuna zona rilevata.</td>';
-      tableBody.appendChild(tr);
-      return;
-    }
-
-    diagnosticsState.zones.forEach((zone) => {
-      const tr = document.createElement('tr');
-      const zoneId = Number.isFinite(Number(zone?.id)) ? Number(zone.id) : null;
-      const zoneLabel = zoneId ? `Z${zoneId}` : 'Zona';
-      const name = (zone?.name && String(zone.name).trim()) || '';
-      const present = zone?.present !== false;
-      const active = zone?.active === true;
-      const tamper = zone?.tamper_backend === true;
-      const faults = [];
-      if (zone?.fault_short) faults.push('SHORT');
-      if (zone?.fault_open) faults.push('OPEN');
-      if (tamper) faults.push('TAMPER');
-      if (!present) faults.push('ASSENTE');
-      const faultText = faults.length ? faults.join(', ') : '—';
-      let stateLabel = '—';
-      if (!present) {
-        stateLabel = 'Assente';
-      } else if (tamper) {
-        stateLabel = 'TAMPER';
-      } else if (active) {
-        stateLabel = 'ALLARME';
-      } else {
-        stateLabel = 'Normale';
-      }
-      const vbiasValue = Number.isFinite(Number(zone?.vbias_v)) ? Number(zone.vbias_v) : diagnosticsState.vbias;
-      const modeLabel = (zone?.mode_backend || '').toString().toUpperCase() || '—';
-      const expectedText = formatExpectedValues(zone?.expected);
-      tr.innerHTML = `
-        <td>${escapeHtml(zoneLabel)} <span class="muted">${escapeHtml(name)}</span></td>
-        <td>${escapeHtml(stateLabel)}</td>
-        <td>${formatVoltage(zone?.vz_v)}</td>
-        <td>${formatVoltage(vbiasValue)}</td>
-        <td>${formatOhm(zone?.rloop_ohm)}</td>
-        <td>${escapeHtml(modeLabel)}</td>
-        <td>${escapeHtml(faultText)}</td>
-        <td>${escapeHtml(expectedText)}</td>`;
-      tableBody.appendChild(tr);
-    });
+    return num.toFixed(0);
   }
 
-  async function refreshDiagnostics(options = {}){
-    if (diagnosticsState.loading) {
-      return diagnosticsState.lastRefreshPromise || Promise.resolve();
-    }
-    diagnosticsState.loading = true;
-    if (!options.keepError) {
-      diagnosticsState.error = '';
-    }
-    if (options.showLoading) {
-      renderDiagnostics();
-    }
-    const promise = Promise.all([
-      apiGet('/api/sys/backend'),
-      apiGet('/api/zones')
-    ]).then(([backendInfo, zonesInfo]) => {
-      const backend = backendInfo?.backend || zonesInfo?.backend || diagnosticsState.backend;
-      diagnosticsState.backend = backend || 'digital';
-      diagnosticsState.backendReady = Boolean(backendInfo?.ready ?? zonesInfo?.backend_ready);
-      const vbiasValue = Number(backendInfo?.vbias_v ?? zonesInfo?.vbias_v);
-      diagnosticsState.vbias = Number.isFinite(vbiasValue) ? vbiasValue : diagnosticsState.vbias;
-      diagnosticsState.zoneCount = Number.isFinite(Number(zonesInfo?.total)) ? Number(zonesInfo.total) : diagnosticsState.zoneCount;
-      diagnosticsState.zones = Array.isArray(zonesInfo?.zones) ? zonesInfo.zones : [];
-      diagnosticsState.error = '';
-    }).catch((err) => {
-      diagnosticsState.error = err?.message || 'Errore aggiornando la diagnostica';
-    }).finally(() => {
-      diagnosticsState.loading = false;
-      diagnosticsState.lastRefreshPromise = null;
-      renderDiagnostics();
-    });
-    diagnosticsState.lastRefreshPromise = promise;
-    return promise;
-  }
+  const MODE_LABELS = Object.freeze({
+    digital: 'Digitale',
+    eol1: 'EOL1',
+    eol2: '2EOL',
+    eol3: '3EOL',
+    unknown: 'Sconosciuto',
+  });
 
-  function startDiagnosticsUpdates(){
-    if (diagnosticsTimer) return;
-    refreshDiagnostics({ showLoading: diagnosticsState.zones.length === 0 }).catch(() => {});
-    diagnosticsTimer = window.setInterval(() => {
-      if (document.hidden) return;
-      refreshDiagnostics().catch(() => {});
-    }, 2000);
-  }
+  const CONTACT_LABELS = Object.freeze({
+    nc: 'NC',
+    no: 'NO',
+  });
 
-  function stopDiagnosticsUpdates(){
-    if (diagnosticsTimer){
-      clearInterval(diagnosticsTimer);
-      diagnosticsTimer = null;
-    }
-  }
-
-  function setupDiagnosticsSection(){
-    const applyBtn = $('#backendApply');
-    if (applyBtn){
-      applyBtn.addEventListener('click', async () => {
-        const select = $('#backendSelect');
-        const value = select ? String(select.value || '').trim() || 'digital' : 'digital';
-        const previous = applyBtn.textContent;
-        applyBtn.disabled = true;
-        applyBtn.textContent = 'Salvataggio…';
-        try {
-          await apiPost('/api/sys/backend', { backend: value });
-          toast('Backend aggiornato');
-          await refreshDiagnostics({ showLoading: true });
-        } catch (err) {
-          toast(`Backend: ${err?.message || 'errore'}`, false);
-        } finally {
-          applyBtn.disabled = false;
-          applyBtn.textContent = previous;
-        }
-      });
-    }
-    renderDiagnostics();
-    return refreshDiagnostics({ showLoading: true });
-  }
+  const STATUS_LABELS = Object.freeze({
+    normal: 'Normale',
+    alarm: 'Allarme',
+    tamper: 'Tamper',
+    fault_short: 'Corto',
+    fault_open: 'Interruzione',
+    unknown: 'Sconosciuto',
+  });
 
   const normalizeRole = (roleValue) => {
     if (typeof roleValue === 'number') return Number.isNaN(roleValue) ? null : roleValue;
@@ -492,25 +296,12 @@
           if (current) current.classList.add("active");
         }
         if (id !== "view-mqtt") maskMqttPassword();
-        if (id === 'view-diagnostics') {
-          startDiagnosticsUpdates();
-        } else {
-          stopDiagnosticsUpdates();
-        }
       });
     });
   }
 
   document.addEventListener("visibilitychange", () => {
-    if (document.hidden) {
-      maskMqttPassword();
-      stopDiagnosticsUpdates();
-    } else {
-      const diag = document.getElementById('view-diagnostics');
-      if (diag && diag.classList.contains('active')) {
-        startDiagnosticsUpdates();
-      }
-    }
+    if (document.hidden) maskMqttPassword();
   });
 
   function getExpansionItems(){
@@ -988,6 +779,224 @@
     }
   }
 
+  function renderAnalogConfig(){
+    const globals = analogState.globals || {};
+    const fields = [
+      ['#analog_r_normal', globals.r_normal],
+      ['#analog_r_alarm', globals.r_alarm],
+      ['#analog_r_tamper', globals.r_tamper],
+      ['#analog_r_eol', globals.r_eol],
+      ['#analog_short_threshold', globals.short_threshold],
+      ['#analog_open_threshold', globals.open_threshold],
+      ['#analog_debounce_ms', globals.debounce_ms],
+      ['#analog_hysteresis_pct', globals.hysteresis_pct],
+    ];
+    fields.forEach(([selector, value]) => {
+      const input = $(selector);
+      if (!input) return;
+      const num = Number(value);
+      if (Number.isFinite(num)) {
+        input.value = String(num);
+      }
+    });
+
+    const tbody = $("#analogZoneConfigBody");
+    if (!tbody) return;
+    if (!Array.isArray(analogState.zones) || analogState.zones.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="4">Configurazione non disponibile</td></tr>';
+      return;
+    }
+    tbody.innerHTML = analogState.zones.map((zone) => {
+      const id = Number(zone?.id);
+      const name = escapeHtml(zone?.name || `Zona ${id}`);
+      const mode = typeof zone?.mode === 'string' ? zone.mode : 'digital';
+      const contact = typeof zone?.contact === 'string' ? zone.contact : 'nc';
+      const modeOptions = ['digital','eol1','eol2','eol3']
+        .map((value) => {
+          const label = MODE_LABELS[value] || value.toUpperCase();
+          const selected = value === mode ? ' selected' : '';
+          return `<option value="${value}"${selected}>${label}</option>`;
+        }).join('');
+      const contactOptions = ['nc','no']
+        .map((value) => {
+          const label = CONTACT_LABELS[value] || value.toUpperCase();
+          const selected = value === contact ? ' selected' : '';
+          return `<option value="${value}"${selected}>${label}</option>`;
+        }).join('');
+      return `<tr data-zone-id="${id}">
+        <td>${id}</td>
+        <td>${name}</td>
+        <td><select data-zone-mode="${id}">${modeOptions}</select></td>
+        <td><select data-zone-contact="${id}">${contactOptions}</select></td>
+      </tr>`;
+    }).join('');
+  }
+
+  async function loadAnalogConfig(){
+    try {
+      const data = await apiGet('/api/zones/analog');
+      analogState.globals = data?.globals || null;
+      analogState.zones = Array.isArray(data?.zones) ? data.zones : [];
+      renderAnalogConfig();
+    } catch (err) {
+      toast(`Configurazione zone: ${err.message}`, false);
+    }
+  }
+
+  async function submitAnalogConfig(ev){
+    ev.preventDefault();
+    const status = $('#analogConfigStatus');
+    if (status) {
+      status.textContent = 'Salvataggio in corso…';
+      status.classList.remove('error', 'success');
+    }
+    const readFloat = (selector, fallback = 0) => {
+      const input = $(selector);
+      const value = input ? Number.parseFloat(input.value) : NaN;
+      return Number.isFinite(value) ? value : fallback;
+    };
+    const readInt = (selector, fallback = 0) => {
+      const input = $(selector);
+      const value = input ? Number.parseInt(input.value, 10) : NaN;
+      return Number.isFinite(value) ? value : fallback;
+    };
+
+    const payload = {
+      globals: {
+        r_normal: readFloat('#analog_r_normal', analogState.globals?.r_normal ?? 4700),
+        r_alarm: readFloat('#analog_r_alarm', analogState.globals?.r_alarm ?? 2200),
+        r_tamper: readFloat('#analog_r_tamper', analogState.globals?.r_tamper ?? 8200),
+        r_eol: readFloat('#analog_r_eol', analogState.globals?.r_eol ?? 4700),
+        short_threshold: readFloat('#analog_short_threshold', analogState.globals?.short_threshold ?? 1000),
+        open_threshold: readFloat('#analog_open_threshold', analogState.globals?.open_threshold ?? 20000),
+        debounce_ms: readInt('#analog_debounce_ms', analogState.globals?.debounce_ms ?? 150),
+        hysteresis_pct: readFloat('#analog_hysteresis_pct', analogState.globals?.hysteresis_pct ?? 12),
+      },
+      zones: [],
+    };
+
+    const rows = $$('#analogZoneConfigBody tr');
+    rows.forEach((row) => {
+      const zoneId = Number(row?.dataset?.zoneId);
+      if (!Number.isFinite(zoneId) || zoneId <= 0) return;
+      const mode = row.querySelector(`select[data-zone-mode="${zoneId}"]`)?.value || 'digital';
+      const contact = row.querySelector(`select[data-zone-contact="${zoneId}"]`)?.value || 'nc';
+      payload.zones.push({ id: zoneId, mode, contact });
+    });
+
+    try {
+      await apiPost('/api/zones/analog', payload);
+      if (status) {
+        status.textContent = 'Configurazione salvata.';
+        status.classList.add('success');
+      }
+      toast('Configurazione zone salvata');
+      await loadAnalogConfig();
+    } catch (err) {
+      if (status) {
+        status.textContent = `Errore: ${err.message}`;
+        status.classList.add('error');
+      }
+      toast(`Configurazione zone: ${err.message}`, false);
+    }
+  }
+
+  function renderDiagnostics(data){
+    analogState.diagnostics = data || null;
+    if (data?.backend) {
+      analogState.backend = data.backend;
+    }
+    const expectedBox = $('#diagExpected');
+    if (expectedBox) {
+      const expected = data?.expected || null;
+      if (!expected) {
+        expectedBox.innerHTML = '<p class="muted">Soglie non disponibili.</p>';
+      } else {
+        const cards = [];
+        const makeEntry = (title, entries) => {
+          if (!entries) return '';
+          const rows = Object.entries(entries)
+            .filter(([, value]) => value && typeof value === 'object')
+            .map(([key, value]) => {
+              const label = key.toUpperCase();
+              const vz = formatVoltage(value?.vz);
+              const counts = formatInteger(value?.counts);
+              const r = value?.resistance != null ? `${formatOhms(value.resistance)} Ω` : '—';
+              return `<div class="diag-expected-row"><span>${label}</span><strong>${vz} V</strong><em>${counts} cnt</em><small>${r}</small></div>`;
+            }).join('');
+          return `<div class="diag-expected-card"><h4>${title}</h4>${rows || '<div class="muted">N/A</div>'}</div>`;
+        };
+        if (expected.eol1) cards.push(makeEntry('EOL1', expected.eol1));
+        if (expected.eol2) cards.push(makeEntry('2EOL', expected.eol2));
+        if (expected.eol3) cards.push(makeEntry('3EOL', expected.eol3));
+        expectedBox.innerHTML = `<div class="diag-expected-grid">${cards.join('')}</div>`;
+      }
+    }
+
+    const backendLabel = $('#diagBackend');
+    if (backendLabel) {
+      backendLabel.textContent = analogState.backend ? analogState.backend.toUpperCase() : 'Sconosciuto';
+    }
+
+    const tbody = $('#diagZonesTable tbody');
+    if (tbody) {
+      const zones = Array.isArray(data?.zones) ? data.zones : [];
+      if (zones.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="10">Nessun dato disponibile</td></tr>';
+      } else {
+        tbody.innerHTML = zones.map((zone) => {
+          const id = Number(zone?.id);
+          const name = escapeHtml(zone?.name || `Zona ${id}`);
+          const statusKey = typeof zone?.status === 'string' ? zone.status : 'unknown';
+          const statusLabel = STATUS_LABELS[statusKey] || statusKey;
+          const present = zone?.present === true ? 'Sì' : (zone?.present === false ? 'No' : '—');
+          const mode = MODE_LABELS[zone?.measure_mode] || (zone?.measure_mode || '').toUpperCase() || '—';
+          const contact = CONTACT_LABELS[zone?.contact] || (zone?.contact || '').toUpperCase() || '—';
+          const vz = zone?.vz != null ? `${formatVoltage(zone.vz)} V` : '—';
+          const vbias = zone?.vbias != null ? `${formatVoltage(zone.vbias)} V` : '—';
+          const rloop = zone?.rloop != null ? `${formatOhms(zone.rloop)} Ω` : '—';
+          const boardLabel = zone?.board_label ? escapeHtml(zone.board_label) : (Number(zone?.board) > 0 ? `Nodo ${zone.board}` : 'Centrale');
+          const rowClass = `status-${statusKey}`;
+          return `<tr class="${rowClass}">
+            <td>${id}</td>
+            <td>${name}</td>
+            <td>${statusLabel}</td>
+            <td>${present}</td>
+            <td>${mode}</td>
+            <td>${contact}</td>
+            <td>${vz}</td>
+            <td>${vbias}</td>
+            <td>${rloop}</td>
+            <td>${boardLabel}</td>
+          </tr>`;
+        }).join('');
+      }
+    }
+  }
+
+  async function refreshDiagnostics(){
+    const status = $('#diagStatus');
+    if (status) {
+      status.textContent = 'Caricamento diagnostica…';
+      status.classList.remove('error', 'success');
+    }
+    try {
+      const data = await apiGet('/api/diagnostics/system');
+      renderDiagnostics(data);
+      if (status) {
+        const ts = new Date();
+        status.textContent = `Aggiornato alle ${ts.toLocaleTimeString('it-IT')}`;
+        status.classList.add('success');
+      }
+    } catch (err) {
+      if (status) {
+        status.textContent = `Errore: ${err.message}`;
+        status.classList.add('error');
+      }
+      toast(`Diagnostica: ${err.message}`, false);
+    }
+  }
+
   async function loadExpansionNodes(){
     expansionsState.loading = true;
     expansionsState.error = "";
@@ -1252,6 +1261,16 @@
       renderExpansionsSection();
       toast(`Nodo CAN: ${message}`, false);
     }
+  }
+
+  async function setupAnalogSection(){
+    const form = $('#analogConfigForm');
+    if (form){
+      form.addEventListener('submit', submitAnalogConfig);
+    }
+    $('#diagRefreshBtn')?.addEventListener('click', () => refreshDiagnostics());
+    renderAnalogConfig();
+    return loadAnalogConfig();
   }
 
   async function setupExpansionsSection(){
@@ -2070,7 +2089,12 @@
     mountUserMenu();
     updateAdminVisibility();
     setupSidebar();
-    const setupPromises = [setupNetMqttForms(), setupWebSecForm(), setupExpansionsSection(), setupDiagnosticsSection()];
+    const setupPromises = [
+      setupNetMqttForms(),
+      setupWebSecForm(),
+      setupExpansionsSection(),
+      setupAnalogSection(),
+    ];
     document.querySelector('[data-tab="home"]')?.addEventListener('click', (e) => {
       e.preventDefault();
       location.href = "/index.html";

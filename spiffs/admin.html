@@ -38,6 +38,25 @@
     .telemetry-metric strong.warn{color:#f87171}
     .telemetry-status{margin:.5rem 0;font-size:.9rem;color:var(--muted)}
     .telemetry-status.error{color:#f87171}
+    .diag-expected-grid{display:grid;gap:.75rem;margin-top:.75rem}
+    @media(min-width:720px){.diag-expected-grid{grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}}
+    .diag-expected-card{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:10px;padding:.75rem}
+    .diag-expected-card h4{margin:0 0 .5rem}
+    .diag-expected-row{display:flex;justify-content:space-between;align-items:center;gap:.4rem;margin:.3rem 0;font-variant-numeric:tabular-nums}
+    .diag-expected-row span{color:var(--muted)}
+    .diag-expected-row strong{font-weight:600}
+    .diag-expected-row em{font-style:normal;color:var(--muted);font-size:.85rem}
+    .diag-expected-row small{color:var(--muted);font-size:.75rem}
+    #diagStatus{margin:.6rem 0;font-size:.9rem}
+    #diagStatus.error{color:#f87171}
+    #diagStatus.success{color:#34d399}
+    #analogConfigStatus{font-size:.85rem}
+    #analogConfigStatus.error{color:#f87171}
+    #analogConfigStatus.success{color:#34d399}
+    #diagZonesTable tbody tr.status-alarm td,
+    #diagZonesTable tbody tr.status-tamper td,
+    #diagZonesTable tbody tr.status-fault_short td,
+    #diagZonesTable tbody tr.status-fault_open td{color:#fbbf24}
   </style>
 </head>
 <body>
@@ -89,7 +108,7 @@
             <li><button class="btn w-100" data-view="view-mqtt">MQTT</button></li>
             <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
             <li><button class="btn w-100" data-view="view-expansions">Espansioni CAN</button></li>
-            <li><button class="btn w-100" data-view="view-diagnostics">Diagnostica sistema</button></li>
+            <li><button class="btn w-100" data-view="view-diagnostics">Diagnostica Sistema</button></li>
           </ul>
         </aside>
 
@@ -211,39 +230,61 @@
           <!-- DIAGNOSTICA SISTEMA -->
           <section id="view-diagnostics" class="view">
             <div class="card">
-              <div class="row" style="justify-content:space-between;align-items:center;gap:.75rem;flex-wrap:wrap">
-                <h3>Backend zone</h3>
-                <div class="row" style="gap:.5rem;align-items:center;flex-wrap:wrap">
-                  <label for="backendSelect" class="muted">Seleziona backend</label>
-                  <select id="backendSelect">
-                    <option value="digital">MCP23017 digitale</option>
-                    <option value="ads">ADS1115 analogico</option>
-                  </select>
-                  <button class="btn" id="backendApply" type="button">Applica</button>
+              <h3>Configurazione front-end zone</h3>
+              <form id="analogConfigForm" class="form" style="margin-top:.6rem">
+                <div class="row" style="gap:1rem;flex-wrap:wrap">
+                  <label class="field"><span>R<sub>N</sub> (Ω)</span><input id="analog_r_normal" type="number" min="0" step="1"></label>
+                  <label class="field"><span>R<sub>A</sub> (Ω)</span><input id="analog_r_alarm" type="number" min="0" step="1"></label>
+                  <label class="field"><span>R<sub>T</sub> (Ω)</span><input id="analog_r_tamper" type="number" min="0" step="1"></label>
+                  <label class="field"><span>R<sub>E</sub> (Ω)</span><input id="analog_r_eol" type="number" min="0" step="1"></label>
                 </div>
+                <div class="row" style="gap:1rem;flex-wrap:wrap;margin-top:.6rem">
+                  <label class="field"><span>Soglia corto (Ω)</span><input id="analog_short_threshold" type="number" min="0" step="1"></label>
+                  <label class="field"><span>Soglia aperto (Ω)</span><input id="analog_open_threshold" type="number" min="0" step="1"></label>
+                  <label class="field"><span>Debounce (ms)</span><input id="analog_debounce_ms" type="number" min="0" step="1"></label>
+                  <label class="field"><span>Isteresi (%)</span><input id="analog_hysteresis_pct" type="number" min="0" step="0.1"></label>
+                </div>
+                <div class="row" style="gap:.6rem;align-items:center;margin-top:.8rem">
+                  <button class="btn" type="submit">Salva configurazione</button>
+                  <span id="analogConfigStatus" class="muted"></span>
+                </div>
+              </form>
+              <div class="table-wrap" style="margin-top:.75rem">
+                <table class="table" id="analogZoneConfig">
+                  <thead><tr><th>Zona</th><th>Nome</th><th>Modo</th><th>Contatto</th></tr></thead>
+                  <tbody id="analogZoneConfigBody"><tr><td colspan="4">Caricamento…</td></tr></tbody>
+                </table>
               </div>
-              <div id="backendStatus" class="status-line muted" style="margin-top:.5rem"></div>
             </div>
 
             <div class="card" style="margin-top:1rem">
-              <h3>Telemetria zone</h3>
-              <div id="diagnosticsError" class="status-line error hidden"></div>
-              <div class="table-wrap" style="margin-top:.5rem;overflow:auto">
-                <table class="table" id="diagnosticsTable">
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.6rem;flex-wrap:wrap">
+                <h3>Diagnostica sistema</h3>
+                <div class="row" style="gap:.6rem;align-items:center;flex-wrap:wrap">
+                  <span class="muted small">Backend: <strong id="diagBackend">—</strong></span>
+                  <button class="btn" id="diagRefreshBtn" type="button">Aggiorna diagnostica</button>
+                </div>
+              </div>
+              <div id="diagStatus" class="muted" style="margin-top:.5rem">Premi “Aggiorna diagnostica” per leggere i valori correnti.</div>
+              <div id="diagExpected" class="diag-expected-grid" style="margin-top:.5rem"></div>
+              <div class="table-wrap" style="margin-top:1rem">
+                <table class="table" id="diagZonesTable">
                   <thead>
                     <tr>
-                      <th>Zona</th>
+                      <th>#</th>
+                      <th>Nome</th>
                       <th>Stato</th>
-                      <th>Vz [V]</th>
-                      <th>Vbias [V]</th>
-                      <th>Rloop [Ω]</th>
-                      <th>Modalità</th>
-                      <th>Fault</th>
-                      <th>Valori attesi [V]</th>
+                      <th>Presente</th>
+                      <th>Modo</th>
+                      <th>Contatto</th>
+                      <th>Vz</th>
+                      <th>Vbias</th>
+                      <th>Rloop</th>
+                      <th>Scheda</th>
                     </tr>
                   </thead>
                   <tbody>
-                    <tr><td colspan="8">Caricamento…</td></tr>
+                    <tr><td colspan="10">Premi “Aggiorna diagnostica” per visualizzare i dati.</td></tr>
                   </tbody>
                 </table>
               </div>

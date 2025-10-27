@@ -732,18 +732,6 @@ static roster_node_t *node_slot(uint8_t node_id)
     return &s_nodes[node_id];
 }
 
-static void node_backend_reset(roster_node_t *node)
-{
-    if (!node) {
-        return;
-    }
-    node->backend_ready = false;
-    node->backend_type = ZONE_BACKEND_DIGITAL_MCP23017;
-    node->backend_zone_count = 0;
-    node->backend_timestamp_ms = 0;
-    memset(node->backend_zones, 0, sizeof(node->backend_zones));
-}
-
 static void node_apply_uid(roster_node_t *node)
 {
     if (!node) {
@@ -775,7 +763,6 @@ static void node_init_defaults(roster_node_t *node, uint8_t node_id)
     node->outputs_flags = 0;
     node->outputs_pwm = 0;
     node->associated_at_ms = 0;
-    node_backend_reset(node);
     node_set_default_label(node);
     label_map_apply(node);
     node_apply_uid(node);
@@ -935,7 +922,6 @@ esp_err_t roster_mark_offline(uint8_t node_id, uint64_t now_ms)
     }
     node->state = ROSTER_NODE_STATE_OFFLINE;
     node->last_seen_ms = now_ms;
-    node_backend_reset(node);
     xSemaphoreGive(s_roster_lock);
     return ESP_OK;
 }
@@ -1426,59 +1412,6 @@ esp_err_t roster_note_inputs(uint8_t node_id,
     return ESP_OK;
 }
 
-esp_err_t roster_note_backend_zone(uint8_t node_id,
-                                   uint8_t zone_index,
-                                   zone_backend_type_t backend_type,
-                                   const zone_backend_zone_state_t *state,
-                                   uint64_t timestamp_ms)
-{
-    if (node_id == 0 || zone_index == 0 || !state) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (zone_index > ZONE_BACKEND_MAX_ZONES) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    ensure_lock();
-    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
-    roster_node_t *node = node_slot(node_id);
-    if (!node) {
-        xSemaphoreGive(s_roster_lock);
-        return ESP_ERR_INVALID_ARG;
-    }
-    if (!node->used) {
-        node_init_defaults(node, node_id);
-    }
-
-    uint8_t idx = (uint8_t)(zone_index - 1u);
-    node->backend_type = backend_type;
-    node->backend_ready = true;
-    node->backend_zones[idx] = *state;
-    if (node->backend_zone_count < zone_index) {
-        node->backend_zone_count = zone_index;
-    }
-    if (timestamp_ms == 0) {
-        timestamp_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
-    }
-    node->backend_timestamp_ms = timestamp_ms;
-    xSemaphoreGive(s_roster_lock);
-    return ESP_OK;
-}
-
-void roster_backend_clear(uint8_t node_id)
-{
-    if (node_id == 0) {
-        return;
-    }
-    ensure_lock();
-    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
-    roster_node_t *node = node_slot(node_id);
-    if (node && node->used) {
-        node_backend_reset(node);
-    }
-    xSemaphoreGive(s_roster_lock);
-}
-
 esp_err_t roster_note_outputs(uint8_t node_id,
                               uint32_t outputs_bitmap,
                               uint8_t flags,
@@ -1562,11 +1495,6 @@ size_t roster_collect_nodes(roster_node_inputs_t *out_nodes, size_t max_nodes)
         dst->inputs_valid = node->inputs_valid;
         dst->inputs_bitmap = node->inputs_bitmap;
         dst->state = node->state;
-        dst->backend_ready = node->backend_ready;
-        dst->backend_type = node->backend_type;
-        dst->backend_zone_count = node->backend_zone_count;
-        dst->backend_timestamp_ms = node->backend_timestamp_ms;
-        memcpy(dst->backend_zones, node->backend_zones, sizeof(dst->backend_zones));
     }
 
     xSemaphoreGive(s_roster_lock);

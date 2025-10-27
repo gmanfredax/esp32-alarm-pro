@@ -246,7 +246,7 @@ esp_err_t mqtt_publish_state(void)
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
 
-    uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t zones_total = roster_effective_zones(inputs_master_zone_count());
     zone_mask_limit(&bypass_mask, zones_total);
     char bypass_hex[ZONE_MASK_WORDS * 8u + 1u];
     zone_mask_to_hex(&bypass_mask, zones_total, bypass_hex, sizeof(bypass_hex));
@@ -275,7 +275,7 @@ esp_err_t mqtt_publish_state(void)
 static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
 {
     if (!s_client) return ESP_ERR_INVALID_STATE;
-    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t total = roster_effective_zones(inputs_master_zone_count());
     if (total > SCENES_MAX_ZONES) {
         total = SCENES_MAX_ZONES;
     }
@@ -342,7 +342,7 @@ esp_err_t mqtt_publish_scenes(void)
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
-    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t total = roster_effective_zones(inputs_master_zone_count());
     if (total > SCENES_MAX_ZONES) {
         total = SCENES_MAX_ZONES;
     }
@@ -424,7 +424,7 @@ static void handle_arm_command(const char *payload)
             bypass_present = true;
         }
     }
-    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t total = roster_effective_zones(inputs_master_zone_count());
     if (total > SCENES_MAX_ZONES) {
         total = SCENES_MAX_ZONES;
     }
@@ -497,7 +497,7 @@ static void handle_disarm_command(void)
     alarm_state_t prev_state = alarm_get_state();
     zone_mask_t scene_mask;
     scenes_get_active_mask(&scene_mask);
-    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t total = roster_effective_zones(inputs_master_zone_count());
     if (total > SCENES_MAX_ZONES) {
         total = SCENES_MAX_ZONES;
     }
@@ -600,7 +600,7 @@ static void handle_bypass_set(const char *payload)
         ok = true;
     }
     if (ok) {
-        uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+        uint16_t total = roster_effective_zones(inputs_master_zone_count());
         if (total > SCENES_MAX_ZONES) {
             total = SCENES_MAX_ZONES;
         }

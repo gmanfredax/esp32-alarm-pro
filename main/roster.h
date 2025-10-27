@@ -6,7 +6,6 @@
 
 #include "esp_err.h"
 #include "cJSON.h"
-#include "zone_backend.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,11 +41,6 @@ typedef struct {
     bool info_valid;
     bool inputs_valid;
     bool outputs_valid;
-    bool backend_ready;
-    zone_backend_type_t backend_type;
-    uint8_t backend_zone_count;
-    uint64_t backend_timestamp_ms;
-    zone_backend_zone_state_t backend_zones[ZONE_BACKEND_MAX_ZONES];
 } roster_node_t;
 
 typedef struct {
@@ -81,11 +75,6 @@ typedef struct {
     bool inputs_valid;
     uint32_t inputs_bitmap;
     roster_node_state_t state;
-    bool backend_ready;
-    zone_backend_type_t backend_type;
-    uint8_t backend_zone_count;
-    uint64_t backend_timestamp_ms;
-    zone_backend_zone_state_t backend_zones[ZONE_BACKEND_MAX_ZONES];
 } roster_node_inputs_t;
 
 void roster_init(uint8_t master_inputs, uint8_t master_outputs, uint16_t master_caps);
@@ -110,12 +99,6 @@ esp_err_t roster_note_outputs(uint8_t node_id,
                               uint8_t flags,
                               uint8_t pwm_level,
                               bool known);
-esp_err_t roster_note_backend_zone(uint8_t node_id,
-                                   uint8_t zone_index,
-                                   zone_backend_type_t backend_type,
-                                   const zone_backend_zone_state_t *state,
-                                   uint64_t timestamp_ms);
-void roster_backend_clear(uint8_t node_id);
 bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state);
 esp_err_t roster_reassign_node_id(uint8_t current_id, uint8_t new_id);
 esp_err_t roster_set_node_label(uint8_t node_id, const char *label);

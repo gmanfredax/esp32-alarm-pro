@@ -41,7 +41,6 @@ typedef enum {
     CAN_PROTO_MSG_TEST_TOGGLE    = 0x30u,
     CAN_PROTO_MSG_SCAN_REQUEST   = 0x31u,
     CAN_PROTO_MSG_SCAN_RESPONSE  = 0x32u,
-    CAN_PROTO_MSG_ZONE_ANALOG    = 0x40u,
     CAN_PROTO_MSG_ACK            = 0x7Fu,
 } can_proto_msg_type_t;
 
@@ -86,21 +85,6 @@ typedef struct __attribute__((packed)) {
     uint8_t enable;    /**< 1 => enable, 0 => disable */
     uint8_t reserved[6];
 } can_proto_test_toggle_t;
-
-#define CAN_PROTO_ZONE_STATUS_PRESENT     0x01u
-#define CAN_PROTO_ZONE_STATUS_ALARM       0x02u
-#define CAN_PROTO_ZONE_STATUS_FAULT_SHORT 0x04u
-#define CAN_PROTO_ZONE_STATUS_FAULT_OPEN  0x08u
-#define CAN_PROTO_ZONE_STATUS_TAMPER      0x10u
-
-typedef struct __attribute__((packed)) {
-    uint8_t  msg_type;   /**< CAN_PROTO_MSG_ZONE_ANALOG */
-    uint8_t  zone_index; /**< 1-based zone index */
-    uint8_t  status;     /**< CAN_PROTO_ZONE_STATUS_* flags */
-    uint8_t  mode;       /**< zone_mode_t value */
-    int16_t  adc_raw;    /**< Last ADC code */
-    uint16_t vbias_mv;   /**< Loop bias voltage in millivolts */
-} can_proto_zone_analog_t;
 
 typedef struct __attribute__((packed)) {
     uint8_t protocol;                /**< CAN protocol version requested */
