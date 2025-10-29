@@ -31,30 +31,21 @@
 #define CAN_MAX_NODE_ID          (127u)
 #define CAN_SCAN_WINDOW_US       (2000000ULL)
 
-enum {
-    CAN_EXT_ZONE_STATE_ALARM      = 0x01u,
-    CAN_EXT_ZONE_STATE_SHORT      = 0x02u,
-    CAN_EXT_ZONE_STATE_OPEN       = 0x04u,
-    CAN_EXT_ZONE_STATE_TAMPER     = 0x08u,
-    CAN_EXT_ZONE_STATE_PRESENT    = 0x10u,
-    CAN_EXT_ZONE_STATE_CONTACT_NO = 0x20u,
-};
-
 typedef struct {
     bool used;
     bool online;
     uint64_t last_seen_ms;
-    uint32_t last_alarm;
-    uint32_t last_tamper;
-    uint32_t last_fault;
-    uint8_t last_state;
+    uint16_t last_alarm;
+    uint8_t last_tamper;
+    uint8_t last_flags;
+    uint8_t last_zone_count;
+    zone_eol_mode_t eol_mode;
     uint8_t change_counter;
     uint32_t outputs_bitmap;
     uint8_t outputs_flags;
     uint8_t outputs_pwm;
     bool outputs_valid;
     bool inputs_valid;
-    bool has_ext_status;
 } can_master_node_t;
 
 static const char *TAG = "can_master";
@@ -73,21 +64,22 @@ static SemaphoreHandle_t state_lock_get(void);
 static SemaphoreHandle_t scan_lock_get(void);
 static void can_master_rx_task(void *arg);
 static void can_master_handle_frame(const twai_message_t *msg);
-static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbeat_t *payload);
-static void can_master_handle_ext_heartbeat(uint8_t node_id, const twai_message_t *msg);
-static void can_master_handle_zone_event(uint8_t node_id, const twai_message_t *msg);
 static void can_master_handle_info(uint8_t node_id, const can_proto_info_t *payload);
-static void can_master_process_info(uint8_t node_id,
-                                    uint8_t protocol,
-                                    uint16_t model,
-                                    uint16_t firmware,
-                                    uint8_t inputs_count,
-                                    uint8_t outputs_count);
 static void can_master_check_timeouts(void);
 static void can_master_notify_online(uint8_t node_id, bool is_new, uint64_t now_ms);
 static void can_master_notify_offline(uint8_t node_id, uint64_t now_ms);
-static void can_master_notify_io_state(uint8_t node_id, uint64_t timestamp_ms);
-static void can_master_refresh_cached_state(uint8_t node_id);
+static void can_master_notify_io_state(uint8_t node_id,
+                                       uint16_t alarm_bitmap,
+                                       uint8_t tamper_bitmap,
+                                       bool inputs_valid,
+                                       uint8_t change_counter,
+                                       uint8_t status_flags,
+                                       zone_eol_mode_t eol_mode,
+                                       uint32_t outputs_bitmap,
+                                       bool outputs_valid,
+                                       uint8_t outputs_flags,
+                                       uint8_t outputs_pwm,
+                                       uint64_t timestamp_ms);
 static void can_scan_note_new_node(void);
 static esp_err_t can_master_driver_start_internal(void);
 static void scan_timer_cb(void *arg);
@@ -280,68 +272,40 @@ static void can_master_notify_offline(uint8_t node_id, uint64_t now_ms)
     }
 }
 
-static void can_master_notify_io_state(uint8_t node_id, uint64_t timestamp_ms)
+static void can_master_notify_io_state(uint8_t node_id,
+                                       uint16_t alarm_bitmap,
+                                       uint8_t tamper_bitmap,
+                                       bool inputs_valid,
+                                       uint8_t change_counter,
+                                       uint8_t status_flags,
+                                       zone_eol_mode_t eol_mode,
+                                       uint32_t outputs_bitmap,
+                                       bool outputs_valid,
+                                       uint8_t outputs_flags,
+                                       uint8_t outputs_pwm,
+                                       uint64_t timestamp_ms)
 {
-    roster_io_state_t state = {0};
-    if (!roster_get_io_state(node_id, &state)) {
-        return;
-    }
-
     cJSON *evt = cJSON_CreateObject();
     if (!evt) {
         return;
     }
     cJSON_AddNumberToObject(evt, "node_id", node_id);
     cJSON_AddNumberToObject(evt, "ts_ms", (double)timestamp_ms);
-    cJSON_AddBoolToObject(evt, "inputs_known", state.inputs_valid);
-    if (state.inputs_valid) {
-        cJSON_AddNumberToObject(evt, "inputs_bitmap", (double)state.inputs_bitmap);
-        cJSON_AddNumberToObject(evt, "inputs_alarm_bitmap", (double)state.inputs_bitmap);
-        cJSON_AddNumberToObject(evt, "inputs_tamper_bitmap", (double)state.inputs_tamper_bitmap);
-        cJSON_AddNumberToObject(evt, "inputs_fault_bitmap", (double)state.inputs_fault_bitmap);
-        cJSON_AddNumberToObject(evt, "change_counter", state.change_counter);
-        cJSON_AddNumberToObject(evt, "node_state_flags", state.node_state_flags);
+    cJSON_AddBoolToObject(evt, "inputs_known", inputs_valid);
+    if (inputs_valid) {
+        cJSON_AddNumberToObject(evt, "alarm_bitmap", (double)alarm_bitmap);
+        cJSON_AddNumberToObject(evt, "tamper_bitmap", (double)tamper_bitmap);
+        cJSON_AddNumberToObject(evt, "change_counter", change_counter);
+        cJSON_AddNumberToObject(evt, "status_flags", status_flags);
+        cJSON_AddNumberToObject(evt, "eol_mode", (double)eol_mode);
     }
-    cJSON_AddBoolToObject(evt, "outputs_known", state.outputs_valid);
-    if (state.outputs_valid) {
-        cJSON_AddNumberToObject(evt, "outputs_bitmap", (double)state.outputs_bitmap);
-        cJSON_AddNumberToObject(evt, "outputs_flags", state.outputs_flags);
-        cJSON_AddNumberToObject(evt, "outputs_pwm", state.outputs_pwm);
+    cJSON_AddBoolToObject(evt, "outputs_known", outputs_valid);
+    if (outputs_valid) {
+        cJSON_AddNumberToObject(evt, "outputs_bitmap", (double)outputs_bitmap);
+        cJSON_AddNumberToObject(evt, "outputs_flags", outputs_flags);
+        cJSON_AddNumberToObject(evt, "outputs_pwm", outputs_pwm);
     }
     web_server_ws_broadcast_event("node_io_state", evt);
-}
-
-static void can_master_refresh_cached_state(uint8_t node_id)
-{
-    roster_io_state_t state = {0};
-    if (!roster_get_io_state(node_id, &state)) {
-        return;
-    }
-
-    SemaphoreHandle_t lock = state_lock_get();
-    if (!lock) {
-        return;
-    }
-
-    xSemaphoreTake(lock, portMAX_DELAY);
-    can_master_node_t *node = &s_nodes[node_id];
-    node->inputs_valid = state.inputs_valid;
-    if (state.inputs_valid) {
-        node->last_alarm = state.inputs_bitmap;
-        node->last_tamper = state.inputs_tamper_bitmap;
-        node->last_fault = state.inputs_fault_bitmap;
-        node->change_counter = state.change_counter;
-        node->last_state = state.node_state_flags;
-    }
-    if (state.outputs_valid) {
-        node->outputs_bitmap = state.outputs_bitmap;
-        node->outputs_flags = state.outputs_flags;
-        node->outputs_pwm = state.outputs_pwm;
-        node->outputs_valid = true;
-    } else {
-        node->outputs_valid = false;
-    }
-    xSemaphoreGive(lock);
 }
 
 static void can_master_check_timeouts(void)
@@ -376,18 +340,23 @@ static void can_master_check_timeouts(void)
     }
 }
 
-static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbeat_t *payload)
+static void can_master_handle_status(uint8_t node_id, const can_proto_status_t *payload)
 {
     if (!payload) {
         return;
     }
-
     uint64_t now = now_ms();
     bool was_online = false;
     bool notify_io = false;
-    bool has_ext = false;
-    uint32_t tamper_bitmap = 0;
-    uint32_t fault_bitmap = 0;
+    uint16_t alarm_bitmap = payload->alarm_bitmap;
+    uint8_t tamper_bitmap = payload->tamper_bitmap;
+    zone_eol_mode_t eol_mode = (payload->eol_mode <= ZONE_EOL_TRIPLE)
+                                   ? (zone_eol_mode_t)payload->eol_mode
+                                   : ZONE_EOL_DISABLED;
+    uint32_t outputs_bitmap = 0;
+    uint8_t outputs_flags = 0;
+    uint8_t outputs_pwm = 0;
+    bool outputs_valid = false;
 
     SemaphoreHandle_t lock = state_lock_get();
     if (!lock) {
@@ -397,39 +366,41 @@ static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbe
     xSemaphoreTake(lock, portMAX_DELAY);
     can_master_node_t *node = &s_nodes[node_id];
     was_online = node->online;
-    has_ext = node->has_ext_status;
-    tamper_bitmap = node->last_tamper;
-    fault_bitmap = node->last_fault;
     notify_io = (!node->inputs_valid) ||
-                (node->last_alarm != payload->inputs_bitmap) ||
+                (node->last_alarm != alarm_bitmap) ||
+                (node->last_tamper != tamper_bitmap) ||
+                (node->last_flags != payload->flags) ||
                 (node->change_counter != payload->change_counter) ||
-                (node->last_state != payload->node_state);
+                (node->last_zone_count != payload->zone_count) ||
+                (node->eol_mode != eol_mode);
     node->used = true;
     node->online = true;
     node->last_seen_ms = now;
-    node->last_alarm = payload->inputs_bitmap;
-    node->last_state = payload->node_state;
+    node->last_alarm = alarm_bitmap;
+    node->last_tamper = tamper_bitmap;
+    node->last_flags = payload->flags;
+    node->last_zone_count = payload->zone_count;
+    node->eol_mode = eol_mode;
     node->change_counter = payload->change_counter;
     node->inputs_valid = true;
+    outputs_bitmap = node->outputs_bitmap;
+    outputs_flags = node->outputs_flags;
+    outputs_pwm = node->outputs_pwm;
+    outputs_valid = node->outputs_valid;
     xSemaphoreGive(lock);
 
-    uint32_t stored_tamper = has_ext ? tamper_bitmap : 0u;
-    uint32_t stored_fault = has_ext ? fault_bitmap : 0u;
-
     esp_err_t roster_err = roster_note_inputs(node_id,
-                                              payload->inputs_bitmap,
-                                              stored_tamper,
-                                              stored_fault,
+                                              alarm_bitmap,
+                                              tamper_bitmap,
+                                              0,
+                                              eol_mode,
                                               payload->change_counter,
-                                              payload->node_state,
-                                              has_ext);
+                                              payload->flags);
     if (roster_err != ESP_OK) {
         ESP_LOGW(TAG, "Unable to store inputs for node %u (err=%s)",
                  (unsigned)node_id,
                  esp_err_to_name(roster_err));
     }
-
-    can_master_refresh_cached_state(node_id);
 
     bool is_new = false;
     if (roster_mark_online(node_id, now, &is_new) == ESP_OK) {
@@ -441,25 +412,33 @@ static void can_master_handle_heartbeat(uint8_t node_id, const can_proto_heartbe
         }
     }
 
-    bool notify_outputs = (payload->msg_type == CAN_PROTO_MSG_IO_REPORT);
-
-    if (notify_io || notify_outputs) {
-        can_master_notify_io_state(node_id, now);
+    if (notify_io) {
+        can_master_notify_io_state(node_id,
+                                   alarm_bitmap,
+                                   tamper_bitmap,
+                                   true,
+                                   payload->change_counter,
+                                   payload->flags,
+                                   eol_mode,
+                                   outputs_bitmap,
+                                   outputs_valid,
+                                   outputs_flags,
+                                   outputs_pwm,
+                                   now);
     }
 }
 
-static void can_master_process_info(uint8_t node_id,
-                                    uint8_t protocol,
-                                    uint16_t model,
-                                    uint16_t firmware,
-                                    uint8_t inputs_count,
-                                    uint8_t outputs_count)
+static void can_master_handle_info(uint8_t node_id, const can_proto_info_t *payload)
 {
-    if (protocol != CAN_PROTO_PROTOCOL_VERSION) {
+    if (!payload) {
+        return;
+    }
+
+    if (payload->protocol != CAN_PROTO_PROTOCOL_VERSION) {
         ESP_LOGW(TAG,
                  "Node %u protocol mismatch (got %u expected %u)",
                  (unsigned)node_id,
-                 (unsigned)protocol,
+                 (unsigned)payload->protocol,
                  (unsigned)CAN_PROTO_PROTOCOL_VERSION);
     }
 
@@ -468,11 +447,11 @@ static void can_master_process_info(uint8_t node_id,
         .kind = "exp",
         .uid = NULL,
         .has_uid = false,
-        .model = model,
-        .fw = firmware,
+        .model = payload->model,
+        .fw = payload->firmware,
         .caps = 0,
-        .inputs_count = inputs_count,
-        .outputs_count = outputs_count,
+        .inputs_count = payload->inputs_count,
+        .outputs_count = payload->outputs_count,
     };
 
     bool is_new = false;
@@ -510,223 +489,16 @@ static void can_master_process_info(uint8_t node_id,
     }
 }
 
-static void can_master_handle_info(uint8_t node_id, const can_proto_info_t *payload)
-{
-    if (!payload) {
-        return;
-    }
-    can_master_process_info(node_id,
-                            payload->protocol,
-                            payload->model,
-                            payload->firmware,
-                            payload->inputs_count,
-                            payload->outputs_count);
-}
-
 static void can_master_handle_scan_response(const twai_message_t *msg)
 {
     if (!msg || msg->data_length_code == 0) {
         return;
     }
     const can_proto_scan_t *scan = (const can_proto_scan_t *)msg->data;
-    if (scan->msg_type != CAN_PROTO_MSG_SCAN_RESPONSE) {
+    if (scan->msg_type != CAN_PROTO_MSG_SCAN_RES) {
         return;
     }
     ESP_LOGI(TAG, "Received CAN scan response frame");
-}
-
-static void can_master_handle_ext_heartbeat(uint8_t node_id, const twai_message_t *msg)
-{
-    if (!msg || msg->data_length_code < 8) {
-        return;
-    }
-
-    uint8_t alarm_bitmap = msg->data[0];
-    uint8_t short_bitmap = msg->data[1];
-    uint8_t open_bitmap = msg->data[2];
-    uint8_t tamper_bitmap = msg->data[3];
-    uint16_t vdda_10mv = msg->data[4];
-    uint16_t vbias_100mv = msg->data[5];
-    uint8_t temp_raw = msg->data[6];
-    uint8_t fw_version = msg->data[7];
-    int16_t temp_c = (int16_t)((int)temp_raw) - 40;
-    uint64_t ts = now_ms();
-
-    uint32_t alarm32 = (uint32_t)alarm_bitmap;
-    uint32_t fault32 = (uint32_t)short_bitmap | (uint32_t)open_bitmap;
-
-    esp_err_t roster_err = roster_note_ext_status(node_id,
-                                                  alarm_bitmap,
-                                                  short_bitmap,
-                                                  open_bitmap,
-                                                  tamper_bitmap,
-                                                  vdda_10mv,
-                                                  vbias_100mv,
-                                                  temp_c,
-                                                  fw_version,
-                                                  ts);
-    if (roster_err != ESP_OK) {
-        ESP_LOGW(TAG, "Unable to store extended status for node %u (err=%s)",
-                 (unsigned)node_id,
-                 esp_err_to_name(roster_err));
-    }
-
-    bool was_online = false;
-    SemaphoreHandle_t lock = state_lock_get();
-    if (lock) {
-        xSemaphoreTake(lock, portMAX_DELAY);
-        can_master_node_t *node = &s_nodes[node_id];
-        was_online = node->online;
-        node->used = true;
-        node->online = true;
-        node->last_seen_ms = ts;
-        node->has_ext_status = true;
-        node->last_alarm = alarm32;
-        node->last_tamper = (uint32_t)tamper_bitmap;
-        node->last_fault = fault32;
-        xSemaphoreGive(lock);
-    }
-
-    can_master_refresh_cached_state(node_id);
-
-    bool is_new = false;
-    if (roster_mark_online(node_id, ts, &is_new) == ESP_OK) {
-        if (is_new) {
-            can_scan_note_new_node();
-        }
-        if (!was_online || is_new) {
-            can_master_notify_online(node_id, is_new, ts);
-        }
-    }
-
-    cJSON *evt = cJSON_CreateObject();
-    if (evt) {
-        cJSON_AddNumberToObject(evt, "node_id", node_id);
-        cJSON_AddNumberToObject(evt, "ts_ms", (double)ts);
-        cJSON_AddNumberToObject(evt, "alarm_bitmap", (double)alarm32);
-        cJSON_AddNumberToObject(evt, "short_bitmap", (double)short_bitmap);
-        cJSON_AddNumberToObject(evt, "open_bitmap", (double)open_bitmap);
-        cJSON_AddNumberToObject(evt, "tamper_bitmap", (double)tamper_bitmap);
-        cJSON_AddNumberToObject(evt, "fault_bitmap", (double)fault32);
-        cJSON_AddNumberToObject(evt, "vdda_mv", (double)vdda_10mv * 10.0);
-        cJSON_AddNumberToObject(evt, "vbias_mv", (double)vbias_100mv * 100.0);
-        cJSON_AddNumberToObject(evt, "vbias_volts", (double)vbias_100mv / 10.0);
-        cJSON_AddNumberToObject(evt, "temp_c", (double)temp_c);
-        cJSON_AddNumberToObject(evt, "fw_version", fw_version);
-        web_server_ws_broadcast_event("node_ext_status", evt);
-    }
-
-    can_master_notify_io_state(node_id, ts);
-}
-
-static const char *can_master_zone_state_string(uint8_t state_bits)
-{
-    if (state_bits & CAN_EXT_ZONE_STATE_TAMPER) {
-        return "TAMPER";
-    }
-    if (state_bits & CAN_EXT_ZONE_STATE_SHORT) {
-        return "FAULT_SHORT";
-    }
-    if (state_bits & CAN_EXT_ZONE_STATE_OPEN) {
-        return "FAULT_OPEN";
-    }
-    if (state_bits & CAN_EXT_ZONE_STATE_ALARM) {
-        return "ALARM";
-    }
-    if (state_bits & CAN_EXT_ZONE_STATE_PRESENT) {
-        return "NORMAL";
-    }
-    return "UNKNOWN";
-}
-
-static void can_master_handle_zone_event(uint8_t node_id, const twai_message_t *msg)
-{
-    if (!msg || msg->data_length_code < 8) {
-        return;
-    }
-
-    uint8_t zone_index = msg->data[0];
-    if (zone_index >= ROSTER_MAX_ZONES) {
-        return;
-    }
-
-    uint8_t state_bits = msg->data[1];
-    uint16_t adc_raw = (uint16_t)msg->data[2] | ((uint16_t)msg->data[3] << 8);
-    uint16_t rloop_ohm_div100 = (uint16_t)msg->data[4] | ((uint16_t)msg->data[5] << 8);
-    uint16_t vbias_100mv = msg->data[6];
-    uint8_t seq = msg->data[7];
-    uint64_t ts = now_ms();
-
-    esp_err_t roster_err = roster_note_zone_event(node_id,
-                                                  zone_index,
-                                                  state_bits,
-                                                  adc_raw,
-                                                  rloop_ohm_div100,
-                                                  vbias_100mv,
-                                                  seq,
-                                                  ts);
-    if (roster_err != ESP_OK) {
-        ESP_LOGW(TAG, "Unable to store zone event for node %u (zone %u err=%s)",
-                 (unsigned)node_id,
-                 (unsigned)zone_index,
-                 esp_err_to_name(roster_err));
-    }
-
-    bool was_online = false;
-    SemaphoreHandle_t lock = state_lock_get();
-    if (lock) {
-        xSemaphoreTake(lock, portMAX_DELAY);
-        can_master_node_t *node = &s_nodes[node_id];
-        was_online = node->online;
-        node->used = true;
-        node->online = true;
-        node->last_seen_ms = ts;
-        node->has_ext_status = true;
-        xSemaphoreGive(lock);
-    }
-
-    can_master_refresh_cached_state(node_id);
-
-    bool is_new = false;
-    if (roster_mark_online(node_id, ts, &is_new) == ESP_OK) {
-        if (is_new) {
-            can_scan_note_new_node();
-        }
-        if (!was_online || is_new) {
-            can_master_notify_online(node_id, is_new, ts);
-        }
-    }
-
-    bool present = (state_bits & CAN_EXT_ZONE_STATE_PRESENT) != 0;
-    bool alarm = (state_bits & CAN_EXT_ZONE_STATE_ALARM) != 0;
-    bool tamper = (state_bits & CAN_EXT_ZONE_STATE_TAMPER) != 0;
-    bool fault_short = (state_bits & CAN_EXT_ZONE_STATE_SHORT) != 0;
-    bool fault_open = (state_bits & CAN_EXT_ZONE_STATE_OPEN) != 0;
-    bool contact_no = (state_bits & CAN_EXT_ZONE_STATE_CONTACT_NO) != 0;
-
-    cJSON *evt = cJSON_CreateObject();
-    if (evt) {
-        cJSON_AddNumberToObject(evt, "node_id", node_id);
-        cJSON_AddNumberToObject(evt, "zone", zone_index);
-        cJSON_AddNumberToObject(evt, "ts_ms", (double)ts);
-        cJSON_AddNumberToObject(evt, "state_bits", state_bits);
-        cJSON_AddStringToObject(evt, "state", can_master_zone_state_string(state_bits));
-        cJSON_AddBoolToObject(evt, "present", present);
-        cJSON_AddBoolToObject(evt, "alarm", alarm);
-        cJSON_AddBoolToObject(evt, "fault_short", fault_short);
-        cJSON_AddBoolToObject(evt, "fault_open", fault_open);
-        cJSON_AddBoolToObject(evt, "tamper", tamper);
-        cJSON_AddBoolToObject(evt, "contact_no", contact_no);
-        cJSON_AddNumberToObject(evt, "adc_raw", adc_raw);
-        cJSON_AddNumberToObject(evt, "rloop_ohm_div100", rloop_ohm_div100);
-        cJSON_AddNumberToObject(evt, "rloop_ohm", (double)rloop_ohm_div100 * 100.0);
-        cJSON_AddNumberToObject(evt, "vbias_100mv", vbias_100mv);
-        cJSON_AddNumberToObject(evt, "vbias_volts", (double)vbias_100mv / 10.0);
-        cJSON_AddNumberToObject(evt, "seq", seq);
-        web_server_ws_broadcast_event("zone_event", evt);
-    }
-
-    can_master_notify_io_state(node_id, ts);
 }
 
 static void can_master_handle_addr_request(const twai_message_t *msg)
@@ -789,8 +561,9 @@ static void can_master_handle_addr_request(const twai_message_t *msg)
         node->outputs_pwm = 0;
         node->last_alarm = 0;
         node->last_tamper = 0;
-        node->last_fault = 0;
-        node->last_state = 0;
+        node->last_flags = 0;
+        node->last_zone_count = 0;
+        node->eol_mode = ZONE_EOL_DISABLED;
         node->change_counter = 0;
         xSemaphoreGive(lock);
     }
@@ -830,11 +603,10 @@ static void can_master_handle_frame(const twai_message_t *msg)
     if (cob_id >= CAN_PROTO_ID_STATUS_BASE &&
         cob_id < (CAN_PROTO_ID_STATUS_BASE + CAN_MAX_NODE_ID + 1)) {
         uint8_t node_id = (uint8_t)(cob_id - CAN_PROTO_ID_STATUS_BASE);
-        if (msg->data_length_code >= sizeof(can_proto_heartbeat_t)) {
-            const can_proto_heartbeat_t *payload = (const can_proto_heartbeat_t *)msg->data;
-            if (payload->msg_type == CAN_PROTO_MSG_HEARTBEAT ||
-                payload->msg_type == CAN_PROTO_MSG_IO_REPORT) {
-                can_master_handle_heartbeat(node_id, payload);
+        if (msg->data_length_code >= sizeof(can_proto_status_t)) {
+            const can_proto_status_t *payload = (const can_proto_status_t *)msg->data;
+            if (payload->msg_type == CAN_PROTO_MSG_STATUS) {
+                can_master_handle_status(node_id, payload);
             }
         }
         return;
@@ -849,20 +621,6 @@ static void can_master_handle_frame(const twai_message_t *msg)
                 can_master_handle_info(node_id, payload);
             }
         }
-        return;
-    }
-
-    if (cob_id >= CAN_PROTO_ID_EXT_HEARTBEAT(0) &&
-        cob_id < (CAN_PROTO_ID_EXT_HEARTBEAT(0) + CAN_MAX_NODE_ID + 1)) {
-        uint8_t node_id = (uint8_t)(cob_id - CAN_PROTO_ID_EXT_HEARTBEAT(0));
-        can_master_handle_ext_heartbeat(node_id, msg);
-        return;
-    }
-
-    if (cob_id >= CAN_PROTO_ID_EXT_ZONE_EVENT(0) &&
-        cob_id < (CAN_PROTO_ID_EXT_ZONE_EVENT(0) + CAN_MAX_NODE_ID + 1)) {
-        uint8_t node_id = (uint8_t)(cob_id - CAN_PROTO_ID_EXT_ZONE_EVENT(0));
-        can_master_handle_zone_event(node_id, msg);
         return;
     }
 }
@@ -981,7 +739,7 @@ esp_err_t can_master_set_node_outputs(uint8_t node_id,
     }
 
     can_proto_output_cmd_t payload = {
-        .msg_type = CAN_PROTO_MSG_OUTPUT_COMMAND,
+        .msg_type = CAN_PROTO_MSG_OUTPUT,
         .flags = flags,
         .outputs_bitmap = outputs_bitmap,
         .pwm_level = pwm_level,
@@ -995,6 +753,12 @@ esp_err_t can_master_set_node_outputs(uint8_t node_id,
         return err;
     }
 
+    uint16_t alarm_bitmap = 0;
+    uint8_t tamper_bitmap = 0;
+    uint8_t change_counter = 0;
+    uint8_t status_flags = 0;
+    zone_eol_mode_t eol_mode = ZONE_EOL_DISABLED;
+    bool inputs_valid = false;
     uint64_t timestamp = now_ms();
 
     SemaphoreHandle_t lock = state_lock_get();
@@ -1006,6 +770,12 @@ esp_err_t can_master_set_node_outputs(uint8_t node_id,
         node->outputs_flags = flags;
         node->outputs_pwm = pwm_level;
         node->outputs_valid = true;
+        alarm_bitmap = node->last_alarm;
+        tamper_bitmap = node->last_tamper;
+        change_counter = node->change_counter;
+        status_flags = node->last_flags;
+        eol_mode = node->eol_mode;
+        inputs_valid = node->inputs_valid;
         xSemaphoreGive(lock);
     }
 
@@ -1020,7 +790,18 @@ esp_err_t can_master_set_node_outputs(uint8_t node_id,
                  esp_err_to_name(roster_err));
     }
 
-    can_master_notify_io_state(node_id, timestamp);
+    can_master_notify_io_state(node_id,
+                               alarm_bitmap,
+                               tamper_bitmap,
+                               inputs_valid,
+                               change_counter,
+                               status_flags,
+                               eol_mode,
+                               outputs_bitmap,
+                               true,
+                               flags,
+                               pwm_level,
+                               timestamp);
 
     return ESP_OK;
 }
@@ -1077,7 +858,7 @@ esp_err_t can_master_request_scan(bool *started)
     }
 
     can_proto_scan_t payload = {
-        .msg_type = CAN_PROTO_MSG_SCAN_REQUEST,
+        .msg_type = CAN_PROTO_MSG_SCAN_REQ,
         .reserved = {0},
     };
 

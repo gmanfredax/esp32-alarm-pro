@@ -31,6 +31,7 @@
 #include "app_mqtt.h"
 #include "alarm_core.h"
 #include "gpio_inputs.h"
+#include "zone_local.h"
 #include "outputs.h"
 #include "pn532_spi.h"
 #include "onewire_ds18b20.h"
@@ -1374,7 +1375,9 @@ static void nvs_init_safe(void)
     }
 }
 
-static void compose_zone_mask(uint16_t master_gpio, uint16_t zones_total, zone_mask_t *out_mask)
+static void compose_zone_mask(const zone_local_snapshot_t *local,
+                              uint16_t zones_total,
+                              zone_mask_t *out_mask)
 {
     if (!out_mask) {
         return;
@@ -1384,34 +1387,30 @@ static void compose_zone_mask(uint16_t master_gpio, uint16_t zones_total, zone_m
     }
 
     zone_mask_clear(out_mask);
-    uint16_t master_limit = inputs_master_zone_count();
-    if (master_limit > zones_total) {
-        master_limit = zones_total;
-    }
 
-    for (uint16_t i = 1; i <= master_limit; ++i) {
-        if (inputs_zone_bit(master_gpio, i)) {
-            zone_mask_set(out_mask, (uint16_t)(i - 1u));
+    uint16_t offset = 0;
+    if (local) {
+        uint8_t local_count = local->count;
+        for (uint8_t i = 0; i < local_count && offset < zones_total; ++i, ++offset) {
+            const zone_local_zone_t *zone = &local->zones[i];
+            bool active = zone->alarm || zone->tamper;
+            if (active) {
+                zone_mask_set(out_mask, offset);
+            }
         }
-    }
-
-    if (zones_total <= inputs_master_zone_count()) {
-        zone_mask_limit(out_mask, zones_total);
-        return;
     }
 
     roster_node_inputs_t nodes[32];
     size_t node_count = roster_collect_nodes(nodes, sizeof(nodes) / sizeof(nodes[0]));
-    uint16_t offset = inputs_master_zone_count();
-    if (offset > zones_total) {
-        offset = zones_total;
-    }
-
     for (size_t idx = 0; idx < node_count && offset < zones_total && offset < ALARM_MAX_ZONES; ++idx) {
         const roster_node_inputs_t *node = &nodes[idx];
         const uint8_t inputs = node->inputs_count;
         for (uint8_t bit = 0; bit < inputs && offset < zones_total && offset < ALARM_MAX_ZONES; ++bit, ++offset) {
-            bool active = node->inputs_valid && ((node->inputs_bitmap & (1u << bit)) != 0u);
+            bool active = false;
+            if (node->inputs_valid) {
+                uint32_t bitmask = (1u << bit);
+                active = ((node->alarm_bitmap | node->tamper_bitmap | node->fault_bitmap) & bitmask) != 0u;
+            }
             if (active) {
                 zone_mask_set(out_mask, offset);
             }
@@ -1479,6 +1478,7 @@ static void system_main_task(void *arg)
 // [debug disattivato] loop dump link rimosso per build pulita
 
     ESP_ERROR_CHECK(inputs_init());
+    ESP_ERROR_CHECK(zone_local_init());
     ESP_ERROR_CHECK(scenes_init(ALARM_MAX_ZONES));
     ESP_ERROR_CHECK(outputs_init());
     ESP_ERROR_CHECK(pn532_init());
@@ -1486,7 +1486,7 @@ static void system_main_task(void *arg)
     ESP_ERROR_CHECK(log_system_init());
 
     // ensure_scan_mutex();
-    roster_init(inputs_master_zone_count(), MASTER_OUTPUTS_COUNT, 0);
+    roster_init(zone_local_zone_count(), MASTER_OUTPUTS_COUNT, 0);
     roster_master_set_device_id(device_id);
 
 #if defined(CONFIG_APP_CAN_ENABLED)
@@ -1528,14 +1528,17 @@ static void system_main_task(void *arg)
     mqtt_publish_scenes();
 
     uint16_t initial_gpio = 0;
-    uint16_t last_zones_total = roster_effective_zones(inputs_master_zone_count());
+    uint16_t last_zones_total = roster_effective_zones(zone_local_zone_count());
     zone_mask_t last_mask;
     zone_mask_clear(&last_mask);
     bool first_cycle = true;
     if (inputs_read_all(&initial_gpio) == ESP_OK) {
-        uint16_t zones_total = roster_effective_zones(inputs_master_zone_count());
+        zone_local_update();
+        zone_local_snapshot_t initial_local;
+        zone_local_get_snapshot(&initial_local);
+        uint16_t zones_total = roster_effective_zones(initial_local.count);
         zone_mask_t init_mask;
-        compose_zone_mask(initial_gpio, zones_total, &init_mask);
+        compose_zone_mask(&initial_local, zones_total, &init_mask);
         mqtt_publish_zones(&init_mask);
         zone_mask_copy(&last_mask, &init_mask);
         last_zones_total = zones_total;
@@ -1568,12 +1571,15 @@ static void system_main_task(void *arg)
         uint16_t ab = 0;
         inputs_read_all(&ab);
 
-        uint16_t zones_total = roster_effective_zones(inputs_master_zone_count());
+        zone_local_update();
+        zone_local_snapshot_t local_snapshot;
+        zone_local_get_snapshot(&local_snapshot);
+        uint16_t zones_total = roster_effective_zones(local_snapshot.count);
         zone_mask_t zmask;
-        compose_zone_mask(ab, zones_total, &zmask);
+        compose_zone_mask(&local_snapshot, zones_total, &zmask);
 
         // esempio: tamper su bit (8+4) come da tuo codice
-        bool tamper = inputs_tamper(ab);
+        bool tamper = inputs_tamper(ab) || (zone_local_tamper_mask() != 0);
 
         if (first_cycle || !zone_mask_equal(&zmask, &last_mask) || zones_total != last_zones_total) {
             mqtt_publish_zones(&zmask);

@@ -12,7 +12,6 @@
 #include "can_proto.h"
 #include "can_master.h"
 #include "roster.h"
-#include "can_bus_protocol.h"
 
 // #ifndef TWAI_FRAME_MAX_DLC
 // #define TWAI_FRAME_MAX_DLC 8
@@ -100,12 +99,13 @@ esp_err_t pdo_send_led_identify_toggle(uint8_t node_id, bool enable, bool *out_c
         return ESP_OK;
     }
 
-    can_proto_identify_cmd_t payload = {
-        .msg_type = CAN_PROTO_MSG_IDENTIFY,
-        .enable = enable ? 1u : 0u,
+    pdo_led_cmd_t cmd = {
+        .led_cmd = PDO_LED_CMD_IDENTIFY_TOGGLE,
+        .duration_ms = 0,
+        .pattern_arg = 0,
         .reserved = {0},
     };
-    esp_err_t err = can_master_send_raw(CAN_PROTO_ID_COMMAND(node_id), &payload, sizeof(payload));
+    esp_err_t err = send_pdo(COBID_PDO_RX2(node_id), &cmd, sizeof(cmd));
     if (err == ESP_OK) {
         bool changed = false;
         err = roster_set_identify(node_id, enable, &changed);

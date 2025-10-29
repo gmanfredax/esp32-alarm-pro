@@ -5,12 +5,6 @@
 // - Sessioni in RAM (token→username) con TTL assoluto 7g e inattività 5m (sliding)
 // - Login con password (+ TOTP opzionale se abilitato per l’utente)
 
-#if CONFIG_APP_INPUT_BACKEND_ADS1115
-#define INPUTS_BACKEND_NAME "ads1115"
-#else
-#define INPUTS_BACKEND_NAME "mcp23017"
-#endif
-
 #include "sdkconfig.h"
 
 #include "esp_timer.h"
@@ -44,7 +38,6 @@
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/pk.h"
 #include "mbedtls/error.h"
-#include <math.h>
 #include "mbedtls/version.h"
 
 #include "web_server.h"
@@ -68,6 +61,8 @@
 #include "app_mqtt.h"
 #include "can_master.h"
 #include "can_bus_protocol.h"
+#include "zone_local.h"
+#include "zone_eol.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -1161,18 +1156,12 @@ static esp_err_t api_can_node_outputs_post(httpd_req_t *req)
                                      updated_state.outputs_pwm : pwm_level));
     cJSON_AddBoolToObject(resp, "inputs_known", updated_state.inputs_valid);
     if (updated_state.inputs_valid) {
-        cJSON_AddNumberToObject(resp, "inputs_bitmap", (double)updated_state.inputs_bitmap);
-        cJSON_AddNumberToObject(resp,
-                                "inputs_alarm_bitmap",
-                                (double)updated_state.inputs_bitmap);
-        cJSON_AddNumberToObject(resp,
-                                "inputs_tamper_bitmap",
-                                (double)updated_state.inputs_tamper_bitmap);
-        cJSON_AddNumberToObject(resp,
-                                "inputs_fault_bitmap",
-                                (double)updated_state.inputs_fault_bitmap);
+        cJSON_AddNumberToObject(resp, "alarm_bitmap", (double)updated_state.alarm_bitmap);
+        cJSON_AddNumberToObject(resp, "tamper_bitmap", (double)updated_state.tamper_bitmap);
+        cJSON_AddNumberToObject(resp, "fault_bitmap", (double)updated_state.fault_bitmap);
+        cJSON_AddNumberToObject(resp, "eol_mode", (double)updated_state.eol_mode);
         cJSON_AddNumberToObject(resp, "change_counter", updated_state.change_counter);
-        cJSON_AddNumberToObject(resp, "node_state_flags", updated_state.node_state_flags);
+        cJSON_AddNumberToObject(resp, "status_flags", updated_state.node_state_flags);
     }
 
     return json_reply_cjson(req, resp);
@@ -3453,10 +3442,11 @@ static esp_err_t users_admin_list_get(httpd_req_t* req){
 // ─────────────────────────────────────────────────────────────────────────────
 
 typedef struct {
-    bool     zone_delay;   // ritardo unico abilitato
-    uint16_t zone_time;    // secondi
-    bool     auto_exclude; // se aperta all'ARM e non ritardata -> bypassabile?
-    char     name[24];
+    bool           zone_delay;   // ritardo unico abilitato
+    uint16_t       zone_time;    // secondi
+    bool           auto_exclude; // se aperta all'ARM e non ritardata -> bypassabile?
+    char           name[24];
+    zone_eol_mode_t eol_mode;
 } zone_cfg_t;
 
 #define ZONE_CONFIG_CAPACITY ALARM_MAX_ZONES
@@ -3464,6 +3454,13 @@ typedef struct {
 typedef struct {
     bool known;
     bool active;
+    bool tamper;
+    bool fault;
+    bool analog;
+    int32_t millivolts;
+    float ratio;
+    zone_line_state_t line_state;
+    zone_eol_mode_t eol_mode;
     uint8_t board;
     uint8_t board_input;
     bool board_online;
@@ -3477,138 +3474,6 @@ typedef struct {
 
 static zone_cfg_t s_zone_cfg[ZONE_CONFIG_CAPACITY];
 static uint8_t    s_zone_board_map[ZONE_CONFIG_CAPACITY];
-
-static const char *zone_measure_mode_to_str(zone_measure_mode_t mode)
-{
-    switch (mode) {
-    case ZONE_MEASURE_DIGITAL: return "digital";
-    case ZONE_MEASURE_EOL1:    return "eol1";
-    case ZONE_MEASURE_EOL2:    return "eol2";
-    case ZONE_MEASURE_EOL3:    return "eol3";
-    default:                   return "unknown";
-    }
-}
-
-static bool zone_measure_mode_from_str(const char *str, zone_measure_mode_t *out)
-{
-    if (!str || !out) {
-        return false;
-    }
-    if (strcasecmp(str, "digital") == 0) {
-        *out = ZONE_MEASURE_DIGITAL;
-        return true;
-    }
-    if (strcasecmp(str, "eol1") == 0) {
-        *out = ZONE_MEASURE_EOL1;
-        return true;
-    }
-    if (strcasecmp(str, "eol2") == 0) {
-        *out = ZONE_MEASURE_EOL2;
-        return true;
-    }
-    if (strcasecmp(str, "eol3") == 0) {
-        *out = ZONE_MEASURE_EOL3;
-        return true;
-    }
-    return false;
-}
-
-static const char *zone_contact_to_str(zone_contact_t contact)
-{
-    switch (contact) {
-    case ZONE_CONTACT_NO: return "no";
-    case ZONE_CONTACT_NC: return "nc";
-    default:              return "nc";
-    }
-}
-
-static bool zone_contact_from_str(const char *str, zone_contact_t *out)
-{
-    if (!str || !out) {
-        return false;
-    }
-    if (strcasecmp(str, "nc") == 0) {
-        *out = ZONE_CONTACT_NC;
-        return true;
-    }
-    if (strcasecmp(str, "no") == 0) {
-        *out = ZONE_CONTACT_NO;
-        return true;
-    }
-    return false;
-}
-
-static const char *zone_status_to_string(zone_status_t st)
-{
-    switch (st) {
-    case ZONE_STATUS_NORMAL:      return "normal";
-    case ZONE_STATUS_ALARM:       return "alarm";
-    case ZONE_STATUS_TAMPER:      return "tamper";
-    case ZONE_STATUS_FAULT_SHORT: return "fault_short";
-    case ZONE_STATUS_FAULT_OPEN:  return "fault_open";
-    default:                      return "unknown";
-    }
-}
-
-static cJSON *diag_expected_entry(float resistance, float vbias, bool is_open)
-{
-    const float rbias = 6800.0f;
-    const float lsb = 4.096f / 32768.0f;
-    const float adc_gain = 5.545f;
-    float vz = vbias;
-    float counts = 0.0f;
-    if (!is_open) {
-        if (resistance < 0.1f) {
-            vz = 0.0f;
-        } else {
-            float lambda = resistance / (resistance + rbias);
-            vz = vbias * lambda;
-        }
-    }
-    float vz_adc = vz / adc_gain;
-    counts = vz_adc / lsb;
-    cJSON *obj = cJSON_CreateObject();
-    if (!obj) {
-        return NULL;
-    }
-    if (!is_open) {
-        cJSON_AddNumberToObject(obj, "resistance", resistance);
-    }
-    cJSON_AddNumberToObject(obj, "vz", vz);
-    cJSON_AddNumberToObject(obj, "v_adc", vz_adc);
-    cJSON_AddNumberToObject(obj, "counts", counts);
-    return obj;
-}
-
-static void diag_add_expected(cJSON *parent, const zone_measure_globals_t *globals, float vbias)
-{
-    if (!parent || !globals) {
-        return;
-    }
-    if (vbias <= 0.1f) {
-        vbias = 12.0f;
-    }
-    cJSON_AddNumberToObject(parent, "vbias", vbias);
-
-    cJSON *eol1 = cJSON_AddObjectToObject(parent, "eol1");
-    if (eol1) {
-        cJSON_AddItemToObject(eol1, "normal", diag_expected_entry(globals->r_eol, vbias, false));
-        cJSON_AddItemToObject(eol1, "open", diag_expected_entry(0.0f, vbias, true));
-    }
-
-    cJSON *eol2 = cJSON_AddObjectToObject(parent, "eol2");
-    if (eol2) {
-        cJSON_AddItemToObject(eol2, "normal", diag_expected_entry(globals->r_normal, vbias, false));
-        cJSON_AddItemToObject(eol2, "alarm", diag_expected_entry(globals->r_normal + globals->r_alarm, vbias, false));
-    }
-
-    cJSON *eol3 = cJSON_AddObjectToObject(parent, "eol3");
-    if (eol3) {
-        cJSON_AddItemToObject(eol3, "normal", diag_expected_entry(globals->r_normal, vbias, false));
-        cJSON_AddItemToObject(eol3, "alarm", diag_expected_entry(globals->r_normal + globals->r_alarm, vbias, false));
-        cJSON_AddItemToObject(eol3, "tamper", diag_expected_entry(globals->r_normal + globals->r_tamper, vbias, false));
-    }
-}
 
 static void zone_board_label_copy(uint8_t board_id, char *out, size_t cap)
 {
@@ -3636,12 +3501,34 @@ static uint8_t zone_board_for_index(int zone_1_based){
 }
 
 static void zones_apply_to_alarm(void){
-     // Invia le opzioni zona ad alarm_core
-    for(int i=1;i<=ALARM_MAX_ZONES;i++){
-        zone_cfg_t *c = &s_zone_cfg[i-1];
-        zone_opts_t o = { .entry_delay = c->zone_delay, .entry_time_ms = (uint16_t)(c->zone_time * 1000u), .exit_delay = c->zone_delay, .exit_time_ms = (uint16_t)(c->zone_time * 1000u), .auto_exclude = c->auto_exclude };
-        alarm_set_zone_opts(i, &o);
+    // Invia le opzioni zona ad alarm_core e aggiorna le modalità EOL locali
+    zone_eol_mode_t local_modes[ZONE_LOCAL_MAX_ZONES];
+    memset(local_modes, 0, sizeof(local_modes));
+    uint8_t local_count = zone_local_zone_count();
+    if (local_count > ZONE_LOCAL_MAX_ZONES) {
+        local_count = ZONE_LOCAL_MAX_ZONES;
     }
+
+    for (int i = 1; i <= ALARM_MAX_ZONES; ++i) {
+        zone_cfg_t *c = &s_zone_cfg[i - 1];
+        zone_opts_t o = {
+            .entry_delay = c->zone_delay,
+            .entry_time_ms = (uint16_t)(c->zone_time * 1000u),
+            .exit_delay = c->zone_delay,
+            .exit_time_ms = (uint16_t)(c->zone_time * 1000u),
+            .auto_exclude = c->auto_exclude
+        };
+        alarm_set_zone_opts(i, &o);
+        if (i <= (int)local_count) {
+            zone_eol_mode_t mode = c->eol_mode;
+            if (mode < ZONE_EOL_DISABLED || mode > ZONE_EOL_TRIPLE) {
+                mode = ZONE_EOL_DOUBLE;
+            }
+            local_modes[i - 1] = mode;
+        }
+    }
+
+    zone_local_apply_modes(local_modes, local_count);
 }
 
 static void zones_snapshot_build(zones_snapshot_t *snap)
@@ -3651,20 +3538,29 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
     }
     memset(snap, 0, sizeof(*snap));
 
-    snap->master_total = inputs_master_zone_count();
+    zone_local_snapshot_t local_snapshot;
+    zone_local_get_snapshot(&local_snapshot);
+
+    snap->master_total = local_snapshot.count;
     if (snap->master_total > ZONE_CONFIG_CAPACITY) {
         snap->master_total = ZONE_CONFIG_CAPACITY;
     }
 
-    uint16_t gpioab = 0;
-    bool gpio_ok = (inputs_read_all(&gpioab) == ESP_OK);
     for (int i = 0; i < snap->master_total; ++i) {
         zone_state_entry_t *entry = &snap->entries[i];
+        const zone_local_zone_t *zone = &local_snapshot.zones[i];
         entry->board = 0;
         entry->board_input = (uint8_t)i;
-        entry->board_online = gpio_ok;
-        entry->known = gpio_ok;
-        entry->active = gpio_ok ? inputs_zone_bit(gpioab, i + 1) : false;
+        entry->board_online = true;
+        entry->known = zone->valid;
+        entry->active = zone->alarm;
+        entry->tamper = zone->tamper;
+        entry->fault = zone->fault;
+        entry->analog = true;
+        entry->millivolts = zone->result.millivolts;
+        entry->ratio = zone->result.ratio;
+        entry->line_state = zone->result.state;
+        entry->eol_mode = zone->mode;
         s_zone_board_map[i] = 0;
         snap->total++;
     }
@@ -3685,7 +3581,21 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
             entry->board_input = bit;
             entry->board_online = (node->state == ROSTER_NODE_STATE_OPERATIONAL);
             entry->known = entry->board_online && node->inputs_valid;
-            entry->active = entry->known ? ((node->inputs_bitmap & (1u << bit)) != 0u) : false;
+            uint32_t bitmask = (1u << bit);
+            entry->active = entry->known ? ((node->alarm_bitmap & bitmask) != 0u) : false;
+            entry->tamper = entry->known ? ((node->tamper_bitmap & bitmask) != 0u) : false;
+            entry->fault = entry->known ? ((node->fault_bitmap & bitmask) != 0u) : false;
+            entry->analog = false;
+            entry->millivolts = 0;
+            entry->ratio = 0.0f;
+            entry->line_state = entry->known
+                                   ? (entry->fault
+                                          ? ZONE_LINE_FAULT
+                                          : (entry->tamper ? ZONE_LINE_TAMPER_OPEN
+                                                           : (entry->active ? ZONE_LINE_ALARM
+                                                                            : ZONE_LINE_SECURE)))
+                                   : ZONE_LINE_UNKNOWN;
+            entry->eol_mode = node->eol_mode;
             s_zone_board_map[snap->total] = entry->board;
             snap->total++;
         }
@@ -3698,6 +3608,13 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
         s_zone_board_map[i] = 0;
         snap->entries[i].known = false;
         snap->entries[i].active = false;
+        snap->entries[i].tamper = false;
+        snap->entries[i].fault = false;
+        snap->entries[i].analog = false;
+        snap->entries[i].millivolts = 0;
+        snap->entries[i].ratio = 0.0f;
+        snap->entries[i].line_state = ZONE_LINE_UNKNOWN;
+        snap->entries[i].eol_mode = ZONE_EOL_DISABLED;
         snap->entries[i].board = 0;
         snap->entries[i].board_input = 0;
         snap->entries[i].board_online = false;
@@ -3707,7 +3624,7 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
 static int zones_snapshot_total(const zones_snapshot_t *snap)
 {
     if (!snap) {
-        return inputs_master_zone_count();
+        return zone_local_zone_count();
     }
     if (snap->total <= 0) {
         return snap->master_total;
@@ -3717,7 +3634,7 @@ static int zones_snapshot_total(const zones_snapshot_t *snap)
 
 static int zones_effective_total(void)
 {
-    uint16_t total = roster_effective_zones(inputs_master_zone_count());
+    uint16_t total = roster_effective_zones(zone_local_zone_count());
     if (total > ZONE_CONFIG_CAPACITY) {
         total = ZONE_CONFIG_CAPACITY;
     }
@@ -3763,6 +3680,14 @@ static void zones_load_from_nvs(void){
         }
         nvs_close(h);
     }
+
+    for (size_t i = 0; i < ZONE_CONFIG_CAPACITY; ++i) {
+        zone_eol_mode_t mode = s_zone_cfg[i].eol_mode;
+        if (mode < ZONE_EOL_DISABLED || mode > ZONE_EOL_TRIPLE) {
+            s_zone_cfg[i].eol_mode = ZONE_EOL_DOUBLE;
+        }
+    }
+
     zones_apply_to_alarm();
 }
 static void zones_save_to_nvs(void){
@@ -4755,6 +4680,12 @@ static esp_err_t status_get(httpd_req_t* req){
     zones_snapshot_t snapshot;
     zones_snapshot_build(&snapshot);
     const int zones_total = zones_snapshot_total(&snapshot);
+    for (int idx = 0; idx < zones_total; ++idx) {
+        if (snapshot.entries[idx].tamper) {
+            tamper = true;
+            break;
+        }
+    }
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
@@ -4769,7 +4700,8 @@ static esp_err_t status_get(httpd_req_t* req){
     if (zones && zones_known) {
         for (int idx = 0; idx < zones_total; ++idx) {
             const zone_state_entry_t *entry = &snapshot.entries[idx];
-            cJSON_AddItemToArray(zones, cJSON_CreateBool(entry->active));
+            bool alarm_like = entry->active || entry->tamper || entry->fault;
+            cJSON_AddItemToArray(zones, cJSON_CreateBool(alarm_like));
             cJSON_AddItemToArray(zones_known, cJSON_CreateBool(entry->known));
         }
         cJSON_AddItemToObject(root, "zones_active", zones);
@@ -4853,6 +4785,15 @@ static esp_err_t zones_get(httpd_req_t* req){
         cJSON_AddStringToObject(it, "name", zname ? zname : "");
         cJSON_AddBoolToObject(it, "known", entry->known);
         cJSON_AddBoolToObject(it, "active", entry->known ? entry->active : false);
+        cJSON_AddBoolToObject(it, "tamper", entry->known ? entry->tamper : false);
+        cJSON_AddBoolToObject(it, "fault", entry->known ? entry->fault : false);
+        cJSON_AddBoolToObject(it, "analog", entry->analog);
+        cJSON_AddStringToObject(it, "state", zone_line_state_name(entry->line_state));
+        cJSON_AddNumberToObject(it, "eol_mode", (double)entry->eol_mode);
+        if (entry->analog) {
+            cJSON_AddNumberToObject(it, "millivolts", (double)entry->millivolts);
+            cJSON_AddNumberToObject(it, "ratio", entry->ratio);
+        }
         cJSON_AddBoolToObject(it, "board_online", entry->board_online);
         cJSON_AddNumberToObject(it, "board", (double)entry->board);
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
@@ -5070,18 +5011,18 @@ static esp_err_t zones_config_get(httpd_req_t* req){
         cJSON_AddBoolToObject(it, "zone_delay", cfg->zone_delay);
         cJSON_AddNumberToObject(it, "zone_time", (double)cfg->zone_time);
         cJSON_AddBoolToObject(it, "auto_exclude", cfg->auto_exclude);
+        cJSON_AddNumberToObject(it, "eol_mode", (double)cfg->eol_mode);
         cJSON_AddNumberToObject(it, "board", (double)(entry->board ? entry->board : zone_board_for_index(zone_id)));
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
-        zone_measure_cfg_t measure;
-        inputs_get_measure_cfg(zone_id, &measure);
-        cJSON_AddStringToObject(it, "measure_mode", zone_measure_mode_to_str(measure.mode));
-        cJSON_AddStringToObject(it, "contact", zone_contact_to_str(measure.contact));
         cJSON_AddBoolToObject(it, "board_online", entry->board_online);
         char board_label[sizeof(((roster_node_t *)0)->label)];
         zone_board_label_copy(entry->board ? entry->board : zone_board_for_index(zone_id),
                               board_label,
                               sizeof(board_label));
         cJSON_AddStringToObject(it, "board_label", board_label);
+        if (entry->board != 0) {
+            cJSON_AddNumberToObject(it, "board_eol_mode", (double)entry->eol_mode);
+        }
         cJSON_AddItemToArray(items, it);
     }
 
@@ -5118,12 +5059,21 @@ static esp_err_t zones_config_post(httpd_req_t* req){
         // nuovo schema: zone_delay/zone_time (con fallback legacy)
         bool z_delay = c->zone_delay;
         uint16_t z_time = c->zone_time;
+        zone_eol_mode_t z_mode = c->eol_mode;
 
         jn = cJSON_GetObjectItemCaseSensitive(it, "zone_delay");
         if(cJSON_IsBool(jn)) z_delay = cJSON_IsTrue(jn);
 
         jn = cJSON_GetObjectItemCaseSensitive(it, "zone_time");
         if(cJSON_IsNumber(jn)) z_time = (uint16_t)jn->valuedouble;
+
+        jn = cJSON_GetObjectItemCaseSensitive(it, "eol_mode");
+        if (cJSON_IsNumber(jn)) {
+            int raw_mode = (int)jn->valuedouble;
+            if (raw_mode < (int)ZONE_EOL_DISABLED) raw_mode = (int)ZONE_EOL_DISABLED;
+            if (raw_mode > (int)ZONE_EOL_TRIPLE) raw_mode = (int)ZONE_EOL_TRIPLE;
+            z_mode = (zone_eol_mode_t)raw_mode;
+        }
 
         // fallback legacy
         jn = cJSON_GetObjectItemCaseSensitive(it, "entry_delay");
@@ -5139,23 +5089,6 @@ static esp_err_t zones_config_post(httpd_req_t* req){
         jn = cJSON_GetObjectItemCaseSensitive(it, "auto_exclude");
         if(cJSON_IsBool(jn)) c->auto_exclude = cJSON_IsTrue(jn);
 
-        zone_measure_cfg_t measure_cfg;
-        inputs_get_measure_cfg(id, &measure_cfg);
-        jn = cJSON_GetObjectItemCaseSensitive(it, "measure_mode");
-        if (cJSON_IsString(jn) && jn->valuestring) {
-            zone_measure_mode_t mode;
-            if (zone_measure_mode_from_str(jn->valuestring, &mode)) {
-                measure_cfg.mode = mode;
-            }
-        }
-        jn = cJSON_GetObjectItemCaseSensitive(it, "contact");
-        if (cJSON_IsString(jn) && jn->valuestring) {
-            zone_contact_t contact;
-            if (zone_contact_from_str(jn->valuestring, &contact)) {
-                measure_cfg.contact = contact;
-            }
-        }
-
         uint8_t board = zone_board_for_index(id);
         jn = cJSON_GetObjectItemCaseSensitive(it, "board");
         if (cJSON_IsNumber(jn)) {
@@ -5167,264 +5100,14 @@ static esp_err_t zones_config_post(httpd_req_t* req){
 
         c->zone_delay = z_delay;
         c->zone_time  = z_time;
+        if (id <= zone_local_zone_count()) {
+            c->eol_mode = z_mode;
+        }
         s_zone_board_map[id-1] = board;
-        inputs_set_measure_cfg(id, &measure_cfg);
     }
     cJSON_Delete(json);
     zones_save_to_nvs();
     return json_bool(req, true);
-}
-
-static esp_err_t zones_analog_get(httpd_req_t *req)
-{
-    if (!check_bearer(req) || !is_admin_user(req)) {
-        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
-        return ESP_FAIL;
-    }
-
-    zone_measure_globals_t globals;
-    inputs_get_measure_globals(&globals);
-
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        return ESP_ERR_NO_MEM;
-    }
-
-    cJSON *g = cJSON_AddObjectToObject(root, "globals");
-    if (!g) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        return ESP_ERR_NO_MEM;
-    }
-    cJSON_AddNumberToObject(g, "r_normal", globals.r_normal);
-    cJSON_AddNumberToObject(g, "r_alarm", globals.r_alarm);
-    cJSON_AddNumberToObject(g, "r_tamper", globals.r_tamper);
-    cJSON_AddNumberToObject(g, "r_eol", globals.r_eol);
-    cJSON_AddNumberToObject(g, "short_threshold", globals.short_threshold);
-    cJSON_AddNumberToObject(g, "open_threshold", globals.open_threshold);
-    cJSON_AddNumberToObject(g, "debounce_ms", globals.debounce_ms);
-    cJSON_AddNumberToObject(g, "hysteresis_pct", globals.hysteresis_pct);
-
-    cJSON *zones = cJSON_AddArrayToObject(root, "zones");
-    if (!zones) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        return ESP_ERR_NO_MEM;
-    }
-
-    int master = inputs_master_zone_count();
-    for (int id = 1; id <= master; ++id) {
-        zone_measure_cfg_t cfg;
-        inputs_get_measure_cfg(id, &cfg);
-        cJSON *it = cJSON_CreateObject();
-        if (!it) {
-            continue;
-        }
-        cJSON_AddNumberToObject(it, "id", id);
-        cJSON_AddStringToObject(it, "name", s_zone_cfg[id-1].name);
-        cJSON_AddStringToObject(it, "mode", zone_measure_mode_to_str(cfg.mode));
-        cJSON_AddStringToObject(it, "contact", zone_contact_to_str(cfg.contact));
-        cJSON_AddItemToArray(zones, it);
-    }
-
-    char *out = cJSON_PrintUnformatted(root);
-    esp_err_t res = json_reply(req, out);
-    cJSON_free(out);
-    cJSON_Delete(root);
-    return res;
-}
-
-static esp_err_t zones_analog_post(httpd_req_t *req)
-{
-    if (!check_bearer(req) || !is_admin_user(req)) {
-        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
-        return ESP_FAIL;
-    }
-
-    char body[1024];
-    size_t blen = 0;
-    if (read_body_to_buf(req, body, sizeof(body), &blen) != ESP_OK) {
-        httpd_resp_send_err(req, 400, "body");
-        return ESP_FAIL;
-    }
-    cJSON *json = cJSON_ParseWithLength(body, blen);
-    if (!json) {
-        httpd_resp_send_err(req, 400, "json");
-        return ESP_FAIL;
-    }
-
-    zone_measure_globals_t globals;
-    inputs_get_measure_globals(&globals);
-
-    const cJSON *g = cJSON_GetObjectItemCaseSensitive(json, "globals");
-    if (cJSON_IsObject(g)) {
-        const cJSON *jn;
-        jn = cJSON_GetObjectItemCaseSensitive(g, "r_normal");
-        if (cJSON_IsNumber(jn)) globals.r_normal = (float)jn->valuedouble;
-        jn = cJSON_GetObjectItemCaseSensitive(g, "r_alarm");
-        if (cJSON_IsNumber(jn)) globals.r_alarm = (float)jn->valuedouble;
-        jn = cJSON_GetObjectItemCaseSensitive(g, "r_tamper");
-        if (cJSON_IsNumber(jn)) globals.r_tamper = (float)jn->valuedouble;
-        jn = cJSON_GetObjectItemCaseSensitive(g, "r_eol");
-        if (cJSON_IsNumber(jn)) globals.r_eol = (float)jn->valuedouble;
-        jn = cJSON_GetObjectItemCaseSensitive(g, "short_threshold");
-        if (cJSON_IsNumber(jn)) globals.short_threshold = (float)jn->valuedouble;
-        jn = cJSON_GetObjectItemCaseSensitive(g, "open_threshold");
-        if (cJSON_IsNumber(jn)) globals.open_threshold = (float)jn->valuedouble;
-        jn = cJSON_GetObjectItemCaseSensitive(g, "debounce_ms");
-        if (cJSON_IsNumber(jn)) globals.debounce_ms = (uint16_t)jn->valuedouble;
-        jn = cJSON_GetObjectItemCaseSensitive(g, "hysteresis_pct");
-        if (cJSON_IsNumber(jn)) globals.hysteresis_pct = (float)jn->valuedouble;
-    }
-
-    inputs_set_measure_globals(&globals);
-
-    const cJSON *zones = cJSON_GetObjectItemCaseSensitive(json, "zones");
-    if (cJSON_IsArray(zones)) {
-        cJSON *it = NULL;
-        cJSON_ArrayForEach(it, zones) {
-            const cJSON *jid = cJSON_GetObjectItemCaseSensitive(it, "id");
-            if (!cJSON_IsNumber(jid)) {
-                continue;
-            }
-            int id = jid->valueint;
-            if (id < 1 || id > inputs_master_zone_count()) {
-                continue;
-            }
-            zone_measure_cfg_t cfg;
-            inputs_get_measure_cfg(id, &cfg);
-            const cJSON *jm = cJSON_GetObjectItemCaseSensitive(it, "mode");
-            if (cJSON_IsString(jm) && jm->valuestring) {
-                zone_measure_mode_t mode;
-                if (zone_measure_mode_from_str(jm->valuestring, &mode)) {
-                    cfg.mode = mode;
-                }
-            }
-            const cJSON *jc = cJSON_GetObjectItemCaseSensitive(it, "contact");
-            if (cJSON_IsString(jc) && jc->valuestring) {
-                zone_contact_t contact;
-                if (zone_contact_from_str(jc->valuestring, &contact)) {
-                    cfg.contact = contact;
-                }
-            }
-            inputs_set_measure_cfg(id, &cfg);
-        }
-    }
-
-    cJSON_Delete(json);
-    return json_bool(req, true);
-}
-
-static esp_err_t diagnostics_system_get(httpd_req_t *req)
-{
-    if (!check_bearer(req) || !is_admin_user(req)) {
-        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
-        return ESP_FAIL;
-    }
-
-    inputs_diag_snapshot_t diag;
-    inputs_get_diagnostics(&diag);
-
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    const int total = zones_snapshot_total(&snapshot);
-
-    zone_measure_globals_t globals;
-    inputs_get_measure_globals(&globals);
-
-    float vbias_ref = 12.0f;
-    bool tamper = false;
-    for (int i = 0; i < diag.total_zones; ++i) {
-        const zone_diag_entry_t *entry = &diag.entries[i];
-        if (entry->vbias > 0.1f) {
-            vbias_ref = entry->vbias;
-        }
-        if (entry->status == ZONE_STATUS_TAMPER ||
-            entry->status == ZONE_STATUS_FAULT_OPEN ||
-            entry->status == ZONE_STATUS_FAULT_SHORT) {
-            tamper = true;
-        }
-    }
-
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        return ESP_ERR_NO_MEM;
-    }
-
-    cJSON_AddStringToObject(root, "backend", INPUTS_BACKEND_NAME);
-    cJSON_AddNumberToObject(root, "master_zones", inputs_master_zone_count());
-    cJSON_AddNumberToObject(root, "zones_total", total);
-    cJSON_AddBoolToObject(root, "tamper", tamper);
-
-    cJSON *g = cJSON_AddObjectToObject(root, "globals");
-    if (g) {
-        cJSON_AddNumberToObject(g, "r_normal", globals.r_normal);
-        cJSON_AddNumberToObject(g, "r_alarm", globals.r_alarm);
-        cJSON_AddNumberToObject(g, "r_tamper", globals.r_tamper);
-        cJSON_AddNumberToObject(g, "r_eol", globals.r_eol);
-        cJSON_AddNumberToObject(g, "short_threshold", globals.short_threshold);
-        cJSON_AddNumberToObject(g, "open_threshold", globals.open_threshold);
-        cJSON_AddNumberToObject(g, "debounce_ms", globals.debounce_ms);
-        cJSON_AddNumberToObject(g, "hysteresis_pct", globals.hysteresis_pct);
-    }
-
-    cJSON *expected = cJSON_AddObjectToObject(root, "expected");
-    if (expected) {
-        diag_add_expected(expected, &globals, vbias_ref);
-    }
-
-    cJSON *zones = cJSON_AddArrayToObject(root, "zones");
-    if (!zones) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        return ESP_ERR_NO_MEM;
-    }
-
-    for (int idx = 0; idx < total; ++idx) {
-        const zone_state_entry_t *entry = &snapshot.entries[idx];
-        zone_measure_cfg_t cfg;
-        inputs_get_measure_cfg(idx + 1, &cfg);
-        cJSON *it = cJSON_CreateObject();
-        if (!it) {
-            continue;
-        }
-        cJSON_AddNumberToObject(it, "id", idx + 1);
-        cJSON_AddStringToObject(it, "name", s_zone_cfg[idx].name);
-        cJSON_AddStringToObject(it, "measure_mode", zone_measure_mode_to_str(cfg.mode));
-        cJSON_AddStringToObject(it, "contact", zone_contact_to_str(cfg.contact));
-        cJSON_AddNumberToObject(it, "board", entry->board);
-        cJSON_AddNumberToObject(it, "board_input", entry->board_input);
-        cJSON_AddBoolToObject(it, "board_online", entry->board_online);
-        char board_label[sizeof(((roster_node_t *)0)->label)];
-        zone_board_label_copy(entry->board, board_label, sizeof(board_label));
-        cJSON_AddStringToObject(it, "board_label", board_label);
-        cJSON_AddBoolToObject(it, "known", entry->known);
-        cJSON_AddBoolToObject(it, "active", entry->active);
-        bool master = (entry->board == 0);
-        cJSON_AddBoolToObject(it, "master", master);
-        if (master && idx < diag.total_zones) {
-            const zone_diag_entry_t *d = &diag.entries[idx];
-            cJSON_AddStringToObject(it, "status", zone_status_to_string(d->status));
-            cJSON_AddBoolToObject(it, "present", d->present);
-            cJSON_AddNumberToObject(it, "vz", d->vz);
-            cJSON_AddNumberToObject(it, "vbias", d->vbias);
-            cJSON_AddNumberToObject(it, "rloop", d->rloop);
-            cJSON_AddNumberToObject(it, "code", d->code);
-        } else {
-            bool active = entry->known && entry->active;
-            cJSON_AddStringToObject(it, "status", active ? "alarm" : "normal");
-            cJSON_AddBoolToObject(it, "present", entry->known);
-        }
-        cJSON_AddItemToArray(zones, it);
-    }
-
-    char *out = cJSON_PrintUnformatted(root);
-    esp_err_t res = json_reply(req, out);
-    cJSON_free(out);
-    cJSON_Delete(root);
-    return res;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5676,9 +5359,6 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/zones",              .method = HTTP_GET,  .handler = zones_get },
     { .uri = "/api/zones/config",       .method = HTTP_GET,  .handler = zones_config_get },
     { .uri = "/api/zones/config",       .method = HTTP_POST, .handler = zones_config_post },
-    { .uri = "/api/zones/analog",       .method = HTTP_GET,  .handler = zones_analog_get },
-    { .uri = "/api/zones/analog",       .method = HTTP_POST, .handler = zones_analog_post },
-    { .uri = "/api/diagnostics/system", .method = HTTP_GET,  .handler = diagnostics_system_get },
     { .uri = "/api/scenes",             .method = HTTP_GET,  .handler = scenes_get },
     { .uri = "/api/scenes",             .method = HTTP_POST, .handler = scenes_post },
     { .uri = "/api/logs",               .method = HTTP_GET,  .handler = logs_get },

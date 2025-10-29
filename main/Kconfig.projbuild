@@ -19,6 +19,94 @@ endchoice
 
 endmenu
 
+menu "ESP32 Alarm Local Zones"
+
+config APP_ZONE_ADS1115_ADDR0
+    hex "ADS1115 #0 I2C address"
+    default 0x48
+    range 0x08 0x77
+    help
+        I2C address of the first ADS1115 connected to the master board. The value
+        must be specified as a 7-bit address without shifting. Make sure the
+        hardware pull-ups match the selected address pins.
+
+config APP_ZONE_ADS1115_ADDR1
+    hex "ADS1115 #1 I2C address"
+    default 0x49
+    range 0x08 0x77
+    help
+        I2C address of the second ADS1115 used for local zones. Set according to
+        the ADDR pin wiring on the PCB.
+
+config APP_ZONE_ADS1115_ADDR2
+    hex "ADS1115 #2 I2C address"
+    default 0x4A
+    range 0x08 0x77
+    help
+        I2C address of the third ADS1115 used for local zones. The address must be
+        unique on the shared I2C bus.
+
+config APP_ZONE_SUPPLY_SENSE
+    bool "Measure real zone supply with ADS1115 input"
+    default y
+    help
+        Reserve one ADS1115 input to measure the actual zone supply voltage. When
+        enabled the system exposes 10 local zones; when disabled all 12 ADS1115
+        inputs are available for zones.
+
+if APP_ZONE_SUPPLY_SENSE
+
+config APP_ZONE_SUPPLY_ADC_INDEX
+    int "ADS1115 index used for supply sense"
+    default 2
+    range 0 2
+    help
+        Select which ADS1115 (0-based index) is wired to the supply sense divider.
+
+config APP_ZONE_SUPPLY_ADC_CHANNEL
+    int "ADS1115 channel used for supply sense"
+    default 2
+    range 0 3
+    help
+        Select the single-ended ADS1115 channel used to sample the supply divider.
+
+config APP_ZONE_SUPPLY_SCALE_NUM
+    int "Supply scale numerator"
+    default 4
+    range 1 64
+    help
+        Scaling factor numerator applied to the measured millivolts to reconstruct
+        the actual supply voltage. The final scale factor is numerator divided by
+        denominator.
+
+config APP_ZONE_SUPPLY_SCALE_DEN
+    int "Supply scale denominator"
+    default 1
+    range 1 64
+    help
+        Scaling factor denominator applied together with the numerator to compute
+        the real supply voltage.
+
+config APP_ZONE_SUPPLY_MIN_MV
+    int "Minimum valid supply reading (mV)"
+    default 6000
+    range 0 30000
+    help
+        Minimum allowed supply voltage reported after scaling. Measured values are
+        clamped to this bound to filter noise.
+
+config APP_ZONE_SUPPLY_MAX_MV
+    int "Maximum valid supply reading (mV)"
+    default 15000
+    range 0 60000
+    help
+        Maximum allowed supply voltage reported after scaling. Values above the
+        threshold are clamped to this limit.
+
+endif # APP_ZONE_SUPPLY_SENSE
+
+endmenu
+
 menu "ESP32 Alarm Cloud Connectivity"
 
 config APP_CLOUD_MQTT_URI
