@@ -273,6 +273,28 @@ static bool check_bearer(httpd_req_t* req){
     return auth_check_bearer(req, NULL);
 }
 
+static esp_err_t send_bearer_unauthorized(httpd_req_t* req)
+{
+    if (!req) {
+        return ESP_FAIL;
+    }
+
+    set_https_security_headers(req);
+    httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Connection", "close");
+
+    static const char payload[] = "{\"error\":\"token\"}";
+    esp_err_t err = httpd_resp_send(req, payload, HTTPD_RESP_USE_STRLEN);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to send bearer unauthorized response: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    httpd_sess_trigger_close(req);
+    return ESP_OK;
+}
+
 static bool is_admin_user(httpd_req_t* req){
     user_info_t u; return auth_check_bearer(req, &u) && u.role==ROLE_ADMIN;
 }
@@ -541,8 +563,7 @@ esp_err_t web_server_ws_broadcast_event(const char *event, cJSON *fields)
 static esp_err_t ws_handler(httpd_req_t *req)
 {
     if (!check_bearer(req)) {
-        httpd_resp_send_err(req, 401, "token");
-        return ESP_FAIL;
+        return send_bearer_unauthorized(req);
     }
     if (req->method == HTTP_GET) {
         int fd = httpd_req_to_sockfd(req);
@@ -782,8 +803,7 @@ static bool web_uri_match(const char *reference_uri,
 static esp_err_t api_can_nodes_get(httpd_req_t *req)
 {
     if (s_provisioned && !check_bearer(req)) {
-        httpd_resp_send_err(req, 401, "token");
-        return ESP_FAIL;
+        return send_bearer_unauthorized(req);
     }
     cors_apply(req);
     cJSON *array = cJSON_CreateArray();
@@ -803,8 +823,7 @@ static esp_err_t api_can_nodes_options(httpd_req_t *req)
 static esp_err_t api_can_scan_post(httpd_req_t *req)
 {
     if (s_provisioned && !check_bearer(req)) {
-        httpd_resp_send_err(req, 401, "token");
-        return ESP_FAIL;
+        return send_bearer_unauthorized(req);
     }
     cors_apply(req);
     bool started = false;
@@ -1015,8 +1034,7 @@ static esp_err_t api_can_node_delete_options(httpd_req_t *req)
 static esp_err_t api_can_node_outputs_post(httpd_req_t *req)
 {
     if (!check_bearer(req)) {
-        httpd_resp_send_err(req, 401, "token");
-        return ESP_FAIL;
+        return send_bearer_unauthorized(req);
     }
     uint8_t node_id = 0;
     if (!parse_can_node_outputs_uri(req->uri, &node_id) || node_id == 0) {
@@ -1353,8 +1371,7 @@ static esp_err_t api_can_node_label_options(httpd_req_t *req)
 static esp_err_t api_can_node_identify_post(httpd_req_t *req)
 {
     if (!check_bearer(req)) {
-        httpd_resp_send_err(req, 401, "token");
-        return ESP_FAIL;
+        return send_bearer_unauthorized(req);
     }
     uint8_t node_id = 0;
     if (!parse_can_node_id(req->uri, &node_id) || node_id == 0) {
@@ -2314,7 +2331,7 @@ static esp_err_t sys_mqtt_reveal_post(httpd_req_t* req){
 
     char admin[32] = {0};
     if (!current_user_from_req(req, admin, sizeof(admin))){
-        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+        return send_bearer_unauthorized(req);
     }
 
     char body[128]; size_t bl = 0;
@@ -2993,17 +3010,17 @@ static esp_err_t json_bool(httpd_req_t* req, bool v){
 }
 
 static esp_err_t user_get_totp(httpd_req_t* req){
-    if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, 401, "token"), ESP_FAIL;
+    if(!check_bearer(req)) return send_bearer_unauthorized(req);
+    char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return send_bearer_unauthorized(req);
     bool enabled = auth_totp_enabled(uname);
     char buf[64]; snprintf(buf, sizeof(buf), "{\"enabled\":%s}", enabled?"true":"false");
     return json_reply(req, buf);
 }
 
 static esp_err_t user_post_password(httpd_req_t* req){
-    if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    if(!check_bearer(req)) return send_bearer_unauthorized(req);
     char uname[32]={0}; 
-    if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    if(!current_user_from_req(req, uname, sizeof(uname))) return send_bearer_unauthorized(req);
 
     char body[WEB_MAX_BODY_LEN]; size_t blen = 0;
     if(read_body_to_buf(req, body, sizeof(body), &blen)!=ESP_OK) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body"), ESP_FAIL;
@@ -3029,8 +3046,8 @@ static esp_err_t user_post_password(httpd_req_t* req){
 }
 
 static esp_err_t user_post_totp_enable(httpd_req_t* req){
-    if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, 401, "token"), ESP_FAIL;
+    if(!check_bearer(req)) return send_bearer_unauthorized(req);
+    char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return send_bearer_unauthorized(req);
 
     char secret[64]={0};
     // 160 bit -> base32
@@ -3058,8 +3075,8 @@ static esp_err_t user_post_totp_enable(httpd_req_t* req){
 }
 
 static esp_err_t user_post_totp_confirm(httpd_req_t* req){
-    if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, 401, "token"), ESP_FAIL;
+    if(!check_bearer(req)) return send_bearer_unauthorized(req);
+    char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return send_bearer_unauthorized(req);
 
     char body[128]; size_t blen = 0;
     if(read_body_to_buf(req, body, sizeof(body), &blen)!=ESP_OK) return httpd_resp_send_err(req, 400, "body"), ESP_FAIL;
@@ -3094,8 +3111,8 @@ static esp_err_t user_post_totp_confirm(httpd_req_t* req){
 }
 
 static esp_err_t user_post_totp_disable(httpd_req_t* req){
-    if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
-    char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, 401, "token"), ESP_FAIL;
+    if(!check_bearer(req)) return send_bearer_unauthorized(req);
+    char uname[16]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return send_bearer_unauthorized(req);
 
     auth_totp_clear_pending(req);
     if(auth_totp_disable(uname)!=ESP_OK) return httpd_resp_send_err(req, 500, "disable"), ESP_FAIL;
@@ -4276,8 +4293,7 @@ static size_t json_escape_string(const char *src, char *dst, size_t dst_cap)
 
 static esp_err_t logs_get(httpd_req_t* req){
     if (!check_bearer(req)) {
-        httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token");
-        return ESP_FAIL;
+        return send_bearer_unauthorized(req);
     }
 
     logs_filter_t filter;
@@ -4641,7 +4657,9 @@ static esp_err_t logs_delete_post(httpd_req_t* req){
 }
 
 static esp_err_t status_get(httpd_req_t* req){
-    if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
+    if (!check_bearer(req)) {
+        return send_bearer_unauthorized(req);
+    }
 
     provisioning_general_config_t general;
     provisioning_load_general(&general);
@@ -4742,7 +4760,9 @@ static esp_err_t status_get(httpd_req_t* req){
 }
 
 static esp_err_t zones_get(httpd_req_t* req){
-    if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
+    if (!check_bearer(req)) {
+        return send_bearer_unauthorized(req);
+    }
     zones_snapshot_t snapshot;
     zones_snapshot_build(&snapshot);
     const int total = zones_snapshot_total(&snapshot);
@@ -4819,7 +4839,9 @@ static esp_err_t zones_get(httpd_req_t* req){
 }
 
 static esp_err_t scenes_get(httpd_req_t* req){
-    if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
+    if (!check_bearer(req)) {
+        return send_bearer_unauthorized(req);
+    }
     zone_mask_t h, n, c, a;
     scenes_get_mask(SCENE_HOME,  &h);
     scenes_get_mask(SCENE_NIGHT, &n);
@@ -4978,7 +5000,7 @@ static esp_err_t scenes_post(httpd_req_t* req){
 
 // GET /api/zones/config
 static esp_err_t zones_config_get(httpd_req_t* req){
-    if(!check_bearer(req)) return httpd_resp_send_err(req,401,"token"), ESP_FAIL;
+    if(!check_bearer(req)) return send_bearer_unauthorized(req);
 
     zones_snapshot_t snapshot;
     zones_snapshot_build(&snapshot);
@@ -5524,10 +5546,10 @@ static void web_server_restart_async(void){
 
 static esp_err_t arm_post(httpd_req_t* req)
 {
-    if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    if(!check_bearer(req)) return send_bearer_unauthorized(req);
     char user[32]={0};
     user_info_t info;
-    if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    if (!auth_check_bearer(req, &info)) return send_bearer_unauthorized(req);
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
 
 
@@ -5685,12 +5707,12 @@ static esp_err_t arm_post(httpd_req_t* req)
 static esp_err_t tamper_reset_post(httpd_req_t* req)
 {
     if (!check_bearer(req)) {
-        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+        return send_bearer_unauthorized(req);
     }
 
     char user[32] = {0};
     if (!current_user_from_req(req, user, sizeof(user))) {
-        return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+        return send_bearer_unauthorized(req);
     }
 
     char body[128]; size_t bl = 0;
@@ -5776,10 +5798,10 @@ static esp_err_t tamper_reset_post(httpd_req_t* req)
 
 static esp_err_t disarm_post(httpd_req_t* req)
 {
-    if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    if(!check_bearer(req)) return send_bearer_unauthorized(req);
     char user[32]={0};
     user_info_t info;
-    if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    if (!auth_check_bearer(req, &info)) return send_bearer_unauthorized(req);
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
 
 
@@ -5839,10 +5861,10 @@ static esp_err_t disarm_post(httpd_req_t* req)
 
 static esp_err_t user_post_pin(httpd_req_t* req)
 {
-    if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    if(!check_bearer(req)) return send_bearer_unauthorized(req);
     char user[32]={0};
     user_info_t info;
-    if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
+    if (!auth_check_bearer(req, &info)) return send_bearer_unauthorized(req);
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
 
     char body[WEB_MAX_BODY_LEN]; size_t blen = 0;
