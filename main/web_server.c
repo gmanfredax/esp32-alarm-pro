@@ -282,17 +282,14 @@ static esp_err_t send_bearer_unauthorized(httpd_req_t* req)
     set_https_security_headers(req);
     httpd_resp_set_status(req, "401 Unauthorized");
     httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Connection", "close");
 
     static const char payload[] = "{\"error\":\"token\"}";
     esp_err_t err = httpd_resp_send(req, payload, HTTPD_RESP_USE_STRLEN);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Failed to send bearer unauthorized response: %s", esp_err_to_name(err));
-        return err;
     }
 
-    httpd_sess_trigger_close(req);
-    return ESP_OK;
+    return ESP_FAIL;
 }
 
 static bool is_admin_user(httpd_req_t* req){
@@ -3492,6 +3489,11 @@ typedef struct {
 static zone_cfg_t s_zone_cfg[ZONE_CONFIG_CAPACITY];
 static uint8_t    s_zone_board_map[ZONE_CONFIG_CAPACITY];
 
+static zones_snapshot_t *zones_snapshot_alloc(void)
+{
+    return (zones_snapshot_t *)calloc(1, sizeof(zones_snapshot_t));
+}
+
 static void zone_board_label_copy(uint8_t board_id, char *out, size_t cap)
 {
     if (!out || cap == 0) {
@@ -4695,17 +4697,22 @@ static esp_err_t status_get(httpd_req_t* req){
     uint16_t outmask = 0;
     outputs_get_mask(&outmask);
 
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    const int zones_total = zones_snapshot_total(&snapshot);
+    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    if (!snapshot) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    const int zones_total = zones_snapshot_total(snapshot);
     for (int idx = 0; idx < zones_total; ++idx) {
-        if (snapshot.entries[idx].tamper) {
+        if (snapshot->entries[idx].tamper) {
             tamper = true;
             break;
         }
     }
     cJSON *root = cJSON_CreateObject();
     if (!root) {
+        free(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
@@ -4717,7 +4724,7 @@ static esp_err_t status_get(httpd_req_t* req){
     cJSON *zones_known = cJSON_CreateArray();
     if (zones && zones_known) {
         for (int idx = 0; idx < zones_total; ++idx) {
-            const zone_state_entry_t *entry = &snapshot.entries[idx];
+            const zone_state_entry_t *entry = &snapshot->entries[idx];
             bool alarm_like = entry->active || entry->tamper || entry->fault;
             cJSON_AddItemToArray(zones, cJSON_CreateBool(alarm_like));
             cJSON_AddItemToArray(zones_known, cJSON_CreateBool(entry->known));
@@ -4750,12 +4757,14 @@ static esp_err_t status_get(httpd_req_t* req){
     if (!out) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        free(snapshot);
         return ESP_ERR_NO_MEM;
     }
 
     esp_err_t err = json_reply(req, out);
     cJSON_free(out);
     cJSON_Delete(root);
+    free(snapshot);
     return err;
 }
 
@@ -4763,18 +4772,24 @@ static esp_err_t zones_get(httpd_req_t* req){
     if (!check_bearer(req)) {
         return send_bearer_unauthorized(req);
     }
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    const int total = zones_snapshot_total(&snapshot);
+    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    if (!snapshot) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    const int total = zones_snapshot_total(snapshot);
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
+        free(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
 
     cJSON *arr  = cJSON_CreateArray();
-    if (!root) {
+    if (!arr) {
+        cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
@@ -4784,7 +4799,7 @@ static esp_err_t zones_get(httpd_req_t* req){
 
     for(int idx = 0; idx < total; ++idx){
         const int zone_id = idx + 1;
-        const zone_state_entry_t *entry = &snapshot.entries[idx];
+        const zone_state_entry_t *entry = &snapshot->entries[idx];
         cJSON *it = cJSON_CreateObject();
         if (!it) {
             continue;
@@ -4831,11 +4846,9 @@ static esp_err_t zones_get(httpd_req_t* req){
         }
         cJSON_AddItemToArray(arr, it);
     }
-    char *out = cJSON_PrintUnformatted(root);
-    esp_err_t e = json_reply(req, out);
-    cJSON_free(out);
-    cJSON_Delete(root);
-    return e;
+    esp_err_t err = json_reply_cjson(req, root);
+    free(snapshot);
+    return err;
 }
 
 static esp_err_t scenes_get(httpd_req_t* req){
@@ -5002,12 +5015,17 @@ static esp_err_t scenes_post(httpd_req_t* req){
 static esp_err_t zones_config_get(httpd_req_t* req){
     if(!check_bearer(req)) return send_bearer_unauthorized(req);
 
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    const int total = zones_snapshot_total(&snapshot);
+    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    if (!snapshot) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    const int total = zones_snapshot_total(snapshot);
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
+        free(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
@@ -5016,6 +5034,7 @@ static esp_err_t zones_config_get(httpd_req_t* req){
     if (!items) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        free(snapshot);
         return ESP_ERR_NO_MEM;
     }
     cJSON_AddItemToObject(root, "items", items);
@@ -5023,7 +5042,7 @@ static esp_err_t zones_config_get(httpd_req_t* req){
     for (int idx = 0; idx < total; ++idx) {
         const int zone_id = idx + 1;
         zone_cfg_t *cfg = &s_zone_cfg[idx];
-        const zone_state_entry_t *entry = &snapshot.entries[idx];
+        const zone_state_entry_t *entry = &snapshot->entries[idx];
         cJSON *it = cJSON_CreateObject();
         if (!it) {
             continue;
@@ -5052,6 +5071,7 @@ static esp_err_t zones_config_get(httpd_req_t* req){
     esp_err_t res = json_reply(req, out);
     cJSON_free(out);
     cJSON_Delete(root);
+    free(snapshot);
     return res;
 }
 
@@ -5592,9 +5612,12 @@ static esp_err_t arm_post(httpd_req_t* req)
     zone_mask_and(&eff_mask, &eff_mask, &scene_mask);
 
     // 3) Costruisci elenco zone aperte e bypass automatico (auto_exclude)
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    int snapshot_total = zones_snapshot_total(&snapshot);
+    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    if (!snapshot) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"), ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    int snapshot_total = zones_snapshot_total(snapshot);
     if (snapshot_total > zones_total) {
         snapshot_total = zones_total;
     }
@@ -5602,10 +5625,11 @@ static esp_err_t arm_post(httpd_req_t* req)
     zone_mask_t open_mask;
     zone_mask_clear(&open_mask);
     for (int idx = 0; idx < snapshot_total; ++idx){
-        const zone_state_entry_t *entry = &snapshot.entries[idx];
+        const zone_state_entry_t *entry = &snapshot->entries[idx];
         if (entry->known && entry->active) zone_mask_set(&open_mask, (uint16_t)idx);
     }
     zone_mask_limit(&open_mask, (uint16_t)zones_total);
+    free(snapshot);
 
     zone_mask_t blocking;
     zone_mask_t bypass_mask;
