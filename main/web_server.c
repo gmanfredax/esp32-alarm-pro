@@ -3489,9 +3489,51 @@ typedef struct {
 static zone_cfg_t s_zone_cfg[ZONE_CONFIG_CAPACITY];
 static uint8_t    s_zone_board_map[ZONE_CONFIG_CAPACITY];
 
-static zones_snapshot_t *zones_snapshot_alloc(void)
+static zones_snapshot_t s_zone_snapshot_fallback;
+static SemaphoreHandle_t s_zone_snapshot_lock;
+static StaticSemaphore_t s_zone_snapshot_lock_buf;
+
+static bool zones_snapshot_lock_init(void)
 {
-    return (zones_snapshot_t *)calloc(1, sizeof(zones_snapshot_t));
+    if (s_zone_snapshot_lock) {
+        return true;
+    }
+    s_zone_snapshot_lock = xSemaphoreCreateMutexStatic(&s_zone_snapshot_lock_buf);
+    return (s_zone_snapshot_lock != NULL);
+}
+
+static zones_snapshot_t *zones_snapshot_acquire(void)
+{
+    zones_snapshot_t *snap = (zones_snapshot_t *)calloc(1, sizeof(zones_snapshot_t));
+    if (snap) {
+        return snap;
+    }
+
+    if (!zones_snapshot_lock_init()) {
+        return NULL;
+    }
+
+    if (xSemaphoreTake(s_zone_snapshot_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return NULL;
+    }
+
+    memset(&s_zone_snapshot_fallback, 0, sizeof(s_zone_snapshot_fallback));
+    return &s_zone_snapshot_fallback;
+}
+
+static void zones_snapshot_release(zones_snapshot_t *snap)
+{
+    if (!snap) {
+        return;
+    }
+
+    if (snap == &s_zone_snapshot_fallback) {
+        if (s_zone_snapshot_lock) {
+            xSemaphoreGive(s_zone_snapshot_lock);
+        }
+    } else {
+        free(snap);
+    }
 }
 
 static void zone_board_label_copy(uint8_t board_id, char *out, size_t cap)
@@ -3721,6 +3763,53 @@ static void zones_save_to_nvs(void){
 #define LOGS_DEFAULT_LIMIT     64
 #define LOGS_MAX_FETCH         128
 #define LOGS_EVENT_FILTER_MAX  8
+
+static audit_entry_t s_logs_entries_fallback[LOGS_MAX_FETCH];
+static SemaphoreHandle_t s_logs_entries_lock;
+static StaticSemaphore_t s_logs_entries_lock_buf;
+
+static bool logs_entries_lock_init(void)
+{
+    if (s_logs_entries_lock) {
+        return true;
+    }
+    s_logs_entries_lock = xSemaphoreCreateMutexStatic(&s_logs_entries_lock_buf);
+    return (s_logs_entries_lock != NULL);
+}
+
+static audit_entry_t *logs_entries_acquire(void)
+{
+    audit_entry_t *buf = (audit_entry_t *)calloc(LOGS_MAX_FETCH, sizeof(audit_entry_t));
+    if (buf) {
+        return buf;
+    }
+
+    if (!logs_entries_lock_init()) {
+        return NULL;
+    }
+
+    if (xSemaphoreTake(s_logs_entries_lock, pdMS_TO_TICKS(200)) != pdTRUE) {
+        return NULL;
+    }
+
+    memset(s_logs_entries_fallback, 0, sizeof(s_logs_entries_fallback));
+    return s_logs_entries_fallback;
+}
+
+static void logs_entries_release(audit_entry_t *buf)
+{
+    if (!buf) {
+        return;
+    }
+
+    if (buf == s_logs_entries_fallback) {
+        if (s_logs_entries_lock) {
+            xSemaphoreGive(s_logs_entries_lock);
+        }
+    } else {
+        free(buf);
+    }
+}
 
 typedef struct {
     int limit;
@@ -4293,6 +4382,11 @@ static size_t json_escape_string(const char *src, char *dst, size_t dst_cap)
     return out;
 }
 
+static inline const char *json_bool_str(bool value)
+{
+    return value ? "true" : "false";
+}
+
 static esp_err_t logs_get(httpd_req_t* req){
     if (!check_bearer(req)) {
         return send_bearer_unauthorized(req);
@@ -4301,7 +4395,7 @@ static esp_err_t logs_get(httpd_req_t* req){
     logs_filter_t filter;
     logs_filter_parse(req, &filter);
 
-    audit_entry_t *entries_buf = calloc(LOGS_MAX_FETCH, sizeof(audit_entry_t));
+    audit_entry_t *entries_buf = logs_entries_acquire();
     if (!entries_buf) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
@@ -4423,7 +4517,7 @@ static esp_err_t logs_get(httpd_req_t* req){
 
     esp_err_t send_err = httpd_resp_sendstr_chunk(req, "{\"entries\":[");
     if (send_err != ESP_OK) {
-        free(entries_buf);
+        logs_entries_release(entries_buf);
         return send_err;
     }
 
@@ -4457,7 +4551,7 @@ static esp_err_t logs_get(httpd_req_t* req){
         if (!first) {
             send_err = httpd_resp_sendstr_chunk(req, ",");
             if (send_err != ESP_OK) {
-                free(entries_buf);
+                logs_entries_release(entries_buf);
                 return send_err;
             }
         }
@@ -4529,7 +4623,7 @@ static esp_err_t logs_get(httpd_req_t* req){
 
         send_err = httpd_resp_sendstr_chunk(req, entry_buf);
         if (send_err != ESP_OK) {
-            free(entries_buf);
+            logs_entries_release(entries_buf);
             return send_err;
         }
         first = false;
@@ -4579,12 +4673,12 @@ static esp_err_t logs_get(httpd_req_t* req){
     }
     send_err = httpd_resp_sendstr_chunk(req, meta);
     if (send_err != ESP_OK) {
-        free(entries_buf);
+        logs_entries_release(entries_buf);
         return send_err;
     }
 
     send_err = httpd_resp_sendstr_chunk(req, NULL);
-    free(entries_buf);
+    logs_entries_release(entries_buf);
     return send_err;
 }
 
@@ -4697,7 +4791,7 @@ static esp_err_t status_get(httpd_req_t* req){
     uint16_t outmask = 0;
     outputs_get_mask(&outmask);
 
-    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    zones_snapshot_t *snapshot = zones_snapshot_acquire();
     if (!snapshot) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
@@ -4712,7 +4806,7 @@ static esp_err_t status_get(httpd_req_t* req){
     }
     cJSON *root = cJSON_CreateObject();
     if (!root) {
-        free(snapshot);
+        zones_snapshot_release(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
@@ -4757,14 +4851,14 @@ static esp_err_t status_get(httpd_req_t* req){
     if (!out) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        free(snapshot);
+        zones_snapshot_release(snapshot);
         return ESP_ERR_NO_MEM;
     }
 
     esp_err_t err = json_reply(req, out);
     cJSON_free(out);
     cJSON_Delete(root);
-    free(snapshot);
+    zones_snapshot_release(snapshot);
     return err;
 }
 
@@ -4772,7 +4866,7 @@ static esp_err_t zones_get(httpd_req_t* req){
     if (!check_bearer(req)) {
         return send_bearer_unauthorized(req);
     }
-    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    zones_snapshot_t *snapshot = zones_snapshot_acquire();
     if (!snapshot) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
@@ -4780,75 +4874,136 @@ static esp_err_t zones_get(httpd_req_t* req){
     zones_snapshot_build(snapshot);
     const int total = zones_snapshot_total(snapshot);
 
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        free(snapshot);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        return ESP_ERR_NO_MEM;
+    set_https_security_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    esp_err_t res = httpd_resp_sendstr_chunk(req, "{\"zones\":[");
+    if (res != ESP_OK) {
+        zones_snapshot_release(snapshot);
+        return res;
     }
 
-    cJSON *arr  = cJSON_CreateArray();
-    if (!arr) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        return ESP_ERR_NO_MEM;
-    }
-
-    cJSON_AddItemToObject(root, "zones", arr);
-    cJSON_AddNumberToObject(root, "total", total);
-
-    for(int idx = 0; idx < total; ++idx){
+    char chunk[768];
+    for (int idx = 0; idx < total; ++idx) {
         const int zone_id = idx + 1;
         const zone_state_entry_t *entry = &snapshot->entries[idx];
-        cJSON *it = cJSON_CreateObject();
-        if (!it) {
-            continue;
-        }
         zone_cfg_t *cfg = &s_zone_cfg[idx];
-        const char *zname = NULL;
-        char tmp[48];
+
+        char tmp_name[48];
+        const char *raw_name = "";
         if (cfg && cfg->name[0]) {
-            zname = cfg->name;
+            raw_name = cfg->name;
         } else if (entry->board != 0) {
-            snprintf(tmp, sizeof(tmp), "Exp %u Z%u", (unsigned)entry->board, (unsigned)(entry->board_input + 1));
-            zname = tmp;
+            snprintf(tmp_name, sizeof(tmp_name), "Exp %u Z%u", (unsigned)entry->board, (unsigned)(entry->board_input + 1));
+            raw_name = tmp_name;
         } else {
-            snprintf(tmp, sizeof(tmp), "Z%d", zone_id);
-            zname = tmp;
+            snprintf(tmp_name, sizeof(tmp_name), "Z%d", zone_id);
+            raw_name = tmp_name;
         }
-        cJSON_AddNumberToObject(it, "id", zone_id);
-        cJSON_AddStringToObject(it, "name", zname ? zname : "");
-        cJSON_AddBoolToObject(it, "known", entry->known);
-        cJSON_AddBoolToObject(it, "active", entry->known ? entry->active : false);
-        cJSON_AddBoolToObject(it, "tamper", entry->known ? entry->tamper : false);
-        cJSON_AddBoolToObject(it, "fault", entry->known ? entry->fault : false);
-        cJSON_AddBoolToObject(it, "analog", entry->analog);
-        cJSON_AddStringToObject(it, "state", zone_line_state_name(entry->line_state));
-        cJSON_AddNumberToObject(it, "eol_mode", (double)entry->eol_mode);
-        if (entry->analog) {
-            cJSON_AddNumberToObject(it, "millivolts", (double)entry->millivolts);
-            cJSON_AddNumberToObject(it, "ratio", entry->ratio);
-        }
-        cJSON_AddBoolToObject(it, "board_online", entry->board_online);
-        cJSON_AddNumberToObject(it, "board", (double)entry->board);
-        cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
+
+        char name_json[64];
+        json_escape_string(raw_name, name_json, sizeof(name_json));
+
+        const char *state = zone_line_state_name(entry->line_state);
+        char state_json[32];
+        json_escape_string(state, state_json, sizeof(state_json));
+
         char board_label[sizeof(((roster_node_t *)0)->label)];
         zone_board_label_copy(entry->board, board_label, sizeof(board_label));
-        cJSON_AddStringToObject(it, "board_label", board_label);
-        if (cfg) {
-            cJSON_AddBoolToObject(it, "auto_exclude", cfg->auto_exclude);
-            cJSON_AddBoolToObject(it, "zone_delay", cfg->zone_delay);
-            cJSON_AddNumberToObject(it, "zone_time", (double)cfg->zone_time);
-        } else {
-            cJSON_AddBoolToObject(it, "auto_exclude", false);
-            cJSON_AddBoolToObject(it, "zone_delay", false);
-            cJSON_AddNumberToObject(it, "zone_time", 0);
+        char board_label_json[96];
+        json_escape_string(board_label, board_label_json, sizeof(board_label_json));
+
+        bool cfg_auto_exclude = cfg ? cfg->auto_exclude : false;
+        bool cfg_zone_delay = cfg ? cfg->zone_delay : false;
+        unsigned cfg_zone_time = cfg ? (unsigned)cfg->zone_time : 0u;
+
+        int used = snprintf(chunk,
+                            sizeof(chunk),
+                            "%s{\"id\":%d,\"name\":\"%s\",\"known\":%s,\"active\":%s,\"tamper\":%s,"
+                            "\"fault\":%s,\"analog\":%s,\"state\":\"%s\",\"eol_mode\":%d",
+                            (idx == 0) ? "" : ",",
+                            zone_id,
+                            name_json,
+                            json_bool_str(entry->known),
+                            json_bool_str(entry->known && entry->active),
+                            json_bool_str(entry->known && entry->tamper),
+                            json_bool_str(entry->known && entry->fault),
+                            json_bool_str(entry->analog),
+                            state_json,
+                            (int)entry->eol_mode);
+        if (used < 0 || used >= (int)sizeof(chunk)) {
+            zones_snapshot_release(snapshot);
+            return ESP_ERR_NO_MEM;
         }
-        cJSON_AddItemToArray(arr, it);
+
+        if (entry->analog) {
+            int add = snprintf(chunk + used,
+                               sizeof(chunk) - (size_t)used,
+                               ",\"millivolts\":%ld,\"ratio\":%.6f",
+                               (long)entry->millivolts,
+                               (double)entry->ratio);
+            if (add < 0 || add >= (int)(sizeof(chunk) - (size_t)used)) {
+                zones_snapshot_release(snapshot);
+                return ESP_ERR_NO_MEM;
+            }
+            used += add;
+        }
+
+        int add = snprintf(chunk + used,
+                           sizeof(chunk) - (size_t)used,
+                           ",\"board_online\":%s,\"board\":%u,\"board_input\":%u,\"board_label\":\"%s\"",
+                           json_bool_str(entry->board_online),
+                           (unsigned)entry->board,
+                           (unsigned)(entry->board_input + 1u),
+                           board_label_json);
+        if (add < 0 || add >= (int)(sizeof(chunk) - (size_t)used)) {
+            zones_snapshot_release(snapshot);
+            return ESP_ERR_NO_MEM;
+        }
+        used += add;
+
+        if (entry->board != 0) {
+            add = snprintf(chunk + used,
+                           sizeof(chunk) - (size_t)used,
+                           ",\"board_eol_mode\":%d",
+                           (int)entry->eol_mode);
+            if (add < 0 || add >= (int)(sizeof(chunk) - (size_t)used)) {
+                zones_snapshot_release(snapshot);
+                return ESP_ERR_NO_MEM;
+            }
+            used += add;
+        }
+
+        add = snprintf(chunk + used,
+                        sizeof(chunk) - (size_t)used,
+                        ",\"auto_exclude\":%s,\"zone_delay\":%s,\"zone_time\":%u}",
+                        json_bool_str(cfg_auto_exclude),
+                        json_bool_str(cfg_zone_delay),
+                        cfg_zone_time);
+        if (add < 0 || add >= (int)(sizeof(chunk) - (size_t)used)) {
+            zones_snapshot_release(snapshot);
+            return ESP_ERR_NO_MEM;
+        }
+        used += add;
+
+        res = httpd_resp_send_chunk(req, chunk, (size_t)used);
+        if (res != ESP_OK) {
+            zones_snapshot_release(snapshot);
+            return res;
+        }
     }
-    esp_err_t err = json_reply_cjson(req, root);
-    free(snapshot);
-    return err;
+
+    int final_len = snprintf(chunk, sizeof(chunk), "],\"total\":%d}", total);
+    if (final_len < 0 || final_len >= (int)sizeof(chunk)) {
+        zones_snapshot_release(snapshot);
+        return ESP_ERR_NO_MEM;
+    }
+    res = httpd_resp_send_chunk(req, chunk, (size_t)final_len);
+    if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, NULL, 0);
+    }
+    zones_snapshot_release(snapshot);
+    return res;
 }
 
 static esp_err_t scenes_get(httpd_req_t* req){
@@ -5015,7 +5170,7 @@ static esp_err_t scenes_post(httpd_req_t* req){
 static esp_err_t zones_config_get(httpd_req_t* req){
     if(!check_bearer(req)) return send_bearer_unauthorized(req);
 
-    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    zones_snapshot_t *snapshot = zones_snapshot_acquire();
     if (!snapshot) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
@@ -5025,7 +5180,7 @@ static esp_err_t zones_config_get(httpd_req_t* req){
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
-        free(snapshot);
+        zones_snapshot_release(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
@@ -5034,7 +5189,7 @@ static esp_err_t zones_config_get(httpd_req_t* req){
     if (!items) {
         cJSON_Delete(root);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        free(snapshot);
+        zones_snapshot_release(snapshot);
         return ESP_ERR_NO_MEM;
     }
     cJSON_AddItemToObject(root, "items", items);
@@ -5071,7 +5226,7 @@ static esp_err_t zones_config_get(httpd_req_t* req){
     esp_err_t res = json_reply(req, out);
     cJSON_free(out);
     cJSON_Delete(root);
-    free(snapshot);
+    zones_snapshot_release(snapshot);
     return res;
 }
 
@@ -5612,7 +5767,7 @@ static esp_err_t arm_post(httpd_req_t* req)
     zone_mask_and(&eff_mask, &eff_mask, &scene_mask);
 
     // 3) Costruisci elenco zone aperte e bypass automatico (auto_exclude)
-    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    zones_snapshot_t *snapshot = zones_snapshot_acquire();
     if (!snapshot) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"), ESP_ERR_NO_MEM;
     }
@@ -5629,7 +5784,7 @@ static esp_err_t arm_post(httpd_req_t* req)
         if (entry->known && entry->active) zone_mask_set(&open_mask, (uint16_t)idx);
     }
     zone_mask_limit(&open_mask, (uint16_t)zones_total);
-    free(snapshot);
+    zones_snapshot_release(snapshot);
 
     zone_mask_t blocking;
     zone_mask_t bypass_mask;
