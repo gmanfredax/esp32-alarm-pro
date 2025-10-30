@@ -1270,7 +1270,16 @@
     }
     $('#diagRefreshBtn')?.addEventListener('click', () => refreshDiagnostics());
     renderAnalogConfig();
-    return loadAnalogConfig();
+    try {
+      await loadAnalogConfig();
+    } catch (err) {
+      console.warn('analog config load', err);
+    }
+    try {
+      await refreshDiagnostics();
+    } catch (err) {
+      console.warn('diagnostics init', err);
+    }
   }
 
   async function setupExpansionsSection(){

@@ -108,6 +108,7 @@
             <li><button class="btn w-100" data-view="view-mqtt">MQTT</button></li>
             <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
             <li><button class="btn w-100" data-view="view-expansions">Espansioni CAN</button></li>
+            <li><button class="btn w-100" data-view="view-eol">Modalità EOL</button></li>
             <li><button class="btn w-100" data-view="view-diagnostics">Diagnostica Sistema</button></li>
           </ul>
         </aside>
@@ -227,8 +228,8 @@
             </div>
           </section>
 
-          <!-- DIAGNOSTICA SISTEMA -->
-          <section id="view-diagnostics" class="view">
+          <!-- CONFIGURAZIONE EOL -->
+          <section id="view-eol" class="view">
             <div class="card">
               <h3>Configurazione front-end zone</h3>
               <form id="analogConfigForm" class="form" style="margin-top:.6rem">
@@ -256,8 +257,11 @@
                 </table>
               </div>
             </div>
+          </section>
 
-            <div class="card" style="margin-top:1rem">
+          <!-- DIAGNOSTICA SISTEMA -->
+          <section id="view-diagnostics" class="view">
+            <div class="card">
               <div class="row" style="justify-content:space-between;align-items:center;gap:.6rem;flex-wrap:wrap">
                 <h3>Diagnostica sistema</h3>
                 <div class="row" style="gap:.6rem;align-items:center;flex-wrap:wrap">

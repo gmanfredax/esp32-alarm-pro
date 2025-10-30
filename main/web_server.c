@@ -78,6 +78,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 
 #include "lwip/ip4_addr.h"
 #include "lwip/ip_addr.h"
@@ -3455,12 +3456,18 @@ static esp_err_t users_admin_list_get(httpd_req_t* req){
 // STATUS / ZONES / SCENES
 // ─────────────────────────────────────────────────────────────────────────────
 
+typedef enum {
+    ZONE_CONTACT_NC = 0,
+    ZONE_CONTACT_NO = 1,
+} zone_contact_t;
+
 typedef struct {
-    bool           zone_delay;   // ritardo unico abilitato
-    uint16_t       zone_time;    // secondi
-    bool           auto_exclude; // se aperta all'ARM e non ritardata -> bypassabile?
-    char           name[24];
+    bool            zone_delay;   // ritardo unico abilitato
+    uint16_t        zone_time;    // secondi
+    bool            auto_exclude; // se aperta all'ARM e non ritardata -> bypassabile?
+    char            name[24];
     zone_eol_mode_t eol_mode;
+    zone_contact_t  contact;
 } zone_cfg_t;
 
 #define ZONE_CONFIG_CAPACITY ALARM_MAX_ZONES
@@ -3486,8 +3493,31 @@ typedef struct {
     zone_state_entry_t entries[ZONE_CONFIG_CAPACITY];
 } zones_snapshot_t;
 
-static zone_cfg_t s_zone_cfg[ZONE_CONFIG_CAPACITY];
-static uint8_t    s_zone_board_map[ZONE_CONFIG_CAPACITY];
+typedef struct {
+    float    r_normal;
+    float    r_alarm;
+    float    r_tamper;
+    float    r_eol;
+    float    short_threshold;
+    float    open_threshold;
+    uint16_t debounce_ms;
+    float    hysteresis_pct;
+} zone_frontend_globals_t;
+
+static const zone_frontend_globals_t ZONE_FRONTEND_GLOBALS_DEFAULT = {
+    .r_normal = 4700.0f,
+    .r_alarm = 2200.0f,
+    .r_tamper = 8200.0f,
+    .r_eol = 4700.0f,
+    .short_threshold = 1000.0f,
+    .open_threshold = 20000.0f,
+    .debounce_ms = 150u,
+    .hysteresis_pct = 12.0f,
+};
+
+static zone_cfg_t               s_zone_cfg[ZONE_CONFIG_CAPACITY];
+static uint8_t                  s_zone_board_map[ZONE_CONFIG_CAPACITY];
+static zone_frontend_globals_t  s_zone_frontend_globals = {0};
 
 static zones_snapshot_t s_zone_snapshot_fallback;
 static SemaphoreHandle_t s_zone_snapshot_lock;
@@ -3590,6 +3620,101 @@ static void zones_apply_to_alarm(void){
     }
 
     zone_local_apply_modes(local_modes, local_count);
+}
+
+static const char *zone_contact_to_string(zone_contact_t contact)
+{
+    return (contact == ZONE_CONTACT_NO) ? "no" : "nc";
+}
+
+static zone_contact_t zone_contact_from_string(const char *value)
+{
+    if (!value || !value[0]) {
+        return ZONE_CONTACT_NC;
+    }
+    if (strcasecmp(value, "no") == 0) {
+        return ZONE_CONTACT_NO;
+    }
+    return ZONE_CONTACT_NC;
+}
+
+static const char *zone_mode_to_string(zone_eol_mode_t mode)
+{
+    switch (mode) {
+        case ZONE_EOL_DISABLED: return "digital";
+        case ZONE_EOL_SINGLE:   return "eol1";
+        case ZONE_EOL_DOUBLE:   return "eol2";
+        case ZONE_EOL_TRIPLE:   return "eol3";
+        default:                return "digital";
+    }
+}
+
+static zone_eol_mode_t zone_mode_from_string(const char *value)
+{
+    if (!value || !value[0]) {
+        return ZONE_EOL_DOUBLE;
+    }
+    if (strcasecmp(value, "digital") == 0) {
+        return ZONE_EOL_DISABLED;
+    }
+    if (strcasecmp(value, "eol1") == 0) {
+        return ZONE_EOL_SINGLE;
+    }
+    if (strcasecmp(value, "eol2") == 0) {
+        return ZONE_EOL_DOUBLE;
+    }
+    if (strcasecmp(value, "eol3") == 0) {
+        return ZONE_EOL_TRIPLE;
+    }
+    return ZONE_EOL_DOUBLE;
+}
+
+static void zone_display_name(int zone_id,
+                              const zone_state_entry_t *entry,
+                              const zone_cfg_t *cfg,
+                              char *out,
+                              size_t cap)
+{
+    if (!out || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (cfg && cfg->name[0]) {
+        strlcpy(out, cfg->name, cap);
+        return;
+    }
+    if (entry && entry->board != 0) {
+        snprintf(out, cap, "Exp %u Z%u", (unsigned)entry->board, (unsigned)(entry->board_input + 1u));
+        return;
+    }
+    snprintf(out, cap, "Zona %d", zone_id);
+}
+
+static const char *zone_status_key(const zone_state_entry_t *entry)
+{
+    if (!entry || !entry->known) {
+        return "unknown";
+    }
+    switch (entry->line_state) {
+        case ZONE_LINE_SECURE:       return "normal";
+        case ZONE_LINE_ALARM:        return "alarm";
+        case ZONE_LINE_TAMPER_OPEN:  return "tamper";
+        case ZONE_LINE_TAMPER_SHORT: return "fault_short";
+        case ZONE_LINE_FAULT:        return "fault_open";
+        case ZONE_LINE_UNKNOWN:
+        default:
+            break;
+    }
+    if (entry->fault) {
+        return "fault_open";
+    }
+    if (entry->tamper) {
+        return "tamper";
+    }
+    if (entry->active) {
+        return "alarm";
+    }
+    return "unknown";
 }
 
 static void zones_snapshot_build(zones_snapshot_t *snap)
@@ -3705,6 +3830,7 @@ static int zones_effective_total(void)
 static void zones_load_from_nvs(void){
     memset(s_zone_cfg, 0, sizeof(s_zone_cfg));
     memset(s_zone_board_map, 0, sizeof(s_zone_board_map));
+    s_zone_frontend_globals = ZONE_FRONTEND_GLOBALS_DEFAULT;
 
     nvs_handle_t h;
     if (nvs_open("zones", NVS_READONLY, &h) == ESP_OK){
@@ -3739,6 +3865,16 @@ static void zones_load_from_nvs(void){
                 free(buf);
             }
         }
+        size_t globals_sz = sizeof(s_zone_frontend_globals);
+        if (nvs_get_blob(h, "analog_globals", NULL, &globals_sz) == ESP_OK && globals_sz > 0) {
+            zone_frontend_globals_t tmp = ZONE_FRONTEND_GLOBALS_DEFAULT;
+            if (globals_sz > sizeof(tmp)) {
+                globals_sz = sizeof(tmp);
+            }
+            if (nvs_get_blob(h, "analog_globals", &tmp, &globals_sz) == ESP_OK) {
+                s_zone_frontend_globals = tmp;
+            }
+        }
         nvs_close(h);
     }
 
@@ -3746,6 +3882,9 @@ static void zones_load_from_nvs(void){
         zone_eol_mode_t mode = s_zone_cfg[i].eol_mode;
         if (mode < ZONE_EOL_DISABLED || mode > ZONE_EOL_TRIPLE) {
             s_zone_cfg[i].eol_mode = ZONE_EOL_DOUBLE;
+        }
+        if (s_zone_cfg[i].contact != ZONE_CONTACT_NC && s_zone_cfg[i].contact != ZONE_CONTACT_NO) {
+            s_zone_cfg[i].contact = ZONE_CONTACT_NC;
         }
     }
 
@@ -3755,6 +3894,7 @@ static void zones_save_to_nvs(void){
     nvs_handle_t h; if(nvs_open("zones", NVS_READWRITE, &h)!=ESP_OK) return;
     nvs_set_blob(h,"cfg",s_zone_cfg,sizeof(s_zone_cfg));
     nvs_set_blob(h,"map",s_zone_board_map,sizeof(s_zone_board_map));
+    nvs_set_blob(h,"analog_globals",&s_zone_frontend_globals,sizeof(s_zone_frontend_globals));
     nvs_commit(h);
     nvs_close(h);
     zones_apply_to_alarm();
@@ -5177,55 +5317,86 @@ static esp_err_t zones_config_get(httpd_req_t* req){
     }
     zones_snapshot_build(snapshot);
     const int total = zones_snapshot_total(snapshot);
+    set_https_security_headers(req);
+    httpd_resp_set_type(req, "application/json");
 
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
+    esp_err_t res = httpd_resp_sendstr_chunk(req, "{\"items\":[");
+    if (res != ESP_OK) {
         zones_snapshot_release(snapshot);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        return ESP_ERR_NO_MEM;
+        return res;
     }
-
-    cJSON *items = cJSON_CreateArray();
-    if (!items) {
-        cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
-        zones_snapshot_release(snapshot);
-        return ESP_ERR_NO_MEM;
-    }
-    cJSON_AddItemToObject(root, "items", items);
+    char chunk[384];
+    bool first = true;
 
     for (int idx = 0; idx < total; ++idx) {
         const int zone_id = idx + 1;
-        zone_cfg_t *cfg = &s_zone_cfg[idx];
+        const zone_cfg_t *cfg = &s_zone_cfg[idx];
         const zone_state_entry_t *entry = &snapshot->entries[idx];
-        cJSON *it = cJSON_CreateObject();
-        if (!it) {
-            continue;
-        }
-        cJSON_AddNumberToObject(it, "id", zone_id);
-        cJSON_AddStringToObject(it, "name", cfg->name);
-        cJSON_AddBoolToObject(it, "zone_delay", cfg->zone_delay);
-        cJSON_AddNumberToObject(it, "zone_time", (double)cfg->zone_time);
-        cJSON_AddBoolToObject(it, "auto_exclude", cfg->auto_exclude);
-        cJSON_AddNumberToObject(it, "eol_mode", (double)cfg->eol_mode);
-        cJSON_AddNumberToObject(it, "board", (double)(entry->board ? entry->board : zone_board_for_index(zone_id)));
-        cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
-        cJSON_AddBoolToObject(it, "board_online", entry->board_online);
+
+        char name_buf[48];
+        zone_display_name(zone_id, entry, cfg, name_buf, sizeof(name_buf));
+        char name_json[64];
+        json_escape_string(name_buf, name_json, sizeof(name_json));
+
+        uint8_t board = entry->board ? entry->board : zone_board_for_index(zone_id);
         char board_label[sizeof(((roster_node_t *)0)->label)];
-        zone_board_label_copy(entry->board ? entry->board : zone_board_for_index(zone_id),
-                              board_label,
-                              sizeof(board_label));
-        cJSON_AddStringToObject(it, "board_label", board_label);
-        if (entry->board != 0) {
-            cJSON_AddNumberToObject(it, "board_eol_mode", (double)entry->eol_mode);
+        zone_board_label_copy(board, board_label, sizeof(board_label));
+        char board_label_json[96];
+        json_escape_string(board_label, board_label_json, sizeof(board_label_json));
+
+        int written = snprintf(chunk,
+                               sizeof(chunk),
+                               "%s{\"id\":%d,\"name\":\"%s\",\"zone_delay\":%s,\"zone_time\":%u,"
+                               "\"auto_exclude\":%s,\"eol_mode\":%d,\"contact\":\"%s\",\"board\":%u,"
+                               "\"board_input\":%u,\"board_online\":%s,\"board_label\":\"%s\"",
+                               first ? "" : ",",
+                               zone_id,
+                               name_json,
+                               json_bool_str(cfg->zone_delay),
+                               (unsigned)cfg->zone_time,
+                               json_bool_str(cfg->auto_exclude),
+                               (int)cfg->eol_mode,
+                               zone_contact_to_string(cfg->contact),
+                               (unsigned)board,
+                               (unsigned)(entry->board_input + 1u),
+                               json_bool_str(entry->board_online),
+                               board_label_json);
+        if (written < 0 || written >= (int)sizeof(chunk)) {
+            zones_snapshot_release(snapshot);
+            return ESP_ERR_NO_MEM;
         }
-        cJSON_AddItemToArray(items, it);
+
+        res = httpd_resp_send_chunk(req, chunk, (size_t)written);
+        if (res != ESP_OK) {
+            zones_snapshot_release(snapshot);
+            return res;
+        }
+        if (entry->board != 0) {
+            written = snprintf(chunk,
+                               sizeof(chunk),
+                               ",\"board_eol_mode\":%d}",
+                               (int)entry->eol_mode);
+        } else {
+            written = snprintf(chunk, sizeof(chunk), "}");
+        }
+        if (written < 0 || written >= (int)sizeof(chunk)) {
+            zones_snapshot_release(snapshot);
+            return ESP_ERR_NO_MEM;
+        }
+
+        res = httpd_resp_send_chunk(req, chunk, (size_t)written);
+        if (res != ESP_OK) {
+            zones_snapshot_release(snapshot);
+            return res;
+        }
+
+        first = false;
     }
 
-    char *out = cJSON_PrintUnformatted(root);
-    esp_err_t res = json_reply(req, out);
-    cJSON_free(out);
-    cJSON_Delete(root);
+    res = httpd_resp_sendstr_chunk(req, "]}");
+    if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, NULL, 0);
+    }
     zones_snapshot_release(snapshot);
     return res;
 }
@@ -5272,6 +5443,11 @@ static esp_err_t zones_config_post(httpd_req_t* req){
             z_mode = (zone_eol_mode_t)raw_mode;
         }
 
+        jn = cJSON_GetObjectItemCaseSensitive(it, "contact");
+        if (cJSON_IsString(jn) && jn->valuestring) {
+            c->contact = zone_contact_from_string(jn->valuestring);
+        }
+
         // fallback legacy
         jn = cJSON_GetObjectItemCaseSensitive(it, "entry_delay");
         if(cJSON_IsBool(jn)) z_delay = cJSON_IsTrue(jn);
@@ -5305,6 +5481,357 @@ static esp_err_t zones_config_post(httpd_req_t* req){
     cJSON_Delete(json);
     zones_save_to_nvs();
     return json_bool(req, true);
+}
+
+static esp_err_t zones_analog_get(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    zones_snapshot_t *snapshot = zones_snapshot_acquire();
+    if (!snapshot) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    const int total = zones_snapshot_total(snapshot);
+
+    float supply_mv = zone_local_supply_mv();
+    bool supply_valid = zone_local_supply_valid();
+    double supply_v = supply_valid ? ((double)supply_mv / 1000.0) : 0.0;
+
+    set_https_security_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    char chunk[512];
+    int written = snprintf(chunk,
+                           sizeof(chunk),
+                           "{\"globals\":{\"r_normal\":%.1f,\"r_alarm\":%.1f,\"r_tamper\":%.1f,"
+                           "\"r_eol\":%.1f,\"short_threshold\":%.1f,\"open_threshold\":%.1f,"
+                           "\"debounce_ms\":%u,\"hysteresis_pct\":%.2f},\"supply\":{\"mv\":%.1f,\"valid\":%s",
+                           (double)s_zone_frontend_globals.r_normal,
+                           (double)s_zone_frontend_globals.r_alarm,
+                           (double)s_zone_frontend_globals.r_tamper,
+                           (double)s_zone_frontend_globals.r_eol,
+                           (double)s_zone_frontend_globals.short_threshold,
+                           (double)s_zone_frontend_globals.open_threshold,
+                           (unsigned)s_zone_frontend_globals.debounce_ms,
+                           (double)s_zone_frontend_globals.hysteresis_pct,
+                           (double)supply_mv,
+                           json_bool_str(supply_valid));
+    if (written < 0 || written >= (int)sizeof(chunk)) {
+        zones_snapshot_release(snapshot);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t res = httpd_resp_send_chunk(req, chunk, (size_t)written);
+    if (res != ESP_OK) {
+        zones_snapshot_release(snapshot);
+        return res;
+    }
+
+    if (supply_valid) {
+        written = snprintf(chunk, sizeof(chunk), ",\"volts\":%.3f},\"zones\":[", supply_v);
+    } else {
+        written = snprintf(chunk, sizeof(chunk), "},\"zones\":[");
+    }
+
+    res = httpd_resp_send_chunk(req, chunk, (size_t)written);
+    if (res != ESP_OK) {
+        zones_snapshot_release(snapshot);
+        return res;
+    }
+
+    bool first = true;
+    for (int idx = 0; idx < total; ++idx) {
+        const int zone_id = idx + 1;
+        const zone_state_entry_t *entry = &snapshot->entries[idx];
+        const zone_cfg_t *cfg = &s_zone_cfg[idx];
+
+        char name_buf[48];
+        zone_display_name(zone_id, entry, cfg, name_buf, sizeof(name_buf));
+        char name_json[64];
+        json_escape_string(name_buf, name_json, sizeof(name_json));
+
+        char board_label[sizeof(((roster_node_t *)0)->label)];
+        zone_board_label_copy(entry->board, board_label, sizeof(board_label));
+        char board_label_json[96];
+        json_escape_string(board_label, board_label_json, sizeof(board_label_json));
+
+        const char *mode_str = zone_mode_to_string(cfg->eol_mode);
+        const char *contact_str = zone_contact_to_string(cfg->contact);
+        const char *measure_mode = entry->analog ? mode_str : zone_mode_to_string(entry->eol_mode);
+
+        const char *vz_json = "null";
+        char vz_buf[24];
+        if (entry->analog) {
+            double vz = (double)entry->millivolts / 1000.0;
+            snprintf(vz_buf, sizeof(vz_buf), "%.3f", vz);
+            vz_json = vz_buf;
+        }
+
+        const char *vbias_json = "null";
+        char vbias_buf[24];
+        if (entry->analog && supply_valid) {
+            snprintf(vbias_buf, sizeof(vbias_buf), "%.3f", supply_v);
+            vbias_json = vbias_buf;
+        }
+
+        written = snprintf(chunk,
+                           sizeof(chunk),
+                           "%s{\"id\":%d,\"name\":\"%s\",\"mode\":\"%s\",\"contact\":\"%s\","
+                           "\"present\":%s,\"measure_mode\":\"%s\",\"board\":%u,\"board_label\":\"%s\","
+                           "\"vz\":%s,\"vbias\":%s,\"rloop\":null}",
+                           first ? "" : ",",
+                           zone_id,
+                           name_json,
+                           mode_str,
+                           contact_str,
+                           json_bool_str(entry->known),
+                           measure_mode,
+                           (unsigned)entry->board,
+                           board_label_json,
+                           vz_json,
+                           vbias_json);
+        if (written < 0 || written >= (int)sizeof(chunk)) {
+            zones_snapshot_release(snapshot);
+            return ESP_ERR_NO_MEM;
+        }
+
+        res = httpd_resp_send_chunk(req, chunk, (size_t)written);
+        if (res != ESP_OK) {
+            zones_snapshot_release(snapshot);
+            return res;
+        }
+
+        first = false;
+    }
+
+    res = httpd_resp_sendstr_chunk(req, "]}");
+    if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, NULL, 0);
+    }
+    zones_snapshot_release(snapshot);
+    return res;
+}
+
+static esp_err_t zones_analog_post(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    char body[WEB_MAX_BODY_LEN];
+    size_t body_len = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &body_len) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body");
+        return ESP_FAIL;
+    }
+
+    cJSON *json = cJSON_ParseWithLength(body, body_len);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json");
+        return ESP_FAIL;
+    }
+
+    zone_frontend_globals_t globals = s_zone_frontend_globals;
+    cJSON *jglobals = cJSON_GetObjectItemCaseSensitive(json, "globals");
+    if (cJSON_IsObject(jglobals)) {
+        cJSON *jn = NULL;
+        jn = cJSON_GetObjectItemCaseSensitive(jglobals, "r_normal");
+        if (cJSON_IsNumber(jn) && isfinite(jn->valuedouble) && jn->valuedouble >= 0.0) {
+            globals.r_normal = (float)jn->valuedouble;
+        }
+        jn = cJSON_GetObjectItemCaseSensitive(jglobals, "r_alarm");
+        if (cJSON_IsNumber(jn) && isfinite(jn->valuedouble) && jn->valuedouble >= 0.0) {
+            globals.r_alarm = (float)jn->valuedouble;
+        }
+        jn = cJSON_GetObjectItemCaseSensitive(jglobals, "r_tamper");
+        if (cJSON_IsNumber(jn) && isfinite(jn->valuedouble) && jn->valuedouble >= 0.0) {
+            globals.r_tamper = (float)jn->valuedouble;
+        }
+        jn = cJSON_GetObjectItemCaseSensitive(jglobals, "r_eol");
+        if (cJSON_IsNumber(jn) && isfinite(jn->valuedouble) && jn->valuedouble >= 0.0) {
+            globals.r_eol = (float)jn->valuedouble;
+        }
+        jn = cJSON_GetObjectItemCaseSensitive(jglobals, "short_threshold");
+        if (cJSON_IsNumber(jn) && isfinite(jn->valuedouble) && jn->valuedouble >= 0.0) {
+            globals.short_threshold = (float)jn->valuedouble;
+        }
+        jn = cJSON_GetObjectItemCaseSensitive(jglobals, "open_threshold");
+        if (cJSON_IsNumber(jn) && isfinite(jn->valuedouble) && jn->valuedouble >= 0.0) {
+            globals.open_threshold = (float)jn->valuedouble;
+        }
+        jn = cJSON_GetObjectItemCaseSensitive(jglobals, "debounce_ms");
+        if (cJSON_IsNumber(jn) && isfinite(jn->valuedouble) && jn->valuedouble >= 0.0) {
+            int value = (int)jn->valuedouble;
+            if (value < 0) value = 0;
+            if (value > 10000) value = 10000;
+            globals.debounce_ms = (uint16_t)value;
+        }
+        jn = cJSON_GetObjectItemCaseSensitive(jglobals, "hysteresis_pct");
+        if (cJSON_IsNumber(jn) && isfinite(jn->valuedouble) && jn->valuedouble >= 0.0) {
+            globals.hysteresis_pct = (float)jn->valuedouble;
+        }
+    }
+
+    cJSON *jzones = cJSON_GetObjectItemCaseSensitive(json, "zones");
+    if (cJSON_IsArray(jzones)) {
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, jzones) {
+            cJSON *jid = cJSON_GetObjectItemCaseSensitive(item, "id");
+            if (!cJSON_IsNumber(jid)) {
+                continue;
+            }
+            int zone_id = jid->valueint;
+            if (zone_id < 1 || zone_id > ZONE_CONFIG_CAPACITY) {
+                continue;
+            }
+            zone_cfg_t *cfg = &s_zone_cfg[zone_id - 1];
+            cJSON *jn = cJSON_GetObjectItemCaseSensitive(item, "mode");
+            if (cJSON_IsString(jn) && jn->valuestring) {
+                cfg->eol_mode = zone_mode_from_string(jn->valuestring);
+            }
+            jn = cJSON_GetObjectItemCaseSensitive(item, "contact");
+            if (cJSON_IsString(jn) && jn->valuestring) {
+                cfg->contact = zone_contact_from_string(jn->valuestring);
+            }
+        }
+    }
+
+    cJSON_Delete(json);
+
+    s_zone_frontend_globals = globals;
+    zones_save_to_nvs();
+
+    return json_bool(req, true);
+}
+
+static esp_err_t diagnostics_system_get(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    zones_snapshot_t *snapshot = zones_snapshot_acquire();
+    if (!snapshot) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    const int total = zones_snapshot_total(snapshot);
+
+    float supply_mv = zone_local_supply_mv();
+    bool supply_valid = zone_local_supply_valid();
+    double supply_v = supply_valid ? ((double)supply_mv / 1000.0) : 0.0;
+
+    set_https_security_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    char chunk[512];
+    int written = snprintf(chunk,
+                           sizeof(chunk),
+                           "{\"backend\":\"ads1115\",\"supply\":{\"mv\":%.1f,\"valid\":%s",
+                           (double)supply_mv,
+                           json_bool_str(supply_valid));
+    if (written < 0 || written >= (int)sizeof(chunk)) {
+        zones_snapshot_release(snapshot);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t res = httpd_resp_send_chunk(req, chunk, (size_t)written);
+    if (res != ESP_OK) {
+        zones_snapshot_release(snapshot);
+        return res;
+    }
+
+    if (supply_valid) {
+        written = snprintf(chunk, sizeof(chunk), ",\"volts\":%.3f},\"expected\":null,\"zones\":[", supply_v);
+    } else {
+        written = snprintf(chunk, sizeof(chunk), "},\"expected\":null,\"zones\":[");
+    }
+    res = httpd_resp_send_chunk(req, chunk, (size_t)written);
+    if (res != ESP_OK) {
+        zones_snapshot_release(snapshot);
+        return res;
+    }
+
+    bool first = true;
+    for (int idx = 0; idx < total; ++idx) {
+        const int zone_id = idx + 1;
+        const zone_state_entry_t *entry = &snapshot->entries[idx];
+        const zone_cfg_t *cfg = &s_zone_cfg[idx];
+
+        char name_buf[48];
+        zone_display_name(zone_id, entry, cfg, name_buf, sizeof(name_buf));
+        char name_json[64];
+        json_escape_string(name_buf, name_json, sizeof(name_json));
+
+        char board_label[sizeof(((roster_node_t *)0)->label)];
+        zone_board_label_copy(entry->board, board_label, sizeof(board_label));
+        char board_label_json[96];
+        json_escape_string(board_label, board_label_json, sizeof(board_label_json));
+
+        const char *measure_mode = entry->analog ? zone_mode_to_string(cfg->eol_mode)
+                                                 : zone_mode_to_string(entry->eol_mode);
+        const char *contact_str = zone_contact_to_string(cfg->contact);
+        const char *status = zone_status_key(entry);
+
+        const char *vz_json = "null";
+        char vz_buf[24];
+        if (entry->analog) {
+            double vz = (double)entry->millivolts / 1000.0;
+            snprintf(vz_buf, sizeof(vz_buf), "%.3f", vz);
+            vz_json = vz_buf;
+        }
+
+        const char *vbias_json = "null";
+        char vbias_buf[24];
+        if (entry->analog && supply_valid) {
+            snprintf(vbias_buf, sizeof(vbias_buf), "%.3f", supply_v);
+            vbias_json = vbias_buf;
+        }
+
+        written = snprintf(chunk,
+                           sizeof(chunk),
+                           "%s{\"id\":%d,\"name\":\"%s\",\"status\":\"%s\",\"present\":%s,"
+                           "\"measure_mode\":\"%s\",\"contact\":\"%s\",\"vz\":%s,\"vbias\":%s,"
+                           "\"rloop\":null,\"board\":%u,\"board_label\":\"%s\"}",
+                           first ? "" : ",",
+                           zone_id,
+                           name_json,
+                           status,
+                           json_bool_str(entry->known),
+                           measure_mode,
+                           contact_str,
+                           vz_json,
+                           vbias_json,
+                           (unsigned)entry->board,
+                           board_label_json);
+        if (written < 0 || written >= (int)sizeof(chunk)) {
+            zones_snapshot_release(snapshot);
+            return ESP_ERR_NO_MEM;
+        }
+
+        res = httpd_resp_send_chunk(req, chunk, (size_t)written);
+        if (res != ESP_OK) {
+            zones_snapshot_release(snapshot);
+            return res;
+        }
+
+        first = false;
+    }
+
+    res = httpd_resp_sendstr_chunk(req, "]}");
+    if (res == ESP_OK) {
+        res = httpd_resp_send_chunk(req, NULL, 0);
+    }
+    zones_snapshot_release(snapshot);
+    return res;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5561,6 +6088,9 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/zones",              .method = HTTP_GET,  .handler = zones_get },
     { .uri = "/api/zones/config",       .method = HTTP_GET,  .handler = zones_config_get },
     { .uri = "/api/zones/config",       .method = HTTP_POST, .handler = zones_config_post },
+    { .uri = "/api/zones/analog",       .method = HTTP_GET,  .handler = zones_analog_get },
+    { .uri = "/api/zones/analog",       .method = HTTP_POST, .handler = zones_analog_post },
+    { .uri = "/api/diagnostics/system", .method = HTTP_GET,  .handler = diagnostics_system_get },
     { .uri = "/api/scenes",             .method = HTTP_GET,  .handler = scenes_get },
     { .uri = "/api/scenes",             .method = HTTP_POST, .handler = scenes_post },
     { .uri = "/api/logs",               .method = HTTP_GET,  .handler = logs_get },
