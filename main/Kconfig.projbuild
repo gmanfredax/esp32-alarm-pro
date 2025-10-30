@@ -105,6 +105,15 @@ config APP_ZONE_SUPPLY_MAX_MV
 
 endif # APP_ZONE_SUPPLY_SENSE
 
+config APP_ZONE_DEBUG_LOG_INTERVAL_MS
+    int "ADS1115 debug log interval (ms)"
+    default 10000
+    range 0 600000
+    help
+        Emit a diagnostic log on the serial console every configured amount
+        of milliseconds with the current ADS1115 readings and classification.
+        Set the value to 0 to disable the periodic log entirely.
+
 endmenu
 
 menu "ESP32 Alarm Cloud Connectivity"

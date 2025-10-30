@@ -740,18 +740,28 @@ function renderZoneChip(zone, options = {}){
   const zoneIdLabel = Number.isFinite(id) ? `Z${id}` : 'Z?';
   const nameSuffix = zone?.name ? ` – ${escapeHtml(zone.name)}` : '';
   const display = `${escapeHtml(zoneIdLabel)}${nameSuffix}`;
+  const isActive = Boolean(zone?.active);
+  const isTamper = Boolean(zone?.tamper);
+  const isFault = Boolean(zone?.fault);
   const classes = ['chip'];
-  if (zone?.active) classes.push('on');
+  if (isActive) classes.push('on');
+  if (isTamper) classes.push('tamper');
+  if (isFault) classes.push('fault');
   if (offline) classes.push('offline');
   const cls = classes.join(' ');
   const badges = buildZoneBadge(zone);
+  const statusFlags = [];
+  if (isTamper) statusFlags.push('<span class="chip-flag tamper">Tamper</span>');
+  if (isFault) statusFlags.push('<span class="chip-flag fault">Guasto</span>');
+  const statusHtml = statusFlags.length ? `<span class="chip-flags">${statusFlags.join('')}</span>` : '';
   const titleParts = [zoneIdLabel];
   if (zone?.name) titleParts.push(zone.name);
   return `
     <div class="card mini zone-card" data-zone-id="${Number.isFinite(id) ? id : ''}" data-board-id="${Number.isFinite(boardId) ? boardId : 0}">
       <div class="${cls}" title="${escapeHtml(titleParts.join(' • '))}">
-        ${display}
+        <span class="chip-label">${display}</span>
         ${badges ? `<span class="badges">${badges}</span>` : ''}
+        ${statusHtml}
       </div>
     </div>`;
 }

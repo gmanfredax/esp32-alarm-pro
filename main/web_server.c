@@ -5373,6 +5373,11 @@ static esp_err_t start_http_redirect_server(void){
     cfg.ctrl_port += 1;  // avoid clashing with the HTTPS server control socket
     cfg.uri_match_fn = web_uri_match; //httpd_uri_match_wildcard;
     cfg.lru_purge_enable = true;
+    cfg.max_open_sockets = 2;
+    cfg.keep_alive_enable = true;
+    cfg.keep_alive_idle = 5;
+    cfg.keep_alive_interval = 5;
+    cfg.keep_alive_count = 2;
     httpd_handle_t srv = NULL;
     esp_err_t err = httpd_start(&srv, &cfg);
     if (err != ESP_OK){
@@ -5611,6 +5616,11 @@ static esp_err_t start_web(void){
     cfg.lru_purge_enable = true;
     cfg.server_port = 443;
     cfg.uri_match_fn = web_uri_match; //httpd_uri_match_wildcard;
+    cfg.max_open_sockets = 3;
+    cfg.keep_alive_enable = true;
+    cfg.keep_alive_idle = 15;
+    cfg.keep_alive_interval = 15;
+    cfg.keep_alive_count = 3;
 
     httpd_handle_t srv = NULL;
     esp_err_t err = https_start(&srv, &cfg);

@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/portmacro.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "sdkconfig.h"
 
 #include "ads1115.h"
@@ -16,6 +17,62 @@ typedef struct {
 } zone_channel_map_t;
 
 static const char *TAG = "zone_local";
+
+#if CONFIG_APP_ZONE_DEBUG_LOG_INTERVAL_MS > 0
+#define ZONE_LOCAL_LOG_INTERVAL_US ((int64_t)CONFIG_APP_ZONE_DEBUG_LOG_INTERVAL_MS * 1000LL)
+static int64_t s_last_log_us = 0;
+
+static void log_snapshot_if_due(const zone_local_zone_t *zones,
+                                uint8_t count,
+                                float supply_mv,
+                                bool supply_valid)
+{
+    if (!zones || count == 0) {
+        return;
+    }
+
+    const int64_t now = esp_timer_get_time();
+    if (s_last_log_us != 0 && (now - s_last_log_us) < ZONE_LOCAL_LOG_INTERVAL_US) {
+        return;
+    }
+
+    s_last_log_us = now;
+
+    ESP_LOGI(TAG,
+             "ADS1115 supply %.1f mV (%s)",
+             (double)supply_mv,
+             supply_valid ? "valid" : "invalid");
+
+    for (uint8_t i = 0; i < count; ++i) {
+        const zone_local_zone_t *entry = &zones[i];
+        const zone_eol_result_t *res = &entry->result;
+        ESP_LOGI(TAG,
+                 "  Z%02u %-13s mv=%ld ratio=%.3f valid=%d mode=%d flags[A=%d T=%d F=%d] adc=%u/%u",
+                 (unsigned)(i + 1u),
+                 zone_line_state_name(res->state),
+                 (long)res->millivolts,
+                 (double)res->ratio,
+                 entry->valid ? 1 : 0,
+                 (int)res->mode,
+                 entry->alarm ? 1 : 0,
+                 entry->tamper ? 1 : 0,
+                 entry->fault ? 1 : 0,
+                 (unsigned)entry->adc_index,
+                 (unsigned)entry->adc_channel);
+    }
+}
+#else
+static inline void log_snapshot_if_due(const zone_local_zone_t *zones,
+                                       uint8_t count,
+                                       float supply_mv,
+                                       bool supply_valid)
+{
+    (void)zones;
+    (void)count;
+    (void)supply_mv;
+    (void)supply_valid;
+}
+#endif
 
 #ifdef CONFIG_APP_ZONE_ADS1115_ADDR0
 #define ZONE_LOCAL_ADS1115_ADDR0 ((uint8_t)(CONFIG_APP_ZONE_ADS1115_ADDR0))
@@ -79,6 +136,19 @@ static const zone_channel_map_t s_supply_channel = {
     .adc_index = ZONE_LOCAL_SUPPLY_ADC_INDEX,
     .channel = ZONE_LOCAL_SUPPLY_ADC_CHANNEL,
 };
+
+static float supply_classification_fallback_raw_mv(void)
+{
+    float midpoint = 0.5f * (ZONE_LOCAL_SUPPLY_MIN_VALID_MV + ZONE_LOCAL_SUPPLY_MAX_VALID_MV);
+    if (midpoint <= 0.0f) {
+        midpoint = (float)ZONE_LOCAL_SUPPLY_MIN_VALID_MV;
+    }
+    float raw = midpoint / ZONE_LOCAL_SUPPLY_SCALE;
+    if (raw <= 0.0f) {
+        raw = ZONE_LOCAL_SUPPLY_DEFAULT_MV / ZONE_LOCAL_SUPPLY_SCALE;
+    }
+    return raw;
+}
 #else
 static const zone_channel_map_t s_channel_map[] = {
     { .adc_index = 0, .channel = 0 },
@@ -98,6 +168,22 @@ static const zone_channel_map_t s_channel_map[] = {
 
 _Static_assert(ZONE_LOCAL_MAX_ZONES >= (sizeof(s_channel_map) / sizeof(s_channel_map[0])),
                "ZONE_LOCAL_MAX_ZONES too small for channel map");
+
+static float supply_reference_for_classification(float supply_mv, bool supply_valid)
+{
+#if ZONE_LOCAL_SUPPLY_SENSE_ENABLED
+    if (supply_valid && supply_mv > 0.0f) {
+        return supply_mv / ZONE_LOCAL_SUPPLY_SCALE;
+    }
+    return supply_classification_fallback_raw_mv();
+#else
+    (void)supply_valid;
+    if (supply_mv > 0.0f) {
+        return supply_mv;
+    }
+    return ZONE_LOCAL_SUPPLY_DEFAULT_MV;
+#endif
+}
 
 static const size_t s_channel_map_count = sizeof(s_channel_map) / sizeof(s_channel_map[0]);
 
@@ -287,9 +373,10 @@ void zone_local_update(void)
     supply_valid = true;
 #endif
 
-    float supply_for_classification = (supply_valid && supply_mv > 0.0f)
-                                          ? supply_mv
-                                          : ZONE_LOCAL_SUPPLY_DEFAULT_MV;
+    float supply_for_classification = supply_reference_for_classification(supply_mv, supply_valid);
+    if (supply_for_classification <= 0.0f) {
+        supply_for_classification = ZONE_LOCAL_SUPPLY_DEFAULT_MV;
+    }
 
     for (uint8_t i = 0; i < s_zone_count; ++i) {
         zone_local_zone_t entry = {
@@ -308,6 +395,18 @@ void zone_local_update(void)
             int32_t mv_i = (int32_t)lroundf(mv);
             entry.result = zone_eol_build_result(entry.mode, mv_i, supply_for_classification);
             entry.valid = entry.result.valid;
+#if ZONE_LOCAL_SUPPLY_SENSE_ENABLED
+            if (!supply_valid) {
+                entry.valid = false;
+                entry.result.valid = false;
+                entry.result.state = ZONE_LINE_FAULT;
+                entry.result.ratio = 0.0f;
+            }
+#endif
+            if (!entry.result.valid && entry.result.state == ZONE_LINE_UNKNOWN) {
+                entry.result.state = ZONE_LINE_FAULT;
+                entry.result.ratio = 0.0f;
+            }
         } else {
             entry.result.mode = entry.mode;
             entry.result.millivolts = 0;
@@ -331,6 +430,7 @@ void zone_local_update(void)
             break;
         case ZONE_LINE_FAULT:
             entry.fault = true;
+            entry.tamper = true;
             break;
         default:
             break;
@@ -353,6 +453,8 @@ void zone_local_update(void)
     portENTER_CRITICAL(&s_lock);
     update_state_locked(tmp, alarm_mask, tamper_mask, fault_mask, supply_mv, supply_valid);
     portEXIT_CRITICAL(&s_lock);
+
+    log_snapshot_if_due(tmp, s_zone_count, supply_mv, supply_valid);
 }
 
 void zone_local_get_snapshot(zone_local_snapshot_t *out_snapshot)
