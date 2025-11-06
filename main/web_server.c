@@ -16,7 +16,6 @@
 #include "esp_err.h"
 #include "esp_system.h"
 #include "esp_http_server.h"
-#include "esp_https_server.h"
 #include "esp_netif.h"
 
 #include "freertos/FreeRTOS.h"
@@ -81,10 +80,6 @@
 #include "lwip/ip_addr.h"
 #include "lwip/inet.h"
 
-extern const unsigned char certs_server_cert_pem_start[] asm("_binary_server_cert_pem_start");
-extern const unsigned char certs_server_cert_pem_end[]   asm("_binary_server_cert_pem_end");
-extern const unsigned char certs_server_key_pem_start[]  asm("_binary_server_key_pem_start");
-extern const unsigned char certs_server_key_pem_end[]    asm("_binary_server_key_pem_end");
 extern const uint8_t certs_broker_ca_pem_start[] asm("_binary_broker_ca_pem_start");
 extern const uint8_t certs_broker_ca_pem_end[]   asm("_binary_broker_ca_pem_end");
 
@@ -231,37 +226,35 @@ static SemaphoreHandle_t s_ws_lock = NULL;
 // Server handle & SPIFFS
 // ─────────────────────────────────────────────────────────────────────────────
 //static httpd_handle_t s_server = NULL;
-static httpd_handle_t s_https_server = NULL;
-static httpd_handle_t s_http_redirect_server = NULL;
+static httpd_handle_t s_http_server = NULL;
 static bool s_spiffs_mounted __attribute__((unused)) = false;
 
-static void set_https_security_headers(httpd_req_t* req){
+static void set_http_security_headers(httpd_req_t* req){
     if (!req) return;
     auth_set_security_headers(req);
 }
 
-static void build_https_location(httpd_req_t* req, const char* target, char* out, size_t outlen){
+static void build_http_location(httpd_req_t* req, const char* target, char* out, size_t outlen){
     if (!out || !outlen) return;
     const char* dest = target && target[0] ? target : "/";
-    if (!strncasecmp(dest, "https://", 8)){ strlcpy(out, dest, outlen); return; }
-    if (!strncasecmp(dest, "http://", 7)){
-        snprintf(out, outlen, "https://%s", dest + 7);
+    if (!strncasecmp(dest, "http://", 7) || !strncasecmp(dest, "https://", 8)){
+        strlcpy(out, dest, outlen);
         return;
     }
     char host[96] = {0};
     if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) == ESP_OK && host[0]){
-        if (dest[0] == '/') snprintf(out, outlen, "https://%s%s", host, dest);
-        else snprintf(out, outlen, "https://%s/%s", host, dest);
+        if (dest[0] == '/') snprintf(out, outlen, "http://%s%s", host, dest);
+        else snprintf(out, outlen, "http://%s/%s", host, dest);
         return;
     }
     if (dest[0] == '/') dest++;
-    snprintf(out, outlen, "https://%s", dest);
+    snprintf(out, outlen, "http://%s", dest);
 }
 
-static esp_err_t send_https_redirect(httpd_req_t* req, const char* target, const char* status){
+static esp_err_t send_http_redirect(httpd_req_t* req, const char* target, const char* status){
     char location[192];
-    build_https_location(req, target, location, sizeof(location));
-    set_https_security_headers(req);
+    build_http_location(req, target, location, sizeof(location));
+    set_http_security_headers(req);
     httpd_resp_set_status(req, status ? status : "302 Found");
     httpd_resp_set_hdr(req, "Location", location);
     return httpd_resp_send(req, NULL, 0);
@@ -368,7 +361,7 @@ static bool json_get_int64(const cJSON *json, const char *key, int64_t *out){
 }
 
 static esp_err_t json_reply(httpd_req_t* req, const char* json){
-    set_https_security_headers(req);
+    set_http_security_headers(req);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, json);
 }
@@ -471,7 +464,7 @@ static esp_err_t ws_broadcast_payload(const char *payload, size_t len)
     if (!payload || len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (!s_https_server) {
+    if (!s_http_server) {
         return ESP_ERR_INVALID_STATE;
     }
     SemaphoreHandle_t lock = ws_lock_get();
@@ -487,7 +480,7 @@ static esp_err_t ws_broadcast_payload(const char *payload, size_t len)
             .payload = (uint8_t *)payload,
             .len = len,
         };
-        esp_err_t err = httpd_ws_send_frame_async(s_https_server, client->fd, &frame);
+        esp_err_t err = httpd_ws_send_frame_async(s_http_server, client->fd, &frame);
         if (err != ESP_OK) {
             ws_client_t *old = client;
             *it = client->next;
@@ -1545,53 +1538,22 @@ static void web_tls_state_set_custom_from_crt(const mbedtls_x509_crt* crt, uint6
 static void web_tls_use_builtin(void){
     web_tls_clear_dynamic();
 
-    size_t cert_len = (size_t)(certs_server_cert_pem_end - certs_server_cert_pem_start);
-    size_t key_len = (size_t)(certs_server_key_pem_end - certs_server_key_pem_start);
-
-    uint8_t *cert = NULL;
-    uint8_t *key = NULL;
-
-    if (cert_len > 0){
-        cert = malloc(cert_len + 1);
-    }
-    if (key_len > 0){
-        key = malloc(key_len + 1);
-    }
-
-    if (!cert || !key){
-        ESP_LOGE(TAG, "TLS: unable to allocate buffers for builtin material");
-        free(cert);
-        free(key);
-        s_tls_material.cert = (const uint8_t*)builtin_cert_pem;
-        s_tls_material.cert_len = sizeof(builtin_cert_pem);
-        s_tls_material.key = (const uint8_t*)builtin_key_pem;
-        s_tls_material.key_len = sizeof(builtin_key_pem);
-    } else {
-        memcpy(cert, certs_server_cert_pem_start, cert_len);
-        cert[cert_len] = '\0';
-        memcpy(key, certs_server_key_pem_start, key_len);
-        key[key_len] = '\0';
-
-        s_tls_material.dyn_cert = cert;
-        s_tls_material.dyn_cert_len = cert_len + 1;
-        s_tls_material.dyn_key = key;
-        s_tls_material.dyn_key_len = key_len + 1;
-        s_tls_material.cert = s_tls_material.dyn_cert;
-        s_tls_material.cert_len = s_tls_material.dyn_cert_len;
-        s_tls_material.key = s_tls_material.dyn_key;
-        s_tls_material.key_len = s_tls_material.dyn_key_len;
-    }
+    s_tls_material.cert = (const uint8_t*)builtin_cert_pem;
+    s_tls_material.cert_len = sizeof(builtin_cert_pem);
+    s_tls_material.key = (const uint8_t*)builtin_key_pem;
+    s_tls_material.key_len = sizeof(builtin_key_pem);
     s_tls_material.source = WEB_TLS_SRC_BUILTIN;
 
-    mbedtls_x509_crt crt; 
-    mbedtls_x509_crt_init(&crt);
-    if (mbedtls_x509_crt_parse(&crt, (const unsigned char*)s_tls_material.cert, s_tls_material.cert_len) == 0){
-        web_tls_state_set_active_from_crt(&crt, WEB_TLS_SRC_BUILTIN);
-        if (!s_web_tls_state.custom_available) {
-            web_tls_state_reset_custom();
-        }
+    s_web_tls_state.active_source = WEB_TLS_SRC_BUILTIN;
+    s_web_tls_state.using_builtin = true;
+    s_web_tls_state.active_subject[0] = '\0';
+    s_web_tls_state.active_issuer[0] = '\0';
+    s_web_tls_state.active_not_before[0] = '\0';
+    s_web_tls_state.active_not_after[0] = '\0';
+    s_web_tls_state.active_fingerprint[0] = '\0';
+    if (!s_web_tls_state.custom_available) {
+        web_tls_state_reset_custom();
     }
-    mbedtls_x509_crt_free(&crt);
 }
 
 
@@ -1860,29 +1822,6 @@ static esp_err_t web_tls_validate_pair(const uint8_t* cert, size_t cert_len,
         if (errbuf) snprintf(errbuf, errbuf_len, "cert/key mismatch");
         mbedtls_x509_crt_free(crt_out);
         return ESP_ERR_INVALID_RESPONSE;
-    }
-    return ESP_OK;
-}
-
-// Se non stai usando davvero HTTPS qui, usa httpd_start come wrapper
-static esp_err_t https_start(httpd_handle_t* s, httpd_config_t* cfg){
-    if (!s || !cfg) return ESP_ERR_INVALID_ARG;
-    esp_err_t tls_err = web_tls_prepare_material();
-    httpd_ssl_config_t ssl_cfg = HTTPD_SSL_CONFIG_DEFAULT();
-    ssl_cfg.httpd = *cfg;
-    ssl_cfg.servercert = s_tls_material.cert;
-    ssl_cfg.servercert_len = s_tls_material.cert_len;
-    ssl_cfg.prvtkey_pem = s_tls_material.key;
-    ssl_cfg.prvtkey_len = s_tls_material.key_len;
-    ssl_cfg.port_secure = cfg->server_port;
-    ssl_cfg.httpd.server_port = cfg->server_port;
-    esp_err_t err = httpd_ssl_start(s, &ssl_cfg);
-    if (err != ESP_OK){
-        ESP_LOGE(TAG, "httpd_ssl_start failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    if (tls_err != ESP_OK && tls_err != ESP_ERR_NOT_FOUND){
-        ESP_LOGW(TAG, "TLS material fallback in use (%s)", esp_err_to_name(tls_err));
     }
     return ESP_OK;
 }
@@ -2734,7 +2673,7 @@ static esp_err_t provision_finish_post(httpd_req_t* req){
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mqtt"), ESP_FAIL;
     }
 
-    return send_https_redirect(req, "/login.html", "302 Found");
+    return send_http_redirect(req, "/login.html", "302 Found");
 }
 
 static bool req_has_hard_reset_header(httpd_req_t* req){
@@ -4327,7 +4266,7 @@ static esp_err_t logs_get(httpd_req_t* req){
         returned = 0;
     }
 
-    set_https_security_headers(req);
+    set_http_security_headers(req);
     httpd_resp_set_type(req, "application/json");
 
     esp_err_t send_err = httpd_resp_sendstr_chunk(req, "{\"entries\":[");
@@ -4562,7 +4501,7 @@ static esp_err_t logs_delete_post(httpd_req_t* req){
         return err;
     }
 
-    set_https_security_headers(req);
+    set_http_security_headers(req);
     httpd_resp_set_status(req, "204 No Content");
     return httpd_resp_send(req, NULL, 0);
 }
@@ -5026,7 +4965,7 @@ static esp_err_t send_file(httpd_req_t* req, const char* fname){
         else if (!strcmp(ext,".ico")) ct = "image/x-icon";
     }
     httpd_resp_set_type(req, ct);
-    set_https_security_headers(req);
+    set_http_security_headers(req);
     char buf[1024];
     size_t r;
     while((r=fread(buf,1,sizeof(buf),f))>0){
@@ -5034,71 +4973,6 @@ static esp_err_t send_file(httpd_req_t* req, const char* fname){
     }
     fclose(f);
     httpd_resp_sendstr_chunk(req, NULL);
-    return ESP_OK;
-}
-
-static esp_err_t redirect_http_handler(httpd_req_t* req){
-    const char* uri = "/";
-    if (req->uri[0] != '\0'){
-        uri = req->uri;
-    }
-    char path[192];
-    strlcpy(path, uri, sizeof(path));
-    size_t qlen = httpd_req_get_url_query_len(req);
-    if (qlen > 0){
-        char* query = malloc(qlen + 1);
-        if (query){
-            if (httpd_req_get_url_query_str(req, query, qlen + 1) == ESP_OK){
-                if (strlen(path) + 1 < sizeof(path)){
-                    strlcat(path, "?", sizeof(path));
-                    strlcat(path, query, sizeof(path));
-                }
-            }
-            free(query);
-        }
-    }
-    char location[192];
-    build_https_location(req, path, location, sizeof(location));
-    httpd_resp_set_status(req, "301 Moved Permanently");
-    httpd_resp_set_hdr(req, "Location", location);
-    httpd_resp_set_hdr(req, "Connection", "close");
-    return httpd_resp_send(req, NULL, 0);
-}
-
-static esp_err_t start_http_redirect_server(void){
-    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port = 80;
-    cfg.ctrl_port += 1;  // avoid clashing with the HTTPS server control socket
-    cfg.uri_match_fn = web_uri_match; //httpd_uri_match_wildcard;
-    cfg.lru_purge_enable = true;
-    httpd_handle_t srv = NULL;
-    esp_err_t err = httpd_start(&srv, &cfg);
-    if (err != ESP_OK){
-        ESP_LOGE(TAG, "Start HTTP redirect server failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    s_http_redirect_server = srv;
-    static httpd_uri_t redirect_get    = {.uri="/*", .method=HTTP_GET,    .handler=redirect_http_handler, .user_ctx=NULL};
-    static httpd_uri_t redirect_post   = {.uri="/*", .method=HTTP_POST,   .handler=redirect_http_handler, .user_ctx=NULL};
-    static httpd_uri_t redirect_put    = {.uri="/*", .method=HTTP_PUT,    .handler=redirect_http_handler, .user_ctx=NULL};
-    static httpd_uri_t redirect_delete = {.uri="/*", .method=HTTP_DELETE, .handler=redirect_http_handler, .user_ctx=NULL};
-#ifdef HTTP_HEAD
-    static httpd_uri_t redirect_head   = {.uri="/*", .method=HTTP_HEAD,   .handler=redirect_http_handler, .user_ctx=NULL};
-#endif
-#ifdef HTTP_OPTIONS
-    static httpd_uri_t redirect_options = {.uri="/*", .method=HTTP_OPTIONS, .handler=redirect_http_handler, .user_ctx=NULL};
-#endif
-    httpd_register_uri_handler(srv, &redirect_get);
-    httpd_register_uri_handler(srv, &redirect_post);
-    httpd_register_uri_handler(srv, &redirect_put);
-    httpd_register_uri_handler(srv, &redirect_delete);
-#ifdef HTTP_HEAD
-    httpd_register_uri_handler(srv, &redirect_head);
-#endif
-#ifdef HTTP_OPTIONS
-    httpd_register_uri_handler(srv, &redirect_options);
-#endif
-    ESP_LOGI(TAG, "Server HTTP redirect attivo sulla porta %d", cfg.server_port);
     return ESP_OK;
 }
 
@@ -5117,7 +4991,7 @@ static esp_err_t login_html_get(httpd_req_t* req){
     // If already logged, go to index
     user_info_t u;
     if (auth_check_cookie(req,&u)){
-        return send_https_redirect(req, "/", "302 Found");
+        return send_http_redirect(req, "/", "302 Found");
     }
     return send_file(req,"login.html");
 }
@@ -5128,7 +5002,7 @@ static esp_err_t index_html_get(httpd_req_t* req){
     }
     user_info_t u;
     if (!auth_check_cookie(req,&u)){
-        return send_https_redirect(req, "/login.html", "302 Found");
+        return send_http_redirect(req, "/login.html", "302 Found");
     }
     return send_file(req, "index.html");
 }
@@ -5307,28 +5181,26 @@ static esp_err_t start_web(void){
     cfg.stack_size = 12288;
     cfg.max_uri_handlers = 150;
     cfg.lru_purge_enable = true;
-    cfg.server_port = 443;
+    cfg.server_port = 80;
     cfg.uri_match_fn = web_uri_match; //httpd_uri_match_wildcard;
 
     httpd_handle_t srv = NULL;
-    esp_err_t err = https_start(&srv, &cfg);
+    esp_err_t tls_err = web_tls_prepare_material();
+    if (tls_err != ESP_OK && tls_err != ESP_ERR_NOT_FOUND){
+        ESP_LOGW(TAG, "TLS material unavailable (%s), avvio server HTTP senza TLS", esp_err_to_name(tls_err));
+    }
+    esp_err_t err = httpd_start(&srv, &cfg);
     if (err != ESP_OK){
+        ESP_LOGE(TAG, "httpd_start failed: %s", esp_err_to_name(err));
         return err;
     }
     // s_server = srv;
-    s_https_server = srv;
-
-    esp_err_t redir_err = start_http_redirect_server();
-    if (redir_err != ESP_OK){
-        ESP_LOGW(TAG, "HTTP redirect server non disponibile: %s", esp_err_to_name(redir_err));
-    }
+    s_http_server = srv;
     ws_clients_reset();
 
     register_uri_set(srv, s_http_routes, sizeof(s_http_routes) / sizeof(s_http_routes[0]));
 
-
-    ESP_LOGI(TAG, "Server HTTPS avviato su porta %d (%s)",
-             cfg.server_port, s_web_tls_state.using_builtin ? "certificato builtin" : "certificato personalizzato");
+    ESP_LOGI(TAG, "Server HTTP avviato su porta %d", cfg.server_port);
 
     return ESP_OK;
 }
@@ -5357,30 +5229,19 @@ esp_err_t web_server_start(void){
             }
         }
     }
-    ESP_LOGI(TAG, "Pronto. Apri https://%s", ip_url);
+    ESP_LOGI(TAG, "Pronto. Apri http://%s", ip_url);
     return ESP_OK;
 }
 
 esp_err_t web_server_stop(void){
     esp_err_t first_err = ESP_OK;
-    if (s_https_server){
-        httpd_handle_t handle = s_https_server;
-        s_https_server = NULL;
-        ws_clients_reset();
-        esp_err_t err = httpd_ssl_stop(handle);
-        if (err != ESP_OK){
-            ESP_LOGE(TAG, "httpd_ssl_stop failed: %s", esp_err_to_name(err));
-            if (first_err == ESP_OK) first_err = err;
-        }
-    }
-    // return err;
-    if (s_http_redirect_server){
-        httpd_handle_t handle = s_http_redirect_server;
-        s_http_redirect_server = NULL;
+    if (s_http_server){
+        httpd_handle_t handle = s_http_server;
+        s_http_server = NULL;
         ws_clients_reset();
         esp_err_t err = httpd_stop(handle);
         if (err != ESP_OK){
-            ESP_LOGE(TAG, "httpd_stop (redirect) failed: %s", esp_err_to_name(err));
+            ESP_LOGE(TAG, "httpd_stop failed: %s", esp_err_to_name(err));
             if (first_err == ESP_OK) first_err = err;
         }
     }
@@ -5390,7 +5251,7 @@ esp_err_t web_server_stop(void){
 static void web_restart_task(void* arg){
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(200));
-    ESP_LOGI(TAG, "Riavvio del server HTTPS in corso");
+    ESP_LOGI(TAG, "Riavvio del server HTTP in corso");
     esp_err_t err = web_server_stop();
     if (err != ESP_OK){
         ESP_LOGW(TAG, "Stop server fallito: %s", esp_err_to_name(err));

@@ -47,7 +47,7 @@ export function getSystemId(){
 function computeOriginForSuffix(suffix){
   const cleaned = sanitizeSystemId(suffix);
   const loc = window.location;
-  const protocol = loc.protocol || 'https:';
+  const protocol = loc.protocol || 'http:';
   const host = loc.hostname || '';
   const port = loc.port ? `:${loc.port}` : '';
   if (!cleaned) {

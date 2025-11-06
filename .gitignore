@@ -6,7 +6,7 @@ cmake-build-*/
 compile_commands.json
 
 # ESP-IDF
-sdkconfig
+#sdkconfig
 sdkconfig.old
 sdkconfig.ci
 # Managed components: tieni solo il lock per riproducibilità
@@ -17,6 +17,7 @@ managed_components/*
 .vscode/
 .idea/
 *.code-workspace
+web/
 
 # OS e log
 .DS_Store
