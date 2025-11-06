@@ -1548,7 +1548,7 @@ static void system_main_task(void *arg)
 
     // Riduci il rumore di handshake cancellati dal client (-0x0050) e altre riconnessioni
     esp_log_level_set("esp-tls-mbedtls", ESP_LOG_WARN);
-    esp_log_level_set("esp_https_server", ESP_LOG_WARN);
+    esp_log_level_set("esp_http_server", ESP_LOG_WARN);
     esp_log_level_set("httpd",           ESP_LOG_WARN);
     // opzionale:
     // esp_log_level_set("esp-tls",      ESP_LOG_WARN);

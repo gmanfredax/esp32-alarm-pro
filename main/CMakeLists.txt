@@ -2,11 +2,13 @@
 #file(GLOB MAIN_SRCS "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
 file(GLOB MAIN_SRCS "*.c")
 
-set(MAIN_EMBED_TXTFILES
-    "certs/server_cert.pem"
-    "certs/server_key.pem"
-#    "certs/broker_ca.pem"
-)
+#set(MAIN_EMBED_TXTFILES
+#    "certs/server_cert.pem"
+#    "certs/server_key.pem"
+##    "certs/broker_ca.pem"
+#)
+set(MAIN_EMBED_TXTFILES)
+
 
 set(MQTT_BROKER_CA_RELATIVE "certs/broker_ca.pem")
 set(MQTT_BROKER_CA_ABSOLUTE "${CMAKE_CURRENT_LIST_DIR}/${MQTT_BROKER_CA_RELATIVE}")
@@ -45,7 +47,7 @@ idf_component_register(
         fatfs
         spiffs
     PRIV_REQUIRES
-        esp_https_server
+        # esp_https_server removed: we run plain HTTP server
         driver
     EMBED_TXTFILES
         ${MAIN_EMBED_TXTFILES}
