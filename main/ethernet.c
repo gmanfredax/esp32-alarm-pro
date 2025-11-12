@@ -113,20 +113,27 @@ static esp_err_t w5500_bus_init(void)
         return err;
     }
 
+    if (ETH_W5500_PIN_CS >= 0) {
+        // Porta il chip select in stato inattivo alto prima di collegare il device
+        // allo SPI master, evitando glitch durante l'inizializzazione del bus.
+        gpio_config_t cs_gpio = {
+            .pin_bit_mask = 1ULL << ETH_W5500_PIN_CS,
+            .mode = GPIO_MODE_OUTPUT,
+            .pull_up_en = GPIO_PULLUP_DISABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&cs_gpio));
+        gpio_set_level(ETH_W5500_PIN_CS, 1);
+    }
+
     s_w5500_devcfg = (spi_device_interface_config_t) {
         .command_bits = 16,
         .address_bits = 8,
-        .dummy_bits = 0,
         .mode = 0,
         .clock_speed_hz = ETH_W5500_SPI_CLOCK_HZ,
         .spics_io_num = ETH_W5500_PIN_CS,
-        // Il driver ufficiale del W5500 effettua transazioni full-duplex:
-        // impostare HALFDUPLEX causa "spi transmit failed" durante il reset.
-        .flags = 0,
         .queue_size = ETH_W5500_SPI_QUEUE_LEN,
-        .input_delay_ns = 50,
-        .cs_ena_posttrans = 2,
-        .cs_ena_pretrans = 2,
     };
     s_w5500_active_clock_hz = ETH_W5500_SPI_CLOCK_HZ;
     s_w5500_spi = NULL;
@@ -215,7 +222,14 @@ esp_err_t eth_start(void)
     }
     xEventGroupClearBits(s_event_group, ETH_EVENT_BIT_GOT_IP);
 
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "netif init");
+    esp_err_t netif_err = esp_netif_init();
+    if (netif_err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGD(TAG, "esp_netif already initialized");
+    } else if (netif_err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_netif_init failed: %s", esp_err_to_name(netif_err));
+        return netif_err;
+    }
+
     esp_err_t err = esp_event_loop_create_default();
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "esp_event_loop_create_default: %s", esp_err_to_name(err));
