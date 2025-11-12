@@ -2,6 +2,7 @@
 #include "can_master.h"
 
 #include <string.h>
+#include <stddef.h>
 #include <inttypes.h>
 
 #if CONFIG_APP_CAN_ENABLED
@@ -13,6 +14,7 @@
 #include "esp_timer.h"
 #include "driver/twai.h"
 #include "esp_err.h"
+#include "esp_intr_alloc.h"
 
 #include "can_bus_protocol.h"
 #include "pins.h"
@@ -130,14 +132,141 @@ static esp_err_t can_master_driver_start_internal(void)
     g_config.intr_flags = ESP_INTR_FLAG_IRAM;
 #endif
 
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+#ifdef ESP_INTR_FLAG_LOWMED
+    g_config.intr_flags &= ~ESP_INTR_FLAG_LOWMED;
+#endif
+#ifdef ESP_INTR_FLAG_LEVEL3
+    g_config.intr_flags |= ESP_INTR_FLAG_LEVEL3;
+#endif
+#endif
+
     twai_timing_config_t t_config = can_timing_config();
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    const uint32_t original_intr_flags = g_config.intr_flags;
 
     esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+    if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG,
+                 "twai_driver_install failed to allocate interrupt (flags=0x%lx), trying fallbacks",
+                 (unsigned long)g_config.intr_flags);
+
+        uint32_t level_mask = ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_LEVEL2 |
+                              ESP_INTR_FLAG_LEVEL3 | ESP_INTR_FLAG_LEVEL4 |
+                              ESP_INTR_FLAG_LEVEL5;
+#ifdef ESP_INTR_FLAG_LEVEL6
+        level_mask |= ESP_INTR_FLAG_LEVEL6;
+#endif
+#ifdef ESP_INTR_FLAG_LEVEL7
+        level_mask |= ESP_INTR_FLAG_LEVEL7;
+#endif
+        const uint32_t base_non_level_flags = g_config.intr_flags & ~level_mask;
+#ifdef ESP_INTR_FLAG_CPU1
+        const uint32_t base_without_cpu = base_non_level_flags & ~ESP_INTR_FLAG_CPU1;
+#else
+        const uint32_t base_without_cpu = base_non_level_flags;
+#endif
+
+        uint32_t candidate_flags[32];
+        size_t candidate_count = 0;
+
+#define ADD_CANDIDATE(flag_value)                                                                   \
+    do {                                                                                            \
+        if ((flag_value) != g_config.intr_flags) {                                                  \
+            bool seen = false;                                                                      \
+            for (size_t add_idx = 0; add_idx < candidate_count; ++add_idx) {                        \
+                if (candidate_flags[add_idx] == (flag_value)) {                                     \
+                    seen = true;                                                                    \
+                    break;                                                                          \
+                }                                                                                   \
+            }                                                                                       \
+            if (!seen && candidate_count < (sizeof(candidate_flags) / sizeof(candidate_flags[0]))) { \
+                candidate_flags[candidate_count++] = (flag_value);                                  \
+            }                                                                                       \
+        }                                                                                           \
+    } while (0)
+
+        const uint32_t level_candidates[] = {
+            ESP_INTR_FLAG_LEVEL1,
+            ESP_INTR_FLAG_LEVEL2,
+#ifdef ESP_INTR_FLAG_LEVEL3
+            ESP_INTR_FLAG_LEVEL3,
+#endif
+#ifdef ESP_INTR_FLAG_LEVEL4
+            ESP_INTR_FLAG_LEVEL4,
+#endif
+#ifdef ESP_INTR_FLAG_LEVEL5
+            ESP_INTR_FLAG_LEVEL5,
+#endif
+#ifdef ESP_INTR_FLAG_LEVEL6
+            ESP_INTR_FLAG_LEVEL6,
+#endif
+#ifdef ESP_INTR_FLAG_LEVEL7
+            ESP_INTR_FLAG_LEVEL7,
+#endif
+        };
+
+        for (size_t i = 0; i < (sizeof(level_candidates) / sizeof(level_candidates[0])); ++i) {
+            uint32_t level = level_candidates[i];
+            if (level == 0) {
+                continue;
+            }
+            ADD_CANDIDATE(base_without_cpu | level);
+#ifdef ESP_INTR_FLAG_SHARED
+            ADD_CANDIDATE(base_without_cpu | level | ESP_INTR_FLAG_SHARED);
+#endif
+#ifdef ESP_INTR_FLAG_CPU1
+            ADD_CANDIDATE(base_without_cpu | level | ESP_INTR_FLAG_CPU1);
+#ifdef ESP_INTR_FLAG_SHARED
+            ADD_CANDIDATE(base_without_cpu | level | ESP_INTR_FLAG_SHARED | ESP_INTR_FLAG_CPU1);
+#endif
+#endif
+        }
+
+#undef ADD_CANDIDATE
+
+        bool installed = false;
+        for (size_t i = 0; i < candidate_count; ++i) {
+            uint32_t candidate = candidate_flags[i];
+
+            ESP_LOGI(TAG, "Retrying twai_driver_install with intr_flags=0x%lx",
+                     (unsigned long)candidate);
+            g_config.intr_flags = candidate;
+            err = twai_driver_install(&g_config, &t_config, &f_config);
+            if (err == ESP_ERR_INVALID_STATE) {
+                ESP_LOGW(TAG, "twai driver already installed, attempting restart");
+                (void)twai_stop();
+                (void)twai_driver_uninstall();
+                err = twai_driver_install(&g_config, &t_config, &f_config);
+            }
+
+            if (err == ESP_OK) {
+                installed = true;
+                break;
+            }
+            if (err == ESP_ERR_NOT_FOUND) {
+                continue;
+            }
+
+            ESP_LOGE(TAG, "twai_driver_install failed: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        if (!installed) {
+            ESP_LOGE(TAG, "Unable to allocate interrupt for TWAI driver");
+            return ESP_ERR_NOT_FOUND;
+        }
+        if (g_config.intr_flags != original_intr_flags) {
+            ESP_LOGW(TAG,
+                     "twai driver installed using fallback intr_flags=0x%lx",
+                     (unsigned long)g_config.intr_flags);
+        }
+    } else if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "twai_driver_install failed: %s", esp_err_to_name(err));
         return err;
-    } else if (err == ESP_ERR_INVALID_STATE) {
+    }
+
+    if (err == ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "twai driver already installed, attempting restart");
         (void)twai_stop();
         (void)twai_driver_uninstall();

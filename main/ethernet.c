@@ -442,7 +442,23 @@ esp_err_t eth_start(void)
         return ESP_FAIL;
     }
 
+    esp_err_t def_netif_err = esp_netif_set_default_netif(s_eth_netif);
+    if (def_netif_err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "default netif already set");
+    } else if (def_netif_err != ESP_OK) {
+        ESP_LOGW(TAG, "unable to set default netif: %s", esp_err_to_name(def_netif_err));
+    }
+
     ESP_RETURN_ON_ERROR(esp_eth_start(s_eth), TAG, "eth start");
+
+    esp_err_t dhcp_err = esp_netif_dhcpc_start(s_eth_netif);
+    if (dhcp_err == ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) {
+        ESP_LOGW(TAG, "Ethernet DHCP client already started");
+    } else if (dhcp_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start Ethernet DHCP client: %s", esp_err_to_name(dhcp_err));
+        eth_stop();
+        return dhcp_err;
+    }
 
     ESP_LOGI(TAG, "Ethernet start: W5500 SPI@%dHz CS=%d INT=%d RST=%d",
              s_w5500_active_clock_hz, ETH_W5500_PIN_CS, ETH_W5500_INT_GPIO, ETH_W5500_RST_GPIO);
