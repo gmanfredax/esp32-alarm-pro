@@ -1,3 +1,8 @@
+# ==== Target ================================================================
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_IDF_TARGET_ESP32S3=y
+# CONFIG_IDF_TARGET_ESP32 is not set
+
 # ==== Flash / Chip ============================================================
 #CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
@@ -9,11 +14,14 @@ CONFIG_ESP32_DEFAULT_CPU_FREQ_240=y
 
 # ==== Logging / Console =======================================================
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
-CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+# CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
+# CONFIG_ESP_CONSOLE_UART_CUSTOM is not set
+CONFIG_ESP_CONSOLE_USB_CDC=y
+CONFIG_ESP_CONSOLE_USB_CDC_RX_BUF_SIZE=256
+CONFIG_ESP_CONSOLE_USB_CDC_TX_BUF_SIZE=256
 CONFIG_NEWLIB_STDIN_LINE_ENDING_CRLF=y
 CONFIG_NEWLIB_STDOUT_LINE_ENDING_CRLF=y
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
-CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 
 # ==== Partizioni (OTA + SPIFFS custom) =======================================
 CONFIG_PARTITION_TABLE_CUSTOM=y
@@ -52,8 +60,8 @@ CONFIG_APP_CLOUD_TOKEN_ENDPOINT="https://api.example.com/token"
 
 # ==== CAN / TWAI ==============================================================
 CONFIG_APP_CAN_ENABLED=y
-CONFIG_APP_CAN_TX_GPIO=5
-CONFIG_APP_CAN_RX_GPIO=4
+CONFIG_APP_CAN_TX_GPIO=38
+CONFIG_APP_CAN_RX_GPIO=39
 CONFIG_APP_CAN_BITRATE_250K=y
 CONFIG_APP_CAN_NODE_TIMEOUT_MS=5000
 CONFIG_APP_CAN_RX_TASK_STACK=4096
@@ -63,8 +71,10 @@ CONFIG_I2C_ISR_IRAM_SAFE=y
 CONFIG_SPI_MASTER_ISR_IN_IRAM=y
 
 # ==== Rete ====================================================================
-# Ethernet RMII (LAN8720): abilita solo Ethernet; ETH_USE_EMAC non esiste in IDF 5.3
+# Ethernet SPI (W5500)
 CONFIG_ETH_ENABLED=y
+CONFIG_ETH_USE_SPI_ETHERNET=y
+CONFIG_ETH_SPI_ETHERNET_W5500=y
 # Se userai anche Wi-Fi abilitalo da menuconfig oppure aggiungi qui le tue opzioni Wi-Fi
 CONFIG_ESP_WIFI_ENABLED=n
 

@@ -238,10 +238,23 @@ esp_err_t mqtt_publish_state(void)
     zone_mask_t bypass_mask;
     alarm_get_bypass_mask(&bypass_mask);
 
-    uint16_t gpioab = 0;
-    inputs_read_all(&gpioab);
-    bool tamper = inputs_tamper(gpioab);
+    uint16_t local_zone_mask = 0;
+    inputs_read_all(&local_zone_mask);
+    (void)local_zone_mask;
+    uint16_t zone_tamper_mask = inputs_zone_tamper_mask();
+    bool tamper_global = inputs_global_tamper();
+    bool tamper = tamper_global || (zone_tamper_mask != 0);
     bool tamper_alarm = (alarm_last_alarm_was_tamper() && st == ALARM_ALARM);
+
+    zone_mask_t tamper_mask_zones;
+    zone_mask_clear(&tamper_mask_zones);
+    for (int i = 0; i < INPUT_ZONES_COUNT && i < (int)ZONE_MASK_CAPACITY; ++i) {
+        if (zone_tamper_mask & (1u << i)) {
+            zone_mask_set(&tamper_mask_zones, (uint16_t)i);
+        }
+    }
+    char tamper_hex[ZONE_MASK_WORDS * 8u + 1u];
+    zone_mask_to_hex(&tamper_mask_zones, INPUT_ZONES_COUNT, tamper_hex, sizeof(tamper_hex));
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
@@ -258,6 +271,9 @@ esp_err_t mqtt_publish_state(void)
     cJSON_AddNumberToObject(root, "bypass_mask_legacy", (double)zone_mask_to_u32(&bypass_mask));
     cJSON_AddItemToObject(root, "tamper", cJSON_CreateBool(tamper));
     cJSON_AddItemToObject(root, "tamper_alarm", cJSON_CreateBool(tamper_alarm));
+    cJSON_AddItemToObject(root, "tamper_global", cJSON_CreateBool(tamper_global));
+    cJSON_AddStringToObject(root, "tamper_zones_mask", tamper_hex);
+    cJSON_AddNumberToObject(root, "tamper_zones_mask_legacy", (double)zone_mask_to_u32(&tamper_mask_zones));
     cJSON_AddNumberToObject(root, "exit_pending_ms", (double)exit_ms);
     cJSON_AddNumberToObject(root, "entry_pending_ms", (double)entry_ms);
     cJSON_AddNumberToObject(root, "entry_zone", (double)entry_zone);
@@ -540,12 +556,31 @@ static void handle_outputs_command(const char *payload)
     cJSON *root = cJSON_Parse(payload);
     if (!root) return;
 
-    cJSON *relay = cJSON_GetObjectItemCaseSensitive(root, "relay");
-    cJSON *ls    = cJSON_GetObjectItemCaseSensitive(root, "ls");
-    cJSON *lm    = cJSON_GetObjectItemCaseSensitive(root, "lm");
+    cJSON *relay      = cJSON_GetObjectItemCaseSensitive(root, "relay");
+    cJSON *relay_int  = cJSON_GetObjectItemCaseSensitive(root, "siren_internal");
+    cJSON *relay_ext  = cJSON_GetObjectItemCaseSensitive(root, "siren_external");
+    cJSON *fog        = cJSON_GetObjectItemCaseSensitive(root, "fog");
+    cJSON *ls         = cJSON_GetObjectItemCaseSensitive(root, "ls");
+    cJSON *lm         = cJSON_GetObjectItemCaseSensitive(root, "lm");
+    cJSON *led_alarm  = cJSON_GetObjectItemCaseSensitive(root, "led_alarm");
+    cJSON *led_r      = cJSON_GetObjectItemCaseSensitive(root, "led_prov_r");
+    cJSON *led_g      = cJSON_GetObjectItemCaseSensitive(root, "led_prov_g");
+    cJSON *led_b      = cJSON_GetObjectItemCaseSensitive(root, "led_prov_b");
+
     if (cJSON_IsNumber(relay)) outputs_siren(relay->valuedouble > 0.5);
-    if (cJSON_IsNumber(ls))    outputs_led_state(ls->valuedouble > 0.5);
-    if (cJSON_IsNumber(lm))    outputs_led_maint(lm->valuedouble > 0.5);
+    if (cJSON_IsNumber(relay_int)) outputs_siren_internal(relay_int->valuedouble > 0.5);
+    if (cJSON_IsNumber(relay_ext)) outputs_siren_external(relay_ext->valuedouble > 0.5);
+    if (cJSON_IsNumber(fog)) outputs_nebbiogeno(fog->valuedouble > 0.5);
+    if (cJSON_IsNumber(ls)) outputs_led_state(ls->valuedouble > 0.5);
+    if (cJSON_IsNumber(lm)) outputs_led_maint(lm->valuedouble > 0.5);
+    if (cJSON_IsNumber(led_alarm)) outputs_led_alarm(led_alarm->valuedouble > 0.5);
+
+    if (cJSON_IsNumber(led_r) || cJSON_IsNumber(led_g) || cJSON_IsNumber(led_b)) {
+        bool r = cJSON_IsNumber(led_r) ? (led_r->valuedouble > 0.5) : false;
+        bool g = cJSON_IsNumber(led_g) ? (led_g->valuedouble > 0.5) : false;
+        bool b = cJSON_IsNumber(led_b) ? (led_b->valuedouble > 0.5) : false;
+        outputs_led_provisioning(r, g, b);
+    }
 
     cJSON_Delete(root);
     mqtt_publish_state();

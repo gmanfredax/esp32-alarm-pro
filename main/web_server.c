@@ -3387,6 +3387,7 @@ typedef struct {
 typedef struct {
     bool known;
     bool active;
+    bool tamper;
     uint8_t board;
     uint8_t board_input;
     bool board_online;
@@ -3447,15 +3448,17 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
         snap->master_total = ZONE_CONFIG_CAPACITY;
     }
 
-    uint16_t gpioab = 0;
-    bool gpio_ok = (inputs_read_all(&gpioab) == ESP_OK);
+    uint16_t zone_mask = 0;
+    bool gpio_ok = (inputs_read_all(&zone_mask) == ESP_OK);
+    uint16_t zone_tamper_mask = inputs_zone_tamper_mask();
     for (int i = 0; i < snap->master_total; ++i) {
         zone_state_entry_t *entry = &snap->entries[i];
         entry->board = 0;
         entry->board_input = (uint8_t)i;
         entry->board_online = gpio_ok;
         entry->known = gpio_ok;
-        entry->active = gpio_ok ? inputs_zone_bit(gpioab, i + 1) : false;
+        entry->active = gpio_ok ? inputs_zone_bit(zone_mask, i + 1) : false;
+        entry->tamper = gpio_ok ? ((zone_tamper_mask & (1u << i)) != 0) : false;
         s_zone_board_map[i] = 0;
         snap->total++;
     }
@@ -3473,10 +3476,11 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
             }
             zone_state_entry_t *entry = &snap->entries[snap->total];
             entry->board = node->node_id;
-            entry->board_input = bit;
-            entry->board_online = (node->state == ROSTER_NODE_STATE_OPERATIONAL);
-            entry->known = entry->board_online && node->inputs_valid;
-            entry->active = entry->known ? ((node->inputs_bitmap & (1u << bit)) != 0u) : false;
+        entry->board_input = bit;
+        entry->board_online = (node->state == ROSTER_NODE_STATE_OPERATIONAL);
+        entry->known = entry->board_online && node->inputs_valid;
+        entry->active = entry->known ? ((node->inputs_bitmap & (1u << bit)) != 0u) : false;
+        entry->tamper = false;
             s_zone_board_map[snap->total] = entry->board;
             snap->total++;
         }
@@ -4535,9 +4539,11 @@ static esp_err_t status_get(httpd_req_t* req){
     if (entry_p && is_armed) state = "PRE_DISARM";
     else if (exit_p && is_armed) state = "PRE_ARM";
 
-    uint16_t gpioab = 0;
-    inputs_read_all(&gpioab);
-    bool tamper = inputs_tamper(gpioab);
+    uint16_t local_zone_mask = 0;
+    inputs_read_all(&local_zone_mask);
+    uint16_t zone_tamper_mask = inputs_zone_tamper_mask();
+    bool tamper_global = inputs_global_tamper();
+    bool tamper = tamper_global || (zone_tamper_mask != 0);
     bool tamper_alarm = (alarm_last_alarm_was_tamper() && _st == ALARM_ALARM);
 
     uint16_t outmask = 0;
@@ -4557,23 +4563,43 @@ static esp_err_t status_get(httpd_req_t* req){
 
     cJSON *zones = cJSON_CreateArray();
     cJSON *zones_known = cJSON_CreateArray();
-    if (zones && zones_known) {
+    cJSON *zones_tamper = cJSON_CreateArray();
+    if (zones && zones_known && zones_tamper) {
+        const zone_state_entry_t *entry = NULL;
         for (int idx = 0; idx < zones_total; ++idx) {
-            const zone_state_entry_t *entry = &snapshot.entries[idx];
+            entry = &snapshot.entries[idx];
             cJSON_AddItemToArray(zones, cJSON_CreateBool(entry->active));
             cJSON_AddItemToArray(zones_known, cJSON_CreateBool(entry->known));
+            cJSON_AddItemToArray(zones_tamper, cJSON_CreateBool(entry->known ? entry->tamper : false));
         }
         cJSON_AddItemToObject(root, "zones_active", zones);
         cJSON_AddItemToObject(root, "zones_known", zones_known);
+        cJSON_AddItemToObject(root, "zones_tamper", zones_tamper);
     } else {
         if (zones) cJSON_Delete(zones);
         if (zones_known) cJSON_Delete(zones_known);
+        if (zones_tamper) cJSON_Delete(zones_tamper);
         cJSON_AddNullToObject(root, "zones_active");
         cJSON_AddNullToObject(root, "zones_known");
+        cJSON_AddNullToObject(root, "zones_tamper");
     }
 
     cJSON_AddBoolToObject(root, "tamper", tamper);
     cJSON_AddBoolToObject(root, "tamper_alarm", tamper_alarm);
+    cJSON_AddBoolToObject(root, "tamper_global", tamper_global);
+
+    zone_mask_t tamper_mask_zones;
+    zone_mask_clear(&tamper_mask_zones);
+    for (int idx = 0; idx < zones_total && idx < INPUT_ZONES_COUNT; ++idx) {
+        if (zone_tamper_mask & (1u << idx)) {
+            zone_mask_set(&tamper_mask_zones, (uint16_t)idx);
+        }
+    }
+    char tamper_hex[ZONE_MASK_WORDS * 8u + 1u];
+    zone_mask_to_hex(&tamper_mask_zones, (uint16_t)zones_total, tamper_hex, sizeof(tamper_hex));
+    cJSON_AddStringToObject(root, "tamper_zones_mask", tamper_hex);
+    cJSON_AddNumberToObject(root, "tamper_zones_mask_legacy", (double)zone_mask_to_u32(&tamper_mask_zones));
+    
     cJSON_AddNumberToObject(root, "outputs_mask", (unsigned)outmask);
     zone_mask_t bypass_mask;
     alarm_get_bypass_mask(&bypass_mask);
@@ -4644,6 +4670,7 @@ static esp_err_t zones_get(httpd_req_t* req){
         cJSON_AddStringToObject(it, "name", zname ? zname : "");
         cJSON_AddBoolToObject(it, "known", entry->known);
         cJSON_AddBoolToObject(it, "active", entry->known ? entry->active : false);
+        cJSON_AddBoolToObject(it, "tamper", entry->known ? entry->tamper : false);
         cJSON_AddBoolToObject(it, "board_online", entry->board_online);
         cJSON_AddNumberToObject(it, "board", (double)entry->board);
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
@@ -5478,9 +5505,9 @@ static esp_err_t tamper_reset_post(httpd_req_t* req)
         return json_reply(req, "{\"error\":\"notamper\",\"message\":\"Allarme non generato dal tamper.\"}");
     }
 
-    uint16_t gpioab = 0;
-    inputs_read_all(&gpioab);
-    if (inputs_tamper(gpioab)) {
+    uint16_t tmp_mask = 0;
+    inputs_read_all(&tmp_mask);
+    if (inputs_global_tamper() || inputs_zone_tamper_mask() != 0) {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "409 Conflict");
         return json_reply(req, "{\"error\":\"tamper_open\",\"message\":\"Linea tamper ancora aperta.\"}");

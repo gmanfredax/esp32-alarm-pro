@@ -5,10 +5,9 @@
 #include <stdint.h>
 
 /**
- * Inizializza l’expander uscite (MCP23017).
- * - IODIRA/IODIRB = 0x00 (tutte uscite)
- * - GPPUA/GPPUB = 0x00 (niente pull-up su uscite)
- * - Uscite tutte a 0
+ * Inizializza l’expander uscite (MCP23017) configurando come uscite soltanto i
+ * bit dedicati a LED (PORTA) e attuatori (PORTB). I bit lasciati come ingressi
+ * (es. tamper globale su B5) non vengono toccati.
  */
 esp_err_t outputs_init(void);
 
@@ -31,5 +30,11 @@ esp_err_t outputs_all_off(void);
 
 /* ───────── Uscite semantiche dedicate (usano i bit di PORTB definiti in pins.h) ───────── */
 void outputs_siren(bool on);
+void outputs_siren_internal(bool on);
+void outputs_siren_external(bool on);
+void outputs_nebbiogeno(bool on);
+
 void outputs_led_state(bool on);
+void outputs_led_alarm(bool on);
 void outputs_led_maint(bool on);
+void outputs_led_provisioning(bool r, bool g, bool b);

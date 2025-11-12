@@ -11,6 +11,8 @@
 #include "i2c_bus.h"    // i2c_bus_get()
 #include "mcp23017.h"
 
+#define BIT_(x) (1u << (x))
+
 // Registri MCP23017 (bank=0)
 #define MCP_IODIRA  0x00
 #define MCP_IODIRB  0x01
@@ -71,7 +73,7 @@ static esp_err_t mcp_device_attach(void)
     // Configurazione device sul bus condiviso
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = MCP23017_ADDR,   // 0x27 (7-bit) definito in pins.h
+        .device_address  = MCP23017_ADDR,
         .scl_speed_hz    = I2C_SPEED_HZ
     };
 
@@ -95,17 +97,38 @@ esp_err_t mcp23017_init(void)
     // Qui lasciamo def. power-on, oppure imposta esplicitamente:
     // ESP_RETURN_ON_ERROR(mcp_wr(MCP_IOCON, 0x20 /* SEQOP=1 */), TAG, "IOCON");
 
-    // Direzioni = input su tutte le linee
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRA, 0xFF), TAG, "IODIRA");
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRB, 0x1F), TAG, "IODIRB");
+    const uint8_t porta_out_mask = (uint8_t)(
+        BIT_(MCPA_LED_STATO_BIT) |
+        BIT_(MCPA_LED_ALLARME_BIT) |
+        BIT_(MCPA_LED_MANUT_BIT) |
+        BIT_(MCPA_LED_PROV_R_BIT) |
+        BIT_(MCPA_LED_PROV_G_BIT) |
+        BIT_(MCPA_LED_PROV_B_BIT));
 
-    // Pull-up interni abilitati su tutte le linee
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUA,  0xFF), TAG, "GPPUA");
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUB,  0x1F), TAG, "GPPUB");
+    const uint8_t portb_out_mask = (uint8_t)(
+        BIT_(MCPB_SIREN_INT_BIT) |
+        BIT_(MCPB_SIREN_EXT_BIT) |
+        BIT_(MCPB_NEBBIOGENO_BIT));
 
-    uint8_t olatb = 0x00;
+    const uint8_t portb_input_mask = (uint8_t)(BIT_(MCPB_TAMPER_GLOBAL_BIT));
 
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_OLATB, olatb), TAG, "OLATB");
+    uint8_t iodira = 0xFF;
+    iodira &= (uint8_t)~porta_out_mask; // 0 = output
+    uint8_t iodirb = 0xFF;
+    iodirb &= (uint8_t)~portb_out_mask;
+
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRA, iodira), TAG, "IODIRA");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRB, iodirb), TAG, "IODIRB");
+
+    uint8_t gppua = (uint8_t)(0xFF & ~porta_out_mask); // pull-up solo su ingressi
+    uint8_t gppub = (uint8_t)(0xFF & ~portb_out_mask);
+    gppub |= portb_input_mask; // abilita pull-up tamper globale
+
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUA, gppua), TAG, "GPPUA");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUB, gppub), TAG, "GPPUB");
+
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUA, gppua), TAG, "GPPUA");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUB, gppub), TAG, "GPPUB");
 
     // Lettura di prova + dump
     uint8_t a=0, b=0;

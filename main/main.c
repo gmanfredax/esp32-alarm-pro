@@ -1527,15 +1527,15 @@ static void system_main_task(void *arg)
     mqtt_publish_state();
     mqtt_publish_scenes();
 
-    uint16_t initial_gpio = 0;
+    uint16_t initial_zones = 0;
     uint16_t last_zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
     zone_mask_t last_mask;
     zone_mask_clear(&last_mask);
     bool first_cycle = true;
-    if (inputs_read_all(&initial_gpio) == ESP_OK) {
+    if (inputs_read_all(&initial_zones) == ESP_OK) {
         uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
         zone_mask_t init_mask;
-        compose_zone_mask(initial_gpio, zones_total, &init_mask);
+        compose_zone_mask(initial_zones, zones_total, &init_mask);
         mqtt_publish_zones(&init_mask);
         zone_mask_copy(&last_mask, &init_mask);
         last_zones_total = zones_total;
@@ -1565,15 +1565,18 @@ static void system_main_task(void *arg)
     // Main loop: leggi ingressi e alimenta la logica d’allarme
     
     while (true) {
-        uint16_t ab = 0;
-        inputs_read_all(&ab);
+        uint16_t zone_bits = 0;
+        if (inputs_read_all(&zone_bits) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
 
         uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
         zone_mask_t zmask;
-        compose_zone_mask(ab, zones_total, &zmask);
+        compose_zone_mask(zone_bits, zones_total, &zmask);
 
-        // esempio: tamper su bit (8+4) come da tuo codice
-        bool tamper = inputs_tamper(ab);
+        uint16_t zone_tamper_mask = inputs_zone_tamper_mask();
+        bool tamper = inputs_global_tamper() || (zone_tamper_mask != 0);
 
         if (first_cycle || !zone_mask_equal(&zmask, &last_mask) || zones_total != last_zones_total) {
             mqtt_publish_zones(&zmask);
