@@ -4,6 +4,8 @@
 
 #include <string.h>
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_check.h"
 #include "driver/i2c_master.h"
 
@@ -39,12 +41,64 @@
 static const char* TAG = "mcp23017";
 static i2c_master_dev_handle_t s_dev = NULL;
 
+static esp_err_t mcp_device_attach(void);
+
+static bool mcp_i2c_error_is_recoverable(esp_err_t err)
+{
+    return err == ESP_ERR_INVALID_STATE ||
+           err == ESP_ERR_TIMEOUT ||
+           err == ESP_ERR_INVALID_RESPONSE ||
+           err == ESP_ERR_NOT_FOUND;
+}
+
+static void mcp_i2c_backoff_delay(int attempt)
+{
+    const TickType_t delay_ticks = pdMS_TO_TICKS(5 * (attempt + 1));
+    vTaskDelay(delay_ticks);
+}
+
+static esp_err_t mcp_recover_device_handle(void)
+{
+    if (s_dev) {
+        esp_err_t rm_err = i2c_master_bus_rm_device(s_dev);
+        if (rm_err != ESP_OK) {
+            ESP_LOGW(TAG, "i2c_master_bus_rm_device failed: %s", esp_err_to_name(rm_err));
+        }
+        s_dev = NULL;
+    }
+
+    ESP_RETURN_ON_ERROR(i2c_bus_init(), TAG, "bus init");
+
+    // Give the expander a moment before re-attaching.
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    esp_err_t attach_err = mcp_device_attach();
+    if (attach_err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    return attach_err;
+}
+
 // --- helper basse ---
 static esp_err_t mcp_wr(uint8_t reg, uint8_t val)
 {
     if (!s_dev) return ESP_ERR_INVALID_STATE;
     uint8_t buf[2] = { reg, val };
-    esp_err_t err = i2c_master_transmit(s_dev, buf, sizeof(buf), 1000 /* ms */);
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        err = i2c_master_transmit(s_dev, buf, sizeof(buf), 1000 /* ms */);
+        if (err == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "I2C write reg 0x%02X attempt %d failed: %s", reg, attempt + 1, esp_err_to_name(err));
+        if (!mcp_i2c_error_is_recoverable(err)) {
+            break;
+        }
+        if (mcp_recover_device_handle() != ESP_OK) {
+            break;
+        }
+        mcp_i2c_backoff_delay(attempt);
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WR reg 0x%02X <- 0x%02X FAILED: %s", reg, val, esp_err_to_name(err));
     }
@@ -55,7 +109,21 @@ static esp_err_t mcp_rd1(uint8_t reg, uint8_t* val)
 {
     if (!s_dev) return ESP_ERR_INVALID_STATE;
     if (!val)   return ESP_ERR_INVALID_ARG;
-    esp_err_t err = i2c_master_transmit_receive(s_dev, &reg, 1, val, 1, 1000 /* ms */);
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        err = i2c_master_transmit_receive(s_dev, &reg, 1, val, 1, 1000 /* ms */);
+        if (err == ESP_OK) {
+            break;
+        }
+        ESP_LOGW(TAG, "I2C read reg 0x%02X attempt %d failed: %s", reg, attempt + 1, esp_err_to_name(err));
+        if (!mcp_i2c_error_is_recoverable(err)) {
+            break;
+        }
+        if (mcp_recover_device_handle() != ESP_OK) {
+            break;
+        }
+        mcp_i2c_backoff_delay(attempt);
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "RD reg 0x%02X FAILED: %s", reg, esp_err_to_name(err));
     }
@@ -86,6 +154,9 @@ static esp_err_t mcp_device_attach(void)
 esp_err_t mcp23017_init(void)
 {
     ESP_RETURN_ON_ERROR(mcp_device_attach(), TAG, "attach");
+
+    // Allow the MCP23017 time to come out of reset before programming registers.
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     // IOCON: BANK=0, SEQOP=0 (auto-increment abilitato), resto default
     ESP_RETURN_ON_ERROR(mcp_wr(MCP_IOCON,   0x00), TAG, "IOCON(A)");

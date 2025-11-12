@@ -7,7 +7,7 @@
 #define I2C_PORT                 I2C_NUM_0
 #define I2C_SDA_GPIO             GPIO_NUM_21
 #define I2C_SCL_GPIO             GPIO_NUM_47
-#define MCP23017_ADDR            0x20
+#define MCP23017_ADDR            0x27
 
 // MCP23017 PORTA → LED, PORTB → uscite potenza
 #define MCPA_LED_STATO_BIT       0

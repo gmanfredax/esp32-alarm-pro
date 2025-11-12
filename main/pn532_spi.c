@@ -122,17 +122,20 @@ esp_err_t pn532_init(void){
             }
         }
 
-        if (!s_isr_service_installed) {
+        esp_err_t add_err = gpio_isr_handler_add(PN532_PIN_IRQ, pn532_irq_handler, NULL);
+        if (add_err == ESP_ERR_INVALID_STATE && !s_isr_service_installed) {
             esp_err_t isr_err = gpio_install_isr_service(0);
             if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
                 ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(isr_err));
                 return isr_err;
             }
             s_isr_service_installed = true;
+            add_err = gpio_isr_handler_add(PN532_PIN_IRQ, pn532_irq_handler, NULL);
         }
 
-        esp_err_t add_err = gpio_isr_handler_add(PN532_PIN_IRQ, pn532_irq_handler, NULL);
-        if (add_err != ESP_OK && add_err != ESP_ERR_INVALID_STATE) {
+        if (add_err == ESP_OK || add_err == ESP_ERR_INVALID_STATE) {
+            s_isr_service_installed = true;
+        } else {
             ESP_LOGE(TAG, "gpio_isr_handler_add failed: %s", esp_err_to_name(add_err));
             return add_err;
         }

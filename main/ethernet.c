@@ -37,6 +37,7 @@
 #include "pins.h"
 
 static const char *TAG = "eth";
+static bool s_gpio_isr_service_installed = false;
 
 static spi_device_handle_t             s_w5500_spi    = NULL;
 static spi_device_interface_config_t   s_w5500_devcfg = {0};
@@ -47,6 +48,24 @@ static EventGroupHandle_t              s_event_group  = NULL;
 static volatile bool                   s_link_up      = false;
 
 #define ETH_EVENT_BIT_GOT_IP  BIT0
+
+static esp_err_t ensure_gpio_isr_service(void)
+{
+    if (s_gpio_isr_service_installed) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = gpio_install_isr_service(0);
+    if (err == ESP_ERR_INVALID_STATE) {
+        // ISR service already installed elsewhere.
+        s_gpio_isr_service_installed = true;
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(err, TAG, "gpio isr service");
+
+    s_gpio_isr_service_installed = true;
+    return ESP_OK;
+}
 
 static esp_err_t w5500_bus_init(void)
 {
@@ -65,6 +84,8 @@ static esp_err_t w5500_bus_init(void)
         .intr_flags = 0,
     };
 
+    ESP_RETURN_ON_ERROR(ensure_gpio_isr_service(), TAG, "install isr service");
+
     esp_err_t err = spi_bus_initialize(ETH_W5500_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(err));
@@ -72,14 +93,17 @@ static esp_err_t w5500_bus_init(void)
     }
 
     s_w5500_devcfg = (spi_device_interface_config_t) {
-        .command_bits = 0,
-        .address_bits = 0,
+        .command_bits = 16,
+        .address_bits = 8,
         .dummy_bits = 0,
         .mode = 0,
         .clock_speed_hz = ETH_W5500_SPI_CLOCK_HZ,
         .spics_io_num = ETH_W5500_PIN_CS,
         .flags = SPI_DEVICE_HALFDUPLEX,
         .queue_size = ETH_W5500_SPI_QUEUE_LEN,
+        .input_delay_ns = 50,
+        .cs_ena_posttrans = 2,
+        .cs_ena_pretrans = 2,
     };
 
     err = spi_bus_add_device(ETH_W5500_SPI_HOST, &s_w5500_devcfg, &s_w5500_spi);
@@ -107,9 +131,9 @@ static esp_err_t w5500_bus_init(void)
         };
         ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&rst_gpio));
         gpio_set_level(ETH_W5500_RST_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(20));
         gpio_set_level(ETH_W5500_RST_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     return ESP_OK;

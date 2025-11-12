@@ -117,7 +117,7 @@
 //   PORTB → Uscite di potenza + tamper globale
 // ─────────────────────────────────────────────────────────────────────────────
 #ifndef MCP23017_ADDR
-  #define MCP23017_ADDR            0x20
+  #define MCP23017_ADDR            0x27
 #endif
 #ifndef MCPA_LED_STATO_BIT
   #define MCPA_LED_STATO_BIT       0
