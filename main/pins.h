@@ -47,8 +47,26 @@
 #ifndef ETH_W5500_SPI_CLOCK_HZ
   #define ETH_W5500_SPI_CLOCK_HZ  (26 * 1000 * 1000)   // 26 MHz stabile anche con cavi lunghi
 #endif
+#ifndef ETH_W5500_SPI_SAFE_CLOCK_HZ
+  #define ETH_W5500_SPI_SAFE_CLOCK_HZ  (8 * 1000 * 1000)   // fallback automatico in caso di problemi all'avvio
+#endif
+#ifndef ETH_W5500_SPI_MIN_CLOCK_HZ
+  #define ETH_W5500_SPI_MIN_CLOCK_HZ   (1 * 1000 * 1000)   // non scendere sotto 1 MHz durante i fallback progressivi
+#endif
+#ifndef ETH_W5500_SW_RESET_TIMEOUT_MS
+  #define ETH_W5500_SW_RESET_TIMEOUT_MS  500
+#endif
 #ifndef ETH_W5500_SPI_QUEUE_LEN
   #define ETH_W5500_SPI_QUEUE_LEN 10
+#endif
+#ifndef ETH_W5500_RST_ASSERT_MS
+  #define ETH_W5500_RST_ASSERT_MS   30
+#endif
+#ifndef ETH_W5500_RST_POST_MS
+  #define ETH_W5500_RST_POST_MS    200
+#endif
+#ifndef ETH_W5500_RETRY_DELAY_MS
+  #define ETH_W5500_RETRY_DELAY_MS 120
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────

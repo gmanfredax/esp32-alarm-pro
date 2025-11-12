@@ -1,6 +1,7 @@
 // main/ethernet.c — Driver Ethernet per ESP32-S3 + W5500 (SPI)
 #include "ethernet.h"
 
+#include <stddef.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -41,6 +42,7 @@ static bool s_gpio_isr_service_installed = false;
 
 static spi_device_handle_t             s_w5500_spi    = NULL;
 static spi_device_interface_config_t   s_w5500_devcfg = {0};
+static int                             s_w5500_active_clock_hz = ETH_W5500_SPI_CLOCK_HZ;
 static esp_eth_handle_t                s_eth          = NULL;
 static esp_netif_t                    *s_eth_netif    = NULL;
 static esp_eth_netif_glue_handle_t     s_glue         = NULL;
@@ -48,6 +50,25 @@ static EventGroupHandle_t              s_event_group  = NULL;
 static volatile bool                   s_link_up      = false;
 
 #define ETH_EVENT_BIT_GOT_IP  BIT0
+
+static void w5500_hw_reset_sequence(uint32_t assert_ms, uint32_t post_ms)
+{
+    if (ETH_W5500_RST_GPIO < 0) {
+        if (post_ms) {
+            vTaskDelay(pdMS_TO_TICKS(post_ms));
+        }
+        return;
+    }
+
+    gpio_set_level(ETH_W5500_RST_GPIO, 0);
+    if (assert_ms) {
+        vTaskDelay(pdMS_TO_TICKS(assert_ms));
+    }
+    gpio_set_level(ETH_W5500_RST_GPIO, 1);
+    if (post_ms) {
+        vTaskDelay(pdMS_TO_TICKS(post_ms));
+    }
+}
 
 static esp_err_t ensure_gpio_isr_service(void)
 {
@@ -99,18 +120,16 @@ static esp_err_t w5500_bus_init(void)
         .mode = 0,
         .clock_speed_hz = ETH_W5500_SPI_CLOCK_HZ,
         .spics_io_num = ETH_W5500_PIN_CS,
-        .flags = SPI_DEVICE_HALFDUPLEX,
+        // Il driver ufficiale del W5500 effettua transazioni full-duplex:
+        // impostare HALFDUPLEX causa "spi transmit failed" durante il reset.
+        .flags = 0,
         .queue_size = ETH_W5500_SPI_QUEUE_LEN,
         .input_delay_ns = 50,
         .cs_ena_posttrans = 2,
         .cs_ena_pretrans = 2,
     };
-
-    err = spi_bus_add_device(ETH_W5500_SPI_HOST, &s_w5500_devcfg, &s_w5500_spi);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    s_w5500_active_clock_hz = ETH_W5500_SPI_CLOCK_HZ;
+    s_w5500_spi = NULL;
 
     gpio_config_t int_gpio = {
         .pin_bit_mask = 1ULL << ETH_W5500_INT_GPIO,
@@ -130,10 +149,7 @@ static esp_err_t w5500_bus_init(void)
             .intr_type = GPIO_INTR_DISABLE,
         };
         ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&rst_gpio));
-        gpio_set_level(ETH_W5500_RST_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(20));
-        gpio_set_level(ETH_W5500_RST_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        w5500_hw_reset_sequence(ETH_W5500_RST_ASSERT_MS, ETH_W5500_RST_POST_MS);
     }
 
     return ESP_OK;
@@ -208,43 +224,177 @@ esp_err_t eth_start(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &on_eth_event, NULL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &on_ip_event, NULL));
 
-    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
-    mac_config.sw_reset_timeout_ms = 100;
-    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
-    phy_config.phy_addr = 0;
-    phy_config.reset_gpio_num = ETH_W5500_RST_GPIO;
+    const int desired_clock_hz = ETH_W5500_SPI_CLOCK_HZ;
+    const int fallback_clock_hz = ETH_W5500_SPI_SAFE_CLOCK_HZ;
+    const int min_clock_hz = ETH_W5500_SPI_MIN_CLOCK_HZ > 0 ? ETH_W5500_SPI_MIN_CLOCK_HZ : 0;
+    int clock_candidates[6] = {0};
+    size_t candidate_count = 0;
+
+    if (desired_clock_hz > 0) {
+        clock_candidates[candidate_count++] = desired_clock_hz;
+    }
+    int pending_clock = -1;
+    bool fallback_added = false;
+    while (candidate_count > 0 &&
+           candidate_count < (sizeof(clock_candidates) / sizeof(clock_candidates[0]))) {
+        int next_clock = -1;
+        if (pending_clock > 0) {
+            next_clock = pending_clock;
+            pending_clock = -1;
+        } else {
+            int last_clock = clock_candidates[candidate_count - 1];
+            if (last_clock <= 0) {
+                break;
+            }
+            int halved_clock = last_clock / 2;
+            if (min_clock_hz > 0 && min_clock_hz < last_clock && halved_clock < min_clock_hz) {
+                halved_clock = min_clock_hz;
+            }
+            if (halved_clock <= 0 || halved_clock == last_clock) {
+                break;
+            }
+            if (!fallback_added && fallback_clock_hz > 0 && fallback_clock_hz < last_clock &&
+                fallback_clock_hz > halved_clock) {
+                next_clock = fallback_clock_hz;
+                pending_clock = halved_clock;
+            } else {
+                next_clock = halved_clock;
+            }
+        }
+
+        bool duplicate = false;
+        for (size_t i = 0; i < candidate_count; ++i) {
+            if (clock_candidates[i] == next_clock) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        clock_candidates[candidate_count++] = next_clock;
+        if (next_clock == fallback_clock_hz) {
+            fallback_added = true;
+        }
+        if (next_clock == min_clock_hz) {
+            break;
+        }
+    }
+
+    if (candidate_count == 0) {
+        ESP_LOGE(TAG, "Nessuna frequenza SPI valida configurata per il W5500");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t driver_err = ESP_FAIL;
+    esp_eth_mac_t *mac = NULL;
+    esp_eth_phy_t *phy = NULL;
+    size_t attempt = 0;
+
+    for (; attempt < candidate_count; ++attempt) {
+        const int clock_hz = clock_candidates[attempt];
+        s_w5500_devcfg.clock_speed_hz = clock_hz;
+        s_w5500_active_clock_hz = clock_hz;
+
+        if (attempt > 0) {
+            ESP_LOGW(TAG, "Nuovo tentativo di inizializzazione W5500 a %d Hz", clock_hz);
+            w5500_hw_reset_sequence(ETH_W5500_RST_ASSERT_MS, ETH_W5500_RST_POST_MS);
+            if (ETH_W5500_RETRY_DELAY_MS > 0) {
+                vTaskDelay(pdMS_TO_TICKS(ETH_W5500_RETRY_DELAY_MS));
+            }
+        }
+
+#if (ESP_IDF_VERSION_MAJOR < 5) || (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 0)
+        if (s_w5500_spi) {
+            spi_bus_remove_device(s_w5500_spi);
+            s_w5500_spi = NULL;
+        }
+        esp_err_t add_err = spi_bus_add_device(ETH_W5500_SPI_HOST, &s_w5500_devcfg, &s_w5500_spi);
+        if (add_err != ESP_OK) {
+            ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(add_err));
+            return add_err;
+        }
+#endif
+
+        eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+        mac_config.sw_reset_timeout_ms = ETH_W5500_SW_RESET_TIMEOUT_MS;
+        eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+        phy_config.phy_addr = 0;
+        phy_config.reset_gpio_num = ETH_W5500_RST_GPIO;
 
 #if defined(ETH_W5500_DEFAULT_CONFIG) && defined(ESP_IDF_VERSION) && defined(ESP_IDF_VERSION_VAL) && \
     (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0))
-    eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(ETH_W5500_SPI_HOST, &s_w5500_devcfg);
+        eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(ETH_W5500_SPI_HOST, &s_w5500_devcfg);
 #elif defined(ETH_W5500_DEFAULT_CONFIG)
-    eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(s_w5500_spi);
+        eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(s_w5500_spi);
 #else
-    eth_w5500_config_t w5500_config = {0};
-    w5500_config.spi_handle = s_w5500_spi;
+        eth_w5500_config_t w5500_config = (eth_w5500_config_t){0};
+        w5500_config.spi_handle = s_w5500_spi;
 #endif
 #if (ESP_IDF_VERSION_MAJOR < 5) || (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 0)
-    w5500_config.spi_handle = s_w5500_spi;
+        w5500_config.spi_handle = s_w5500_spi;
 #endif
-    w5500_config.int_gpio_num = ETH_W5500_INT_GPIO;
+        w5500_config.int_gpio_num = ETH_W5500_INT_GPIO;
 
-    esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
-    ESP_RETURN_ON_FALSE(mac != NULL, ESP_ERR_NO_MEM, TAG, "mac new");
+        mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
+        if (!mac) {
+            ESP_LOGE(TAG, "mac new failed");
+#if (ESP_IDF_VERSION_MAJOR < 5) || (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 0)
+            if (s_w5500_spi) {
+                spi_bus_remove_device(s_w5500_spi);
+                s_w5500_spi = NULL;
+            }
+#endif
+            driver_err = ESP_ERR_NO_MEM;
+            break;
+        }
 
-    esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_config);
-    if (!phy) {
+        phy = esp_eth_phy_new_w5500(&phy_config);
+        if (!phy) {
+            mac->del(mac);
+            mac = NULL;
+            ESP_LOGE(TAG, "phy new failed");
+            driver_err = ESP_ERR_NO_MEM;
+#if (ESP_IDF_VERSION_MAJOR < 5) || (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 0)
+            s_w5500_spi = NULL;
+#endif
+            break;
+        }
+
+        esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
+        driver_err = esp_eth_driver_install(&eth_config, &s_eth);
+        if (driver_err == ESP_OK) {
+#if (ESP_IDF_VERSION_MAJOR < 5) || (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 0)
+            s_w5500_spi = NULL;
+#endif
+            break;
+        }
+
+        phy->del(phy);
+        phy = NULL;
         mac->del(mac);
-        ESP_LOGE(TAG, "phy new failed");
-        return ESP_ERR_NO_MEM;
+        mac = NULL;
+#if (ESP_IDF_VERSION_MAJOR < 5) || (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 0)
+        s_w5500_spi = NULL;
+#endif
+
+        if (driver_err == ESP_ERR_INVALID_VERSION && attempt + 1 < candidate_count) {
+            const int next_clock = clock_candidates[attempt + 1];
+            ESP_LOGW(TAG, "W5500 version check failed a %d Hz, riprovo a %d Hz", clock_hz, next_clock);
+            continue;
+        }
+
+        ESP_LOGE(TAG, "driver install failed: %s", esp_err_to_name(driver_err));
+        return driver_err;
     }
 
-    esp_eth_config_t eth_config = ETH_DEFAULT_CONFIG(mac, phy);
-    esp_err_t driver_err = esp_eth_driver_install(&eth_config, &s_eth);
     if (driver_err != ESP_OK) {
-        ESP_LOGE(TAG, "driver install failed: %s", esp_err_to_name(driver_err));
-        phy->del(phy);
-        mac->del(mac);
+        w5500_bus_deinit();
         return driver_err;
+    }
+
+    if (attempt > 0) {
+        ESP_LOGW(TAG, "W5500 SPI clock ridotto a %d Hz dopo %zu tentativi", s_w5500_active_clock_hz, attempt + 1);
     }
 
     esp_netif_config_t netif_config = ESP_NETIF_DEFAULT_ETH();
@@ -255,6 +405,9 @@ esp_err_t eth_start(void)
         s_eth = NULL;
         phy->del(phy);
         mac->del(mac);
+#if (ESP_IDF_VERSION_MAJOR < 5) || (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 0)
+        s_w5500_spi = NULL;
+#endif
         return ESP_ERR_NO_MEM;
     }
 
@@ -269,13 +422,16 @@ esp_err_t eth_start(void)
         s_eth_netif = NULL;
         esp_eth_driver_uninstall(s_eth);
         s_eth = NULL;
+#if (ESP_IDF_VERSION_MAJOR < 5) || (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 0)
+        s_w5500_spi = NULL;
+#endif
         return ESP_FAIL;
     }
 
     ESP_RETURN_ON_ERROR(esp_eth_start(s_eth), TAG, "eth start");
 
     ESP_LOGI(TAG, "Ethernet start: W5500 SPI@%dHz CS=%d INT=%d RST=%d",
-             ETH_W5500_SPI_CLOCK_HZ, ETH_W5500_PIN_CS, ETH_W5500_INT_GPIO, ETH_W5500_RST_GPIO);
+             s_w5500_active_clock_hz, ETH_W5500_PIN_CS, ETH_W5500_INT_GPIO, ETH_W5500_RST_GPIO);
     return ESP_OK;
 }
 
@@ -293,6 +449,9 @@ void eth_stop(void)
         }
         esp_eth_driver_uninstall(s_eth);
         s_eth = NULL;
+#if (ESP_IDF_VERSION_MAJOR < 5) || (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 0)
+        s_w5500_spi = NULL;
+#endif
     }
     s_link_up = false;
     if (s_event_group) {
