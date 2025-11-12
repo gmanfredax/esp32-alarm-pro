@@ -58,6 +58,24 @@
 //#define TWAI_FRAME_MAX_DLC 8
 //#endif
 
+#define SYSTEM_MAIN_TASK_STACK_BYTES      (16384)
+#define SYSTEM_MAIN_TASK_PRIORITY         (tskIDLE_PRIORITY + 5)
+#define WEB_SERVER_START_TASK_STACK_BYTES (16384)
+#define WEB_SERVER_START_TASK_PRIORITY    (SYSTEM_MAIN_TASK_PRIORITY)
+#define SNTP_SYNC_TASK_STACK_BYTES        (4096)
+#define SNTP_SYNC_TASK_PRIORITY           (tskIDLE_PRIORITY + 3)
+
+_Static_assert((SYSTEM_MAIN_TASK_STACK_BYTES % sizeof(StackType_t)) == 0,
+               "SYSTEM_MAIN_TASK_STACK_BYTES must align to StackType_t size");
+_Static_assert((SNTP_SYNC_TASK_STACK_BYTES % sizeof(StackType_t)) == 0,
+               "SNTP_SYNC_TASK_STACK_BYTES must align to StackType_t size");
+
+static const char *TAG = "app";
+
+static TaskHandle_t                 s_sntp_task_handle  = NULL;
+static bool                         s_sntp_synced_once  = false;
+static esp_event_handler_instance_t s_sntp_ip_handler   = NULL;
+
 static void sntp_start_and_wait(void){
     // API compatibile con IDF “classico” (LWIP SNTP)
     sntp_setoperatingmode(SNTP_OPMODE_POLL);
@@ -79,7 +97,60 @@ static void sntp_start_and_wait(void){
     }
 }
 
-static const char *TAG = "app";
+static void sntp_sync_task(void *arg)
+{
+    (void)arg;
+    sntp_start_and_wait();
+    s_sntp_task_handle = NULL;
+    s_sntp_synced_once = true;
+    if (s_sntp_ip_handler) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_ETH_GOT_IP, s_sntp_ip_handler));
+        s_sntp_ip_handler = NULL;
+    }
+    vTaskDelete(NULL);
+}
+
+static bool sntp_start_sync_task(void)
+{
+    if (s_sntp_task_handle) {
+        return true;
+    }
+    BaseType_t created = xTaskCreate(sntp_sync_task,
+                                     "sntp_sync",
+                                     SNTP_SYNC_TASK_STACK_BYTES,
+                                     NULL,
+                                     SNTP_SYNC_TASK_PRIORITY,
+                                     &s_sntp_task_handle);
+    if (created != pdPASS) {
+        ESP_LOGE(TAG, "Unable to create SNTP sync task");
+        s_sntp_task_handle = NULL;
+        return false;
+    }
+    return true;
+}
+
+static void sntp_start_when_ip_ready(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    (void)arg;
+    (void)base;
+    (void)id;
+    (void)data;
+    if (s_sntp_synced_once) {
+        goto cleanup;
+    }
+    if (!sntp_start_sync_task()) {
+        return;
+    }
+    ESP_LOGI(TAG, "Ethernet IP ready, starting SNTP in background");
+
+cleanup:
+    if (s_sntp_ip_handler) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_ETH_GOT_IP, s_sntp_ip_handler));
+        s_sntp_ip_handler = NULL;
+    }
+}
 
 // #if defined(CONFIG_APP_CAN_ENABLED)
 // static const char *TAG_CAN = "can";
@@ -99,15 +170,6 @@ static const char *TAG = "app";
 // static void can_master_lss_tick(void);
 // static void can_process_lss_response(const twai_message_t *msg);
 // #endif
-
-#define SYSTEM_MAIN_TASK_STACK_BYTES      (16384)
-#define SYSTEM_MAIN_TASK_PRIORITY         (tskIDLE_PRIORITY + 5)
-#define WEB_SERVER_START_TASK_STACK_BYTES (16384)
-#define WEB_SERVER_START_TASK_PRIORITY    (SYSTEM_MAIN_TASK_PRIORITY)
-
-_Static_assert((SYSTEM_MAIN_TASK_STACK_BYTES % sizeof(StackType_t)) == 0,
-               "SYSTEM_MAIN_TASK_STACK_BYTES must align to StackType_t size");
-
 
 // ---- START CANBUS -------------------------------------------
 
@@ -1499,6 +1561,7 @@ static void system_main_task(void *arg)
     // reset_buttons_init();
     // ESP_LOGI(TAG, "Pulsanti HW reset su GPIO %d e %d", PIN_HW_RESET_BTN_A, PIN_HW_RESET_BTN_B);
     bool eth_ready_for_time = false;
+    bool waiting_for_async_sntp = false;
     if (eth_ret == ESP_OK) {
         const TickType_t wait_timeout = pdMS_TO_TICKS(15000);
         esp_err_t wait_res = eth_wait_for_ip(wait_timeout);
@@ -1512,12 +1575,33 @@ static void system_main_task(void *arg)
         } else if (wait_res == ESP_ERR_TIMEOUT) {
             ESP_LOGW(TAG, "Timeout waiting for Ethernet IP (%lu ms)",
                      (unsigned long)(wait_timeout * portTICK_PERIOD_MS));
+            if (!s_sntp_synced_once && !s_sntp_task_handle && !s_sntp_ip_handler) {
+                esp_err_t reg_err = esp_event_handler_instance_register(IP_EVENT,
+                                                                        IP_EVENT_ETH_GOT_IP,
+                                                                        &sntp_start_when_ip_ready,
+                                                                        NULL,
+                                                                        &s_sntp_ip_handler);
+                if (reg_err == ESP_OK) {
+                    waiting_for_async_sntp = true;
+                    ESP_LOGI(TAG, "SNTP will start automatically when Ethernet gets an IP address");
+                } else if (reg_err == ESP_ERR_INVALID_STATE) {
+                    ESP_LOGW(TAG, "Unable to register SNTP retry handler: event loop not ready");
+                } else {
+                    ESP_LOGE(TAG, "Failed to register SNTP retry handler: %s", esp_err_to_name(reg_err));
+                }
+            }
         } else {
             ESP_LOGW(TAG, "Failed waiting for Ethernet IP: %s", esp_err_to_name(wait_res));
+        }
+        if (!waiting_for_async_sntp && (s_sntp_ip_handler || s_sntp_task_handle)) {
+            waiting_for_async_sntp = true;
         }
     }
     if (eth_ready_for_time) {
         sntp_start_and_wait();
+        s_sntp_synced_once = true;
+    } else if (waiting_for_async_sntp) {
+        ESP_LOGW(TAG, "Skipping SNTP start for now; will retry when Ethernet gets an IP");
     } else {
         ESP_LOGW(TAG, "Skipping SNTP start because Ethernet is not ready");
     }
