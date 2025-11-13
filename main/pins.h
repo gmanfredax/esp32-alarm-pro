@@ -96,6 +96,30 @@
 #endif
 
 
+// ================================ ADS1115 ====================================
+#ifndef ADS1115_COUNT
+  #define ADS1115_COUNT 3
+#endif
+
+#if ADS1115_COUNT > 0
+  #ifndef ADS1115_ADDR_0
+    #define ADS1115_ADDR_0 0x48
+  #endif
+#endif
+#if ADS1115_COUNT > 1
+  #ifndef ADS1115_ADDR_1
+    #define ADS1115_ADDR_1 0x49
+  #endif
+#endif
+#if ADS1115_COUNT > 2
+  #ifndef ADS1115_ADDR_2
+    #define ADS1115_ADDR_2 0x4A
+  #endif
+#endif
+
+_Static_assert(ADS1115_COUNT >= 0 && ADS1115_COUNT <= 3, "Supporto massimo: tre ADS1115");
+
+
 // ================================ MCP23017 ===================================
 // Indirizzo 7-bit NON shiftato (modifica se A2..A0 != 111)
 #ifndef MCP23017_ADDR
