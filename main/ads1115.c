@@ -25,6 +25,7 @@ static const char* TAG = "ads1115";
 typedef struct {
     bool in_use;
     i2c_master_dev_handle_t handle;
+    uint8_t address;
     ads1115_operating_config_t options;
     ads1115_mux_t current_mux;
     uint16_t base_config;
@@ -142,6 +143,7 @@ static void reset_state(void)
     for (size_t i = 0; i < ADS1115_MAX_DEVICES; ++i) {
         s_devices[i].in_use = false;
         s_devices[i].handle = NULL;
+        s_devices[i].address = 0;
         memset(&s_devices[i].options, 0, sizeof(s_devices[i].options));
         s_devices[i].current_mux = ADS1115_MUX_AIN0_GND;
         s_devices[i].base_config = 0;
@@ -162,9 +164,8 @@ esp_err_t ads1115_uninstall(void)
             }
             s_devices[i].handle = NULL;
         }
-        s_devices[i].in_use = false;
     }
-    s_device_count = 0;
+    reset_state();
     return ESP_OK;
 }
 
@@ -184,16 +185,22 @@ esp_err_t ads1115_install(const ads1115_device_config_t* configs, size_t count)
     i2c_master_bus_handle_t bus = i2c_bus_get();
     ESP_RETURN_ON_FALSE(bus != NULL, ESP_ERR_INVALID_STATE, TAG, "I2C bus not ready");
 
+    size_t ready = 0;
     for (size_t i = 0; i < count; ++i) {
         const ads1115_device_config_t* cfg = &configs[i];
-        ads1115_device_t* dev = &s_devices[i];
+        ads1115_device_t* dev = &s_devices[ready];
 
         i2c_device_config_t dev_cfg = {
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
             .device_address = cfg->address,
             .scl_speed_hz = I2C_SPEED_HZ,
         };
-        ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(bus, &dev_cfg, &dev->handle), TAG, "add device");
+
+        esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg, &dev->handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "ADS1115 add_device @0x%02X failed: %s", cfg->address, esp_err_to_name(err));
+            continue;
+        }
 
         dev->options = cfg->options;
         dev->base_config = build_config_word(&dev->options);
@@ -201,18 +208,53 @@ esp_err_t ads1115_install(const ads1115_device_config_t* configs, size_t count)
         dev->conversion_wait_ticks = compute_wait_ticks(&dev->options);
         dev->poll_delay_ticks = ensure_min_tick(pdMS_TO_TICKS(1));
         dev->in_use = true;
+        dev->address = cfg->address;
 
-        // set soglie comparator default
-        ESP_RETURN_ON_ERROR(write_reg(dev->handle, ADS1115_REG_LO_THRESH, 0x8000), TAG, "lo_thresh");
-        ESP_RETURN_ON_ERROR(write_reg(dev->handle, ADS1115_REG_HI_THRESH, 0x7FFF), TAG, "hi_thresh");
+        bool skip_thresholds = (dev->options.comp_queue == ADS1115_COMP_QUEUE_DISABLE);
+        if (!skip_thresholds) {
+            err = write_reg(dev->handle, ADS1115_REG_LO_THRESH, 0x8000);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "ADS1115 @0x%02X NACK writing LO threshold: %s", cfg->address, esp_err_to_name(err));
+                goto skip_device;
+            }
+            err = write_reg(dev->handle, ADS1115_REG_HI_THRESH, 0x7FFF);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "ADS1115 @0x%02X NACK writing HI threshold: %s", cfg->address, esp_err_to_name(err));
+                goto skip_device;
+            }
+        }
 
-        ESP_RETURN_ON_ERROR(apply_config_to_device(dev, cfg->default_mux), TAG, "config");
-        ESP_LOGI(TAG, "ADS1115[%zu] ready @0x%02X (mode=%s, gain=%d, rate=%d SPS)", i, cfg->address,
+        err = apply_config_to_device(dev, cfg->default_mux);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "ADS1115 @0x%02X configuration failed: %s", cfg->address, esp_err_to_name(err));
+            goto skip_device;
+        }
+
+        ESP_LOGI(TAG, "ADS1115[%zu] ready @0x%02X (mode=%s, gain=%d, rate=%d SPS)", ready, cfg->address,
                  (cfg->options.mode == ADS1115_MODE_SINGLE_SHOT) ? "single" : "continuous",
                  cfg->options.gain, cfg->options.data_rate);
+        ready++;
+        continue;
+
+    skip_device:
+        if (dev->handle) {
+            esp_err_t rm_err = i2c_master_bus_rm_device(dev->handle);
+            if (rm_err != ESP_OK) {
+                ESP_LOGW(TAG, "ADS1115 cleanup @0x%02X failed: %s", cfg->address, esp_err_to_name(rm_err));
+            }
+        }
+        memset(dev, 0, sizeof(*dev));
+        dev->poll_delay_ticks = ensure_min_tick(pdMS_TO_TICKS(1));
     }
 
-    s_device_count = count;
+    s_device_count = ready;
+    if (ready == 0 && count > 0) {
+        ESP_LOGW(TAG, "No ADS1115 devices responded (requested=%zu)", count);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (ready > 0 && ready < count) {
+        ESP_LOGW(TAG, "ADS1115 detected %zu/%zu requested device(s)", ready, count);
+    }
     return ESP_OK;
 }
 
@@ -229,6 +271,19 @@ esp_err_t ads1115_get_config(size_t unit, ads1115_operating_config_t* out_cfg)
         return ESP_ERR_INVALID_ARG;
     }
     *out_cfg = dev->options;
+    return ESP_OK;
+}
+
+esp_err_t ads1115_get_info(size_t unit, ads1115_device_info_t* out_info)
+{
+    ads1115_device_t* dev = get_device(unit);
+    ESP_RETURN_ON_FALSE(dev && dev->in_use, ESP_ERR_INVALID_ARG, TAG, "invalid unit");
+    ESP_RETURN_ON_FALSE(out_info != NULL, ESP_ERR_INVALID_ARG, TAG, "null info");
+
+    out_info->address = dev->address;
+    out_info->options = dev->options;
+    out_info->current_mux = dev->current_mux;
+    out_info->last_config_word = dev->last_config_word;
     return ESP_OK;
 }
 

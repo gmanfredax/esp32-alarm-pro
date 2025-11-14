@@ -140,6 +140,27 @@
     lastRequestAt: 0,
   };
 
+  const ADS_DIAG_REFRESH_THRESHOLD_MS = 15000;
+  const adsDiagState = {
+    enabled: true,
+    loading: false,
+    error: "",
+    expected: 0,
+    detected: 0,
+    devices: [],
+    timestampMs: null,
+  };
+  let adsDiagFetchedOnce = false;
+
+  const ANALOG_MODE_LABELS = { 1: '1EOL', 2: '2EOL', 3: '3EOL' };
+  const analogEolState = {
+    payload: null,
+    loading: false,
+    saving: false,
+    error: "",
+    lastFetched: 0,
+  };
+
   const TELEMETRY_REFRESH_MS = 1500;
   let telemetryTimer = null;
   let telemetryNodeId = null;
@@ -167,6 +188,17 @@
       return String(num);
     }
   }
+
+  const analogModeLabel = (mode) => {
+    const key = Number(mode);
+    return ANALOG_MODE_LABELS[key] || '';
+  };
+
+  const formatAnalogValue = (value) => {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return '';
+    return num.toFixed(2);
+  };
 
   const normalizeRole = (roleValue) => {
     if (typeof roleValue === 'number') return Number.isNaN(roleValue) ? null : roleValue;
@@ -248,6 +280,8 @@
           if (current) current.classList.add("active");
         }
         if (id !== "view-mqtt") maskMqttPassword();
+        if (id === "view-diagnostics") maybeAutoRefreshAdsDiag();
+        if (id === "view-general") loadAnalogEolConfig();
       });
     });
   }
@@ -699,6 +733,518 @@
         status.classList.add("muted");
       }
     }
+  }
+
+  function formatVoltage(value){
+    const num = Number(value);
+    if (!Number.isFinite(num)) return "—";
+    return `${num.toFixed(3)} V`;
+  }
+
+  function formatAddressHex(hexValue, addressValue){
+    if (typeof hexValue === "string" && hexValue.trim()) {
+      return hexValue.trim();
+    }
+    const addrNum = Number(addressValue);
+    if (!Number.isFinite(addrNum)) {
+      return "0x??";
+    }
+    return `0x${addrNum.toString(16).padStart(2, "0").toUpperCase()}`;
+  }
+
+  function buildAdsDiagCard(device, fallbackIndex){
+    const card = document.createElement("div");
+    card.className = "diag-card";
+
+    const online = device?.online === true;
+    const addressHex = formatAddressHex(device?.address_hex, device?.address);
+    const slot = Number(device?.slot);
+    const displayIndex = Number.isFinite(slot) ? slot + 1 : fallbackIndex + 1;
+
+    const header = document.createElement("div");
+    header.className = "diag-card-head";
+
+    const title = document.createElement("h4");
+    title.textContent = `Modulo ${displayIndex} — ${addressHex}`;
+    header.appendChild(title);
+
+    const badge = document.createElement("span");
+    const hasError = !!device?.error_code;
+    badge.className = `tag ${online ? (hasError ? "warn" : "ok") : "err"}`;
+    badge.textContent = online ? (hasError ? "Online (attenzione)" : "Online") : "Offline";
+    header.appendChild(badge);
+
+    card.appendChild(header);
+
+    const meta = document.createElement("div");
+    meta.className = "diag-meta";
+    const addressDec = Number(device?.address);
+    const labelAddress = Number.isFinite(addressDec) ? ` (${addressDec})` : "";
+    meta.innerHTML = `Indirizzo I²C: <code>${escapeHtml(addressHex)}</code>${labelAddress}`;
+    card.appendChild(meta);
+
+    const config = device?.config || {};
+    const modeLabel = config.mode_label || "—";
+    const gainLabel = config.gain_label || "—";
+    const rateLabel = config.data_rate_label || (Number.isFinite(Number(config.data_rate_sps)) ? `${config.data_rate_sps} SPS` : "—");
+    const compLabel = config.comp_queue_label || (config.comparator_enabled ? "Comparator attivo" : "Comparator disabilitato");
+
+    const metaList = document.createElement("ul");
+    metaList.className = "diag-meta-list";
+    metaList.innerHTML = `
+      <li><span>Modo:</span> <strong>${escapeHtml(modeLabel)}</strong></li>
+      <li><span>Gain:</span> <strong>${escapeHtml(gainLabel)}</strong></li>
+      <li><span>Frequenza:</span> <strong>${escapeHtml(rateLabel)}</strong></li>
+      <li><span>Comparator:</span> <strong>${escapeHtml(compLabel)}</strong></li>
+    `;
+    card.appendChild(metaList);
+
+    const statusMsg = document.createElement("p");
+    statusMsg.className = "diag-message";
+    const statusText = device?.status ? String(device.status) : (online ? "Dispositivo online." : "Modulo non rilevato sul bus I²C.");
+    statusMsg.textContent = statusText;
+    if (!online) {
+      statusMsg.classList.add("warn");
+    } else if (device?.error_code) {
+      statusMsg.classList.add("error");
+    } else {
+      statusMsg.classList.add("ok");
+    }
+    card.appendChild(statusMsg);
+
+    const channels = Array.isArray(device?.channels) ? device.channels : [];
+    if (channels.length) {
+      const table = document.createElement("table");
+      table.className = "diag-channels";
+      table.innerHTML = "<thead><tr><th>Canale</th><th>Raw</th><th>Tensione</th></tr></thead>";
+      const tbody = document.createElement("tbody");
+      channels.forEach((ch) => {
+        const tr = document.createElement("tr");
+        const indexCell = document.createElement("td");
+        const idxValue = Number(ch?.index);
+        indexCell.textContent = Number.isFinite(idxValue) ? `AIN${idxValue}` : "—";
+        const rawCell = document.createElement("td");
+        const rawValue = Number(ch?.raw);
+        rawCell.textContent = Number.isFinite(rawValue) ? String(rawValue) : "—";
+        const voltCell = document.createElement("td");
+        const voltValue = Number(ch?.voltage);
+        voltCell.textContent = Number.isFinite(voltValue) ? formatVoltage(voltValue) : "—";
+        tr.append(indexCell, rawCell, voltCell);
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      card.appendChild(table);
+    }
+
+    return card;
+  }
+
+  function renderAdsDiagnostics(){
+    const summary = $("#adsDiagSummary");
+    const refreshBtn = $("#adsDiagRefreshBtn");
+    const container = $("#adsDiagDevices");
+    const emptyMsg = $("#adsDiagEmpty");
+    const timestampEl = $("#adsDiagTimestamp");
+
+    if (refreshBtn) {
+      refreshBtn.disabled = !!adsDiagState.loading;
+    }
+
+    if (summary) {
+      summary.classList.remove("error", "success", "muted");
+      if (adsDiagState.loading) {
+        summary.textContent = "Caricamento diagnostica ADS1115…";
+        summary.classList.add("muted");
+      } else if (adsDiagState.error) {
+        summary.textContent = `Errore: ${adsDiagState.error}`;
+        summary.classList.add("error");
+      } else if (!adsDiagState.enabled) {
+        summary.textContent = "Gli ADS1115 non sono abilitati in questo firmware.";
+        summary.classList.add("muted");
+      } else if (adsDiagState.expected === 0) {
+        summary.textContent = "Nessun ADS1115 configurato.";
+        summary.classList.add("muted");
+      } else if (adsDiagState.detected === adsDiagState.expected) {
+        summary.textContent = `Tutti gli ADS1115 sono online (${adsDiagState.detected} su ${adsDiagState.expected}).`;
+        summary.classList.add("success");
+      } else if (adsDiagState.detected > 0) {
+        summary.textContent = `Rilevati ${adsDiagState.detected} su ${adsDiagState.expected} ADS1115.`;
+        summary.classList.add("error");
+      } else {
+        summary.textContent = "Nessun ADS1115 rilevato sul bus I²C.";
+        summary.classList.add("error");
+      }
+    }
+
+    if (container && !adsDiagState.loading) {
+      container.innerHTML = "";
+      if (adsDiagState.enabled && Array.isArray(adsDiagState.devices) && adsDiagState.devices.length) {
+        const frag = document.createDocumentFragment();
+        adsDiagState.devices.forEach((device, idx) => {
+          const card = buildAdsDiagCard(device, idx);
+          if (card) frag.appendChild(card);
+        });
+        container.appendChild(frag);
+      }
+    }
+
+    if (emptyMsg) {
+      let show = false;
+      let message = "Nessun dato disponibile.";
+      if (!adsDiagState.loading) {
+        if (!adsDiagState.enabled) {
+          message = "Gli ADS1115 non sono abilitati in questo firmware.";
+          show = true;
+        } else if (adsDiagState.expected === 0) {
+          message = "Nessun ADS1115 configurato.";
+          show = true;
+        } else if (!adsDiagState.devices.length) {
+          show = true;
+        }
+      }
+      emptyMsg.textContent = message;
+      emptyMsg.classList.toggle("hidden", !show);
+    }
+
+    if (timestampEl) {
+      if (!adsDiagState.loading && adsDiagState.enabled && adsDiagState.timestampMs) {
+        timestampEl.textContent = `Ultimo aggiornamento: ${formatDateTime(adsDiagState.timestampMs)}.`;
+        timestampEl.classList.remove("hidden");
+      } else {
+        timestampEl.textContent = "";
+        timestampEl.classList.add("hidden");
+      }
+    }
+  }
+
+  async function loadAdsDiagnostics(){
+    if (adsDiagState.loading) return;
+    adsDiagState.loading = true;
+    adsDiagState.error = "";
+    renderAdsDiagnostics();
+    try {
+      const data = await apiGet("/api/admin/diagnostics/ads1115");
+      adsDiagState.enabled = data?.enabled !== false;
+      adsDiagState.expected = Number.isFinite(Number(data?.expected)) ? Number(data.expected) : 0;
+      adsDiagState.detected = Number.isFinite(Number(data?.detected)) ? Number(data.detected) : 0;
+      adsDiagState.timestampMs = Number.isFinite(Number(data?.timestamp_ms)) ? Number(data.timestamp_ms) : Date.now();
+      const devices = Array.isArray(data?.devices) ? data.devices : [];
+      adsDiagState.devices = adsDiagState.enabled ? devices : [];
+      adsDiagState.error = "";
+      adsDiagFetchedOnce = true;
+    } catch (err){
+      adsDiagState.error = err?.message || "Impossibile caricare la diagnostica ADS1115.";
+      if (!adsDiagFetchedOnce) {
+        adsDiagState.devices = [];
+      }
+    } finally {
+      adsDiagState.loading = false;
+      renderAdsDiagnostics();
+    }
+  }
+
+  function setupAdsDiagnostics(){
+    const refreshBtn = $("#adsDiagRefreshBtn");
+    if (refreshBtn && !refreshBtn._adsBound){
+      refreshBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        if (!adsDiagState.loading) {
+          loadAdsDiagnostics();
+        }
+      });
+      refreshBtn._adsBound = true;
+    }
+    return loadAdsDiagnostics();
+  }
+
+  function maybeAutoRefreshAdsDiag(){
+    if (adsDiagState.loading) return;
+    const last = Number(adsDiagState.timestampMs) || 0;
+    const stale = !adsDiagFetchedOnce || (Date.now() - last) > ADS_DIAG_REFRESH_THRESHOLD_MS;
+    if (adsDiagState.error || stale) {
+      loadAdsDiagnostics();
+    }
+  }
+
+  function setAnalogStatus(text, variant){
+    const statusEl = $("#analogEolStatus");
+    if (!statusEl) return;
+    statusEl.textContent = text || '';
+    statusEl.classList.remove('hidden', 'error', 'success', 'warn');
+    if (!text) {
+      statusEl.classList.add('hidden');
+      return;
+    }
+    if (variant === 'error') {
+      statusEl.classList.add('error');
+      statusEl.classList.remove('muted');
+    } else if (variant === 'success') {
+      statusEl.classList.add('success');
+      statusEl.classList.remove('muted');
+    } else if (variant === 'warn') {
+      statusEl.classList.add('warn');
+      statusEl.classList.remove('muted');
+    } else {
+      statusEl.classList.remove('error', 'success', 'warn');
+      statusEl.classList.add('muted');
+    }
+  }
+
+  function updateAnalogRowMode(row){
+    if (!row) return;
+    const modeSelect = row.querySelector('[data-field="mode"]');
+    const mode = Number(modeSelect?.value ?? 0);
+    const disableTamper = mode === 1;
+    row.querySelectorAll('[data-field="tamper_low"], [data-field="tamper_high"]').forEach((input) => {
+      if (!(input instanceof HTMLInputElement)) return;
+      input.disabled = disableTamper;
+      if (!disableTamper) {
+        input.classList.remove('input-error');
+      }
+    });
+  }
+
+  function renderAnalogEolSection(){
+    const tableWrap = document.querySelector('.analog-table-wrap');
+    const tbody = $("#analogEolTableBody");
+    const emptyEl = $("#analogEolEmpty");
+    const saveBtn = $("#analogEolSaveBtn");
+    const reloadBtn = $("#analogEolReloadBtn");
+
+    if (reloadBtn) reloadBtn.disabled = analogEolState.loading;
+    if (saveBtn) saveBtn.disabled = analogEolState.loading || analogEolState.saving;
+
+    if (analogEolState.loading) {
+      setAnalogStatus('Caricamento…');
+    } else if (analogEolState.error) {
+      setAnalogStatus(`Errore: ${analogEolState.error}`, 'error');
+    } else if (analogEolState.payload && analogEolState.payload.enabled) {
+      const expected = Number.isFinite(Number(analogEolState.payload.expected_devices))
+        ? Number(analogEolState.payload.expected_devices) : 0;
+      const detected = Number.isFinite(Number(analogEolState.payload.detected_devices))
+        ? Number(analogEolState.payload.detected_devices) : 0;
+      const analogCount = Number.isFinite(Number(analogEolState.payload.analog_count))
+        ? Number(analogEolState.payload.analog_count) : 0;
+      const variant = expected > 0 && detected < expected
+        ? 'warn'
+        : (analogCount > 0 ? 'success' : null);
+      const message = `Zone analogiche: ${analogCount}. ADS1115 rilevati ${detected}/${expected}.`;
+      setAnalogStatus(message, variant);
+    } else if (analogEolState.payload && analogEolState.payload.enabled === false) {
+      setAnalogStatus('Zone analogiche disabilitate.', null);
+    } else {
+      setAnalogStatus('', null);
+    }
+
+    const zones = Array.isArray(analogEolState.payload?.zones) ? analogEolState.payload.zones : [];
+    const showTable = !analogEolState.error && !analogEolState.loading && analogEolState.payload?.enabled && zones.length > 0;
+    if (tableWrap) tableWrap.classList.toggle('hidden', !showTable);
+    if (emptyEl) emptyEl.classList.toggle('hidden', showTable || analogEolState.error || analogEolState.loading);
+
+    if (!showTable) {
+      if (tbody) tbody.innerHTML = '';
+      return;
+    }
+
+    const rowsHtml = zones.map((zone) => {
+      const index = Number(zone?.index ?? -1);
+      if (!Number.isFinite(index) || index < 0) {
+        return '';
+      }
+      const zoneId = Number(zone?.zone_id ?? index + 1);
+      const userName = typeof zone?.name === 'string' && zone.name.trim() ? zone.name.trim() : '';
+      const title = userName ? `Z${zoneId} • ${userName}` : `Z${zoneId}`;
+      const deviceSlot = Number(zone?.device_slot ?? 0) + 1;
+      const channel = Number(zone?.channel ?? 0);
+      const mode = Number(zone?.mode ?? 2);
+
+      const metaEntries = [];
+      metaEntries.push({ text: `Dispositivo ${deviceSlot} • Canale ${channel}`, cls: '' });
+      if (zone?.address_hex) metaEntries.push({ text: `Indirizzo ${zone.address_hex}`, cls: '' });
+      const modeLabel = analogModeLabel(mode);
+      if (modeLabel) metaEntries.push({ text: `Modalità ${modeLabel}`, cls: '' });
+      if (zone?.device_present === false) {
+        metaEntries.push({ text: 'Modulo non rilevato', cls: 'warn' });
+      } else if (zone?.sample_valid === false) {
+        metaEntries.push({ text: 'Campione non disponibile', cls: 'warn' });
+      } else if (zone?.sample_valid && zone?.voltage != null) {
+        metaEntries.push({ text: `Ultima lettura ${formatAnalogValue(zone.voltage)} V`, cls: '' });
+      }
+      if (zone?.alarm_active) metaEntries.push({ text: 'Allarme attivo', cls: 'warn' });
+      if (zone?.tamper_active) metaEntries.push({ text: 'Tamper attivo', cls: 'error' });
+      if (zone?.last_error) metaEntries.push({ text: `Errore: ${zone.last_error}`, cls: 'warn' });
+
+      const metaHtml = metaEntries.map((entry) => `<div class="analog-zone-meta${entry.cls ? ` ${entry.cls}` : ''}">${escapeHtml(entry.text)}</div>`).join('');
+
+      const normalMin = formatAnalogValue(zone?.normal_min);
+      const normalMax = formatAnalogValue(zone?.normal_max);
+      const alarmMin = formatAnalogValue(zone?.alarm_min);
+      const alarmMax = formatAnalogValue(zone?.alarm_max);
+      const tamperLow = formatAnalogValue(zone?.tamper_low);
+      const tamperHigh = formatAnalogValue(zone?.tamper_high);
+
+      return `
+        <tr data-index="${index}">
+          <td>
+            <div class="analog-zone-title">${escapeHtml(title)}</div>
+            ${metaHtml}
+          </td>
+          <td>
+            <div class="analog-config-grid">
+              <div class="analog-config-row">
+                <label>
+                  <span>Modalità</span>
+                  <select class="analog-mode-select" data-field="mode">
+                    <option value="1"${mode === 1 ? ' selected' : ''}>1 EOL</option>
+                    <option value="2"${mode === 2 ? ' selected' : ''}>2 EOL</option>
+                    <option value="3"${mode === 3 ? ' selected' : ''}>3 EOL</option>
+                  </select>
+                </label>
+              </div>
+              <div class="analog-config-row">
+                <label><span>Normale min (V)</span><input type="number" step="0.01" data-field="normal_min" value="${normalMin}"></label>
+                <label><span>Normale max (V)</span><input type="number" step="0.01" data-field="normal_max" value="${normalMax}"></label>
+              </div>
+              <div class="analog-config-row">
+                <label><span>Allarme min (V)</span><input type="number" step="0.01" data-field="alarm_min" value="${alarmMin}"></label>
+                <label><span>Allarme max (V)</span><input type="number" step="0.01" data-field="alarm_max" value="${alarmMax}"></label>
+              </div>
+              <div class="analog-config-row">
+                <label><span>Tamper bassa (V)</span><input type="number" step="0.01" data-field="tamper_low" value="${tamperLow}"></label>
+                <label><span>Tamper alta (V)</span><input type="number" step="0.01" data-field="tamper_high" value="${tamperHigh}"></label>
+              </div>
+            </div>
+          </td>
+        </tr>`;
+    }).join('');
+
+    if (tbody) {
+      tbody.innerHTML = rowsHtml;
+      tbody.querySelectorAll('tr').forEach(updateAnalogRowMode);
+    }
+  }
+
+  async function loadAnalogEolConfig(force = false){
+    if (analogEolState.loading) return analogEolState.payload;
+    const now = Date.now();
+    if (!force && analogEolState.payload && (now - analogEolState.lastFetched) < 5000) {
+      renderAnalogEolSection();
+      return analogEolState.payload;
+    }
+    analogEolState.loading = true;
+    analogEolState.error = "";
+    renderAnalogEolSection();
+    try {
+      const data = await apiGet('/api/admin/inputs/analog-eol');
+      analogEolState.payload = data;
+      analogEolState.lastFetched = Date.now();
+      analogEolState.error = "";
+    } catch (err) {
+      analogEolState.payload = null;
+      analogEolState.error = err?.message || 'Impossibile caricare la configurazione analogica.';
+    }
+    analogEolState.loading = false;
+    renderAnalogEolSection();
+    return analogEolState.payload;
+  }
+
+  async function saveAnalogEolConfig(){
+    if (analogEolState.loading || analogEolState.saving) return;
+    const tbody = $("#analogEolTableBody");
+    if (!tbody) return;
+    const rows = Array.from(tbody.querySelectorAll('tr[data-index]'));
+    if (!rows.length) return;
+
+    let hasError = false;
+    const payload = [];
+
+    const readNumber = (input) => {
+      if (!(input instanceof HTMLInputElement)) return null;
+      input.classList.remove('input-error');
+      const value = Number.parseFloat(input.value);
+      if (!Number.isFinite(value)) {
+        input.classList.add('input-error');
+        hasError = true;
+        return null;
+      }
+      return value;
+    };
+
+    rows.forEach((row) => {
+      const index = Number.parseInt(row.dataset.index, 10);
+      if (!Number.isFinite(index) || index < 0) return;
+      const modeSelect = row.querySelector('[data-field="mode"]');
+      const mode = Number.parseInt(modeSelect?.value ?? '', 10);
+      if (!Number.isInteger(mode) || mode < 1 || mode > 3) {
+        modeSelect?.classList.add('input-error');
+        hasError = true;
+        return;
+      }
+      modeSelect?.classList.remove('input-error');
+
+      const normalMin = readNumber(row.querySelector('[data-field="normal_min"]'));
+      const normalMax = readNumber(row.querySelector('[data-field="normal_max"]'));
+      const alarmMin = readNumber(row.querySelector('[data-field="alarm_min"]'));
+      const alarmMax = readNumber(row.querySelector('[data-field="alarm_max"]'));
+      const tamperLow = readNumber(row.querySelector('[data-field="tamper_low"]'));
+      const tamperHigh = readNumber(row.querySelector('[data-field="tamper_high"]'));
+
+      if (hasError) return;
+
+      payload.push({
+        index,
+        mode,
+        normal_min: normalMin,
+        normal_max: normalMax,
+        alarm_min: alarmMin,
+        alarm_max: alarmMax,
+        tamper_low: tamperLow,
+        tamper_high: tamperHigh,
+      });
+    });
+
+    if (hasError || !payload.length) {
+      toast('Correggi i valori evidenziati.', false);
+      return;
+    }
+
+    analogEolState.saving = true;
+    renderAnalogEolSection();
+    try {
+      await apiPost('/api/admin/inputs/analog-eol', { zones: payload });
+      analogEolState.saving = false;
+      analogEolState.error = "";
+      toast('Configurazione analogica salvata');
+      await loadAnalogEolConfig(true);
+    } catch (err) {
+      analogEolState.saving = false;
+      analogEolState.error = err?.message || 'Salvataggio configurazione fallito.';
+      renderAnalogEolSection();
+      toast(`Analogico: ${analogEolState.error}`, false);
+    }
+  }
+
+  async function setupAnalogGeneralSection(){
+    const reloadBtn = $("#analogEolReloadBtn");
+    if (reloadBtn && !reloadBtn._analogBound){
+      reloadBtn.addEventListener('click', () => loadAnalogEolConfig(true));
+      reloadBtn._analogBound = true;
+    }
+    const saveBtn = $("#analogEolSaveBtn");
+    if (saveBtn && !saveBtn._analogBound){
+      saveBtn.addEventListener('click', () => saveAnalogEolConfig());
+      saveBtn._analogBound = true;
+    }
+    const tbody = $("#analogEolTableBody");
+    if (tbody && !tbody._analogBound){
+      tbody.addEventListener('change', (event) => {
+        if (event.target?.matches('[data-field="mode"]')) {
+          updateAnalogRowMode(event.target.closest('tr'));
+        }
+      });
+      tbody._analogBound = true;
+    }
+    await loadAnalogEolConfig(true);
   }
 
   async function sendCanBroadcast(nextState){
@@ -1813,7 +2359,13 @@
     mountUserMenu();
     updateAdminVisibility();
     setupSidebar();
-    const setupPromises = [setupNetMqttForms(), setupWebSecForm(), setupExpansionsSection()];
+    const setupPromises = [
+      setupAdsDiagnostics(),
+      setupAnalogGeneralSection(),
+      setupNetMqttForms(),
+      setupWebSecForm(),
+      setupExpansionsSection()
+    ];
     document.querySelector('[data-tab="home"]')?.addEventListener('click', (e) => {
       e.preventDefault();
       location.href = "/index.html";

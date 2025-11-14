@@ -420,6 +420,24 @@ function showNotice(text, type = 'info'){
   el.style.color = type === 'error' ? '#f87171' : '#a5f3fc';
 }
 
+function updateHardwareNotice(status){
+  const el = $('#hardwareNotice');
+  if (!el) return;
+  const expected = Number.isFinite(status?.ads1115_expected) ? Number(status.ads1115_expected) : 0;
+  const detected = Number.isFinite(status?.ads1115_detected) ? Number(status.ads1115_detected) : 0;
+  if (expected > 0 && detected < expected) {
+    const missing = expected - detected;
+    const message = missing === expected
+      ? `ATTENZIONE: nessun ADS1115 rilevato (${detected} su ${expected}).`
+      : `ATTENZIONE: rilevati ${detected} su ${expected} ADS1115.`;
+    el.textContent = message;
+    el.classList.remove('hidden');
+  } else {
+    el.textContent = '';
+    el.classList.add('hidden');
+  }
+}
+
 function escapeHtml(str = ''){
   return String(str)
     .replace(/&/g, '&amp;')
@@ -647,6 +665,7 @@ async function refreshStatus(){
     const prevStateName = state.status?.state || '';
     const prevAlarmZoneIds = Array.isArray(state.alarmZoneIds) ? [...state.alarmZoneIds] : [];
     state.status = data;
+    updateHardwareNotice(data);
     const stateName = typeof data?.state === 'string' ? data.state : '';
     const isAlarmState = stateName === 'ALARM';
     const isArmedState = stateName.startsWith('ARMED_');

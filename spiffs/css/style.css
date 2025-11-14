@@ -119,6 +119,7 @@ body.modal-open{overflow:hidden;}
 .login-card .actions { justify-content: flex-start; margin-top: .75rem; }
 .msg{margin-top:.5rem;}
 .msg.small{font-size:.85rem; opacity:.9}
+.msg.alert{color:var(--danger); font-weight:600;}
 
 .container{max-width:1120px;margin:0 auto;padding:0 20px}
 .site-header{

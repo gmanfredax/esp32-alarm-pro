@@ -95,11 +95,19 @@ typedef struct {
     ads1115_operating_config_t options;
 } ads1115_device_config_t;
 
+typedef struct {
+    uint8_t address;
+    ads1115_operating_config_t options;
+    ads1115_mux_t current_mux;
+    uint16_t last_config_word;
+} ads1115_device_info_t;
+
 esp_err_t ads1115_install(const ads1115_device_config_t* configs, size_t count);
 esp_err_t ads1115_uninstall(void);
 size_t ads1115_device_count(void);
 
 esp_err_t ads1115_get_config(size_t unit, ads1115_operating_config_t* out_cfg);
+esp_err_t ads1115_get_info(size_t unit, ads1115_device_info_t* out_info);
 esp_err_t ads1115_configure(size_t unit, const ads1115_operating_config_t* cfg);
 esp_err_t ads1115_set_mux(size_t unit, ads1115_mux_t mux);
 esp_err_t ads1115_read_latest(size_t unit, int16_t* raw_value);

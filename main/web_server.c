@@ -84,6 +84,8 @@ extern const uint8_t certs_broker_ca_pem_start[] asm("_binary_broker_ca_pem_star
 extern const uint8_t certs_broker_ca_pem_end[]   asm("_binary_broker_ca_pem_end");
 
 static void web_server_restart_async(void);
+static esp_err_t read_body_alloc(httpd_req_t* req, char** out, size_t* out_len, size_t max_len);
+static esp_err_t read_body_to_str(httpd_req_t* req, char** out, size_t* out_len);
 
 static const char *TAG = "web";
 static const char *TAG_ADMIN __attribute__((unused)) = "admin_html";
@@ -101,6 +103,7 @@ static bool web_uri_match(const char *reference_uri,
 // ─────────────────────────────────────────────────────────────────────────────
 #define OTP_DISABLED        1   // 1 = disattiva completamente la richiesta OTP su /api/login
 #define WEB_MAX_BODY_LEN     2048
+#define ANALOG_E0L_MAX_BODY_LEN (4*1024)
 #define SESSION_TTL_S        (7*24*60*60)  // 7 giorni
 #define SESSION_IDLE_S       (5*60)       // 30 minuti sliding
 
@@ -1770,6 +1773,11 @@ static esp_err_t read_body_alloc(httpd_req_t* req, char** out, size_t* out_len, 
     return ESP_OK;
 }
 
+static esp_err_t read_body_to_str(httpd_req_t* req, char** out, size_t* out_len)
+{
+    return read_body_alloc(req, out, out_len, ANALOG_E0L_MAX_BODY_LEN);
+}
+
 static esp_err_t decode_base64_alloc(const char* b64, uint8_t** out, size_t* out_len){
     if (!b64 || !out) return ESP_ERR_INVALID_ARG;
     size_t in_len = strlen(b64);
@@ -3390,6 +3398,12 @@ typedef struct {
     uint8_t board;
     uint8_t board_input;
     bool board_online;
+    bool analog;
+    float analog_value;
+    bool tamper;
+    bool analog_device_present;
+    bool analog_sample_valid;
+    uint8_t analog_mode;
 } zone_state_entry_t;
 
 typedef struct {
@@ -3400,6 +3414,8 @@ typedef struct {
 
 static zone_cfg_t s_zone_cfg[ZONE_CONFIG_CAPACITY];
 static uint8_t    s_zone_board_map[ZONE_CONFIG_CAPACITY];
+
+#define ZONE_BOARD_ID_ADS1115_BASE 200
 
 static void zone_board_label_copy(uint8_t board_id, char *out, size_t cap)
 {
@@ -3413,10 +3429,49 @@ static void zone_board_label_copy(uint8_t board_id, char *out, size_t cap)
         return;
     }
 
+#if ADS1115_COUNT > 0
+    if (board_id >= ZONE_BOARD_ID_ADS1115_BASE &&
+        board_id < ZONE_BOARD_ID_ADS1115_BASE + ADS1115_COUNT) {
+        snprintf(out, cap, "ADS1115 #%u",
+                 (unsigned)(board_id - ZONE_BOARD_ID_ADS1115_BASE + 1u));
+        return;
+    }
+#endif
+
     roster_node_t snapshot;
     if (roster_get_node_snapshot(board_id, &snapshot)) {
         snprintf(out, cap, "%s", snapshot.label);
     }
+}
+
+static const char* zone_entry_display_name(int zone_index, const zone_state_entry_t *entry, char *out, size_t cap)
+{
+    if (!out || cap == 0) {
+        return "";
+    }
+    out[0] = '\0';
+    if (zone_index >= 0 && zone_index < ZONE_CONFIG_CAPACITY) {
+        zone_cfg_t *cfg = &s_zone_cfg[zone_index];
+        if (cfg && cfg->name[0]) {
+            snprintf(out, cap, "%s", cfg->name);
+            return out;
+        }
+    }
+
+#if ADS1115_COUNT > 0
+    if (entry && entry->analog) {
+        snprintf(out, cap, "ADS%u CH%u",
+                 (unsigned)(entry->board - ZONE_BOARD_ID_ADS1115_BASE + 1u),
+                 (unsigned)(entry->board_input + 1u));
+        return out;
+    }
+#endif
+    if (entry && entry->board != 0) {
+        snprintf(out, cap, "Exp %u Z%u", (unsigned)entry->board, (unsigned)(entry->board_input + 1u));
+        return out;
+    }
+    snprintf(out, cap, "Z%d", zone_index + 1);
+    return out;
 }
 
 static uint8_t zone_board_for_index(int zone_1_based){
@@ -3456,9 +3511,68 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
         entry->board_online = gpio_ok;
         entry->known = gpio_ok;
         entry->active = gpio_ok ? inputs_zone_bit(gpioab, i + 1) : false;
+        entry->analog = false;
+        entry->analog_value = 0.0f;
+        entry->tamper = false;
+        entry->analog_device_present = false;
+        entry->analog_sample_valid = false;
+        entry->analog_mode = 0;
         s_zone_board_map[i] = 0;
         snap->total++;
     }
+
+#if ADS1115_COUNT > 0
+    size_t ads_expected = inputs_ads1115_expected_devices();
+    size_t ads_detected = inputs_ads1115_count();
+    uint16_t analog_slots = INPUT_ANALOG_ZONES_COUNT;
+    if (snap->total + analog_slots > ZONE_CONFIG_CAPACITY) {
+        if (snap->total < ZONE_CONFIG_CAPACITY) {
+            analog_slots = (uint16_t)(ZONE_CONFIG_CAPACITY - snap->total);
+        } else {
+            analog_slots = 0;
+        }
+    }
+
+    uint16_t added = 0;
+    for (size_t dev = 0; dev < ads_expected && added < analog_slots; ++dev) {
+        bool device_online = (dev < ads_detected);
+        for (int ch = 0; ch < ADS1115_CHANNEL_COUNT && added < analog_slots; ++ch, ++added) {
+            if (snap->total >= ZONE_CONFIG_CAPACITY) {
+                break;
+            }
+            zone_state_entry_t *entry = &snap->entries[snap->total];
+            entry->board = (uint8_t)(ZONE_BOARD_ID_ADS1115_BASE + dev);
+            entry->board_input = (uint8_t)ch;
+            entry->board_online = device_online;
+            entry->analog = true;
+            entry->analog_value = 0.0f;
+            entry->known = false;
+            entry->active = false;
+            entry->tamper = false;
+            entry->analog_device_present = false;
+            entry->analog_sample_valid = false;
+            entry->analog_mode = 0;
+#if ADS1115_COUNT > 0
+            size_t analog_index = (size_t)(dev * ADS1115_CHANNEL_COUNT + ch);
+            input_analog_zone_state_t state;
+            if (inputs_analog_evaluate(analog_index, pdMS_TO_TICKS(75), &state) == ESP_OK) {
+                entry->analog_mode = (uint8_t)state.mode;
+                entry->analog_device_present = state.device_present;
+                entry->analog_sample_valid = state.sample_valid;
+                entry->board_online = state.device_present;
+                if (state.device_present && state.sample_valid) {
+                    entry->known = true;
+                    entry->active = state.alarm;
+                    entry->analog_value = state.voltage;
+                    entry->tamper = state.tamper;
+                }
+            }
+#endif
+            s_zone_board_map[snap->total] = entry->board;
+            snap->total++;
+        }
+    }
+#endif
 
     roster_node_inputs_t nodes[32];
     size_t node_count = roster_collect_nodes(nodes, sizeof(nodes) / sizeof(nodes[0]));
@@ -3477,6 +3591,12 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
             entry->board_online = (node->state == ROSTER_NODE_STATE_OPERATIONAL);
             entry->known = entry->board_online && node->inputs_valid;
             entry->active = entry->known ? ((node->inputs_bitmap & (1u << bit)) != 0u) : false;
+            entry->analog = false;
+            entry->analog_value = 0.0f;
+            entry->tamper = false;
+            entry->analog_device_present = false;
+            entry->analog_sample_valid = false;
+            entry->analog_mode = 0;
             s_zone_board_map[snap->total] = entry->board;
             snap->total++;
         }
@@ -3492,6 +3612,10 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
         snap->entries[i].board = 0;
         snap->entries[i].board_input = 0;
         snap->entries[i].board_online = false;
+        snap->entries[i].tamper = false;
+        snap->entries[i].analog_device_present = false;
+        snap->entries[i].analog_sample_valid = false;
+        snap->entries[i].analog_mode = 0;
     }
 }
 
@@ -3508,7 +3632,7 @@ static int zones_snapshot_total(const zones_snapshot_t *snap)
 
 static int zones_effective_total(void)
 {
-    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t total = roster_effective_zones(inputs_master_zone_capacity());
     if (total > ZONE_CONFIG_CAPACITY) {
         total = ZONE_CONFIG_CAPACITY;
     }
@@ -4537,7 +4661,9 @@ static esp_err_t status_get(httpd_req_t* req){
 
     uint16_t gpioab = 0;
     inputs_read_all(&gpioab);
-    bool tamper = inputs_tamper(gpioab);
+    bool tamper_global = inputs_tamper(gpioab);
+    zone_mask_t tamper_mask;
+    zone_mask_clear(&tamper_mask);
     bool tamper_alarm = (alarm_last_alarm_was_tamper() && _st == ALARM_ALARM);
 
     uint16_t outmask = 0;
@@ -4554,6 +4680,13 @@ static esp_err_t status_get(httpd_req_t* req){
 
     cJSON_AddStringToObject(root, "state", state);
     cJSON_AddNumberToObject(root, "zones_count", zones_total);
+#if ADS1115_COUNT > 0
+    cJSON_AddNumberToObject(root, "ads1115_expected", (double)inputs_ads1115_expected_devices());
+    cJSON_AddNumberToObject(root, "ads1115_detected", (double)inputs_ads1115_count());
+#else
+    cJSON_AddNumberToObject(root, "ads1115_expected", 0);
+    cJSON_AddNumberToObject(root, "ads1115_detected", 0);
+#endif
 
     cJSON *zones = cJSON_CreateArray();
     cJSON *zones_known = cJSON_CreateArray();
@@ -4562,6 +4695,9 @@ static esp_err_t status_get(httpd_req_t* req){
             const zone_state_entry_t *entry = &snapshot.entries[idx];
             cJSON_AddItemToArray(zones, cJSON_CreateBool(entry->active));
             cJSON_AddItemToArray(zones_known, cJSON_CreateBool(entry->known));
+            if (entry->known && entry->tamper) {
+                zone_mask_set(&tamper_mask, (uint16_t)idx);
+            }
         }
         cJSON_AddItemToObject(root, "zones_active", zones);
         cJSON_AddItemToObject(root, "zones_known", zones_known);
@@ -4572,8 +4708,41 @@ static esp_err_t status_get(httpd_req_t* req){
         cJSON_AddNullToObject(root, "zones_known");
     }
 
+    bool tamper = tamper_global || zone_mask_any(&tamper_mask);
     cJSON_AddBoolToObject(root, "tamper", tamper);
+    cJSON_AddBoolToObject(root, "tamper_global", tamper_global);
+    cJSON_AddNumberToObject(root, "tamper_zone_mask", (double)zone_mask_to_u32(&tamper_mask));
     cJSON_AddBoolToObject(root, "tamper_alarm", tamper_alarm);
+    cJSON *tamper_sources = cJSON_CreateArray();
+    if (tamper_sources) {
+        if (tamper_global) {
+            cJSON *src = cJSON_CreateObject();
+            if (src) {
+                cJSON_AddStringToObject(src, "type", "global");
+                cJSON_AddStringToObject(src, "label", "Tamper centrale");
+                cJSON_AddItemToArray(tamper_sources, src);
+            }
+        }
+        for (int idx = 0; idx < zones_total; ++idx) {
+            const zone_state_entry_t *entry = &snapshot.entries[idx];
+            if (!entry->known || !entry->tamper) {
+                continue;
+            }
+            cJSON *src = cJSON_CreateObject();
+            if (!src) {
+                continue;
+            }
+            cJSON_AddStringToObject(src, "type", "zone");
+            cJSON_AddNumberToObject(src, "zone_id", (double)(idx + 1));
+            char name_buf[48];
+            const char *label = zone_entry_display_name(idx, entry, name_buf, sizeof(name_buf));
+            cJSON_AddStringToObject(src, "name", label ? label : "");
+            cJSON_AddItemToArray(tamper_sources, src);
+        }
+        cJSON_AddItemToObject(root, "tamper_sources", tamper_sources);
+    } else {
+        cJSON_AddNullToObject(root, "tamper_sources");
+    }
     cJSON_AddNumberToObject(root, "outputs_mask", (unsigned)outmask);
     zone_mask_t bypass_mask;
     alarm_get_bypass_mask(&bypass_mask);
@@ -4599,6 +4768,461 @@ static esp_err_t status_get(httpd_req_t* req){
     cJSON_Delete(root);
     return err;
 }
+
+#if ADS1115_COUNT > 0
+static const char* ads_gain_label(ads1115_gain_t gain)
+{
+    switch (gain) {
+        case ADS1115_PGA_FSR_6144: return "±6.144 V";
+        case ADS1115_PGA_FSR_4096: return "±4.096 V";
+        case ADS1115_PGA_FSR_2048: return "±2.048 V";
+        case ADS1115_PGA_FSR_1024: return "±1.024 V";
+        case ADS1115_PGA_FSR_0512: return "±0.512 V";
+        case ADS1115_PGA_FSR_0256: return "±0.256 V";
+        default: return "±6.144 V";
+    }
+}
+
+static const char* ads_mode_label(ads1115_mode_t mode)
+{
+    switch (mode) {
+        case ADS1115_MODE_CONTINUOUS: return "Continuo";
+        case ADS1115_MODE_SINGLE_SHOT: return "Singolo (single-shot)";
+        default: return "Sconosciuto";
+    }
+}
+
+static int ads_data_rate_value(ads1115_data_rate_t rate)
+{
+    switch (rate) {
+        case ADS1115_DATA_RATE_8_SPS: return 8;
+        case ADS1115_DATA_RATE_16_SPS: return 16;
+        case ADS1115_DATA_RATE_32_SPS: return 32;
+        case ADS1115_DATA_RATE_64_SPS: return 64;
+        case ADS1115_DATA_RATE_128_SPS: return 128;
+        case ADS1115_DATA_RATE_250_SPS: return 250;
+        case ADS1115_DATA_RATE_475_SPS: return 475;
+        case ADS1115_DATA_RATE_860_SPS: return 860;
+        default: return 0;
+    }
+}
+
+static const char* ads_data_rate_label(ads1115_data_rate_t rate)
+{
+    static char label[16];
+    int value = ads_data_rate_value(rate);
+    if (value <= 0) {
+        snprintf(label, sizeof(label), "? SPS");
+    } else {
+        snprintf(label, sizeof(label), "%d SPS", value);
+    }
+    return label;
+}
+
+static const char* ads_comp_queue_label(ads1115_comp_queue_t queue)
+{
+    switch (queue) {
+        case ADS1115_COMP_QUEUE_ASSERT_1: return "Comparator attivo dopo 1 conversione";
+        case ADS1115_COMP_QUEUE_ASSERT_2: return "Comparator attivo dopo 2 conversioni";
+        case ADS1115_COMP_QUEUE_ASSERT_4: return "Comparator attivo dopo 4 conversioni";
+        case ADS1115_COMP_QUEUE_DISABLE: return "Comparator disabilitato";
+        default: return "Comparator sconosciuto";
+    }
+}
+
+static esp_err_t api_admin_ads1115_diag_get(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    cJSON* root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t expected = inputs_ads1115_expected_devices();
+    size_t detected = inputs_ads1115_count();
+    uint64_t now_ms = esp_timer_get_time() / 1000ULL;
+
+    cJSON_AddBoolToObject(root, "enabled", true);
+    cJSON_AddBoolToObject(root, "all_online", (expected > 0) && (detected == expected));
+    cJSON_AddNumberToObject(root, "expected", (double)expected);
+    cJSON_AddNumberToObject(root, "detected", (double)detected);
+    cJSON_AddNumberToObject(root, "channel_count", ADS1115_CHANNEL_COUNT);
+    cJSON_AddNumberToObject(root, "timestamp_ms", (double)now_ms);
+
+    cJSON* devices = cJSON_CreateArray();
+    if (!devices) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddItemToObject(root, "devices", devices);
+
+    for (size_t slot = 0; slot < expected; ++slot) {
+        cJSON* device = cJSON_CreateObject();
+        if (!device) {
+            continue;
+        }
+        cJSON_AddItemToArray(devices, device);
+        cJSON_AddNumberToObject(device, "slot", (double)slot);
+
+        ads1115_device_config_t cfg;
+        esp_err_t cfg_err = inputs_ads1115_get_expected_config(slot, &cfg);
+        if (cfg_err != ESP_OK) {
+            cJSON_AddStringToObject(device, "status", "Configurazione ADS1115 non disponibile");
+            cJSON_AddBoolToObject(device, "online", false);
+            continue;
+        }
+
+        cJSON_AddNumberToObject(device, "address", (double)cfg.address);
+        char addr_hex[8];
+        snprintf(addr_hex, sizeof(addr_hex), "0x%02X", cfg.address);
+        cJSON_AddStringToObject(device, "address_hex", addr_hex);
+
+        cJSON* config = cJSON_CreateObject();
+        if (config) {
+            cJSON_AddNumberToObject(config, "gain", (double)cfg.options.gain);
+            cJSON_AddStringToObject(config, "gain_label", ads_gain_label(cfg.options.gain));
+            cJSON_AddNumberToObject(config, "mode", (double)cfg.options.mode);
+            cJSON_AddStringToObject(config, "mode_label", ads_mode_label(cfg.options.mode));
+            cJSON_AddNumberToObject(config, "data_rate", (double)cfg.options.data_rate);
+            cJSON_AddNumberToObject(config, "data_rate_sps", (double)ads_data_rate_value(cfg.options.data_rate));
+            cJSON_AddStringToObject(config, "data_rate_label", ads_data_rate_label(cfg.options.data_rate));
+            cJSON_AddNumberToObject(config, "comp_queue", (double)cfg.options.comp_queue);
+            cJSON_AddStringToObject(config, "comp_queue_label", ads_comp_queue_label(cfg.options.comp_queue));
+            cJSON_AddBoolToObject(config, "comparator_enabled", cfg.options.comp_queue != ADS1115_COMP_QUEUE_DISABLE);
+            cJSON_AddItemToObject(device, "config", config);
+        }
+
+        int detected_index = inputs_ads1115_detected_index_for_address(cfg.address);
+        bool online = (detected_index >= 0);
+        cJSON_AddBoolToObject(device, "online", online);
+        if (online) {
+            cJSON_AddNumberToObject(device, "detected_index", (double)detected_index);
+        }
+
+        cJSON* channels = cJSON_CreateArray();
+        if (channels) {
+            esp_err_t read_err = ESP_ERR_INVALID_STATE;
+            int16_t raw_values[ADS1115_CHANNEL_COUNT] = {0};
+            if (online) {
+                read_err = inputs_ads1115_read_all_raw((size_t)detected_index, pdMS_TO_TICKS(100), raw_values);
+            }
+
+            const char* status_text = NULL;
+            char status_buf[96];
+
+            if (!online) {
+                status_text = "Modulo non rilevato sul bus I2C.";
+            } else if (read_err != ESP_OK) {
+                snprintf(status_buf, sizeof(status_buf), "Errore lettura canali: %s", esp_err_to_name(read_err));
+                status_text = status_buf;
+                cJSON_AddStringToObject(device, "error_code", esp_err_to_name(read_err));
+                cJSON_AddNumberToObject(device, "error_value", (double)read_err);
+            } else {
+                status_text = "Campionamento completato.";
+            }
+
+            if (status_text) {
+                cJSON_AddStringToObject(device, "status", status_text);
+            }
+
+            ads1115_device_info_t info;
+            if (online && ads1115_get_info((size_t)detected_index, &info) == ESP_OK) {
+                cJSON_AddNumberToObject(device, "last_config_word", (double)info.last_config_word);
+            }
+
+            for (int ch = 0; ch < ADS1115_CHANNEL_COUNT; ++ch) {
+                cJSON* ch_obj = cJSON_CreateObject();
+                if (!ch_obj) {
+                    continue;
+                }
+                cJSON_AddNumberToObject(ch_obj, "index", (double)ch);
+                if (online && read_err == ESP_OK) {
+                    cJSON_AddNumberToObject(ch_obj, "raw", (double)raw_values[ch]);
+                    double volts = (double)ads1115_raw_to_voltage(raw_values[ch], cfg.options.gain);
+                    cJSON_AddNumberToObject(ch_obj, "voltage", volts);
+                } else {
+                    cJSON_AddNullToObject(ch_obj, "raw");
+                    cJSON_AddNullToObject(ch_obj, "voltage");
+                }
+                cJSON_AddItemToArray(channels, ch_obj);
+            }
+
+            if (cJSON_GetArraySize(channels) == 0) {
+                for (int ch = 0; ch < ADS1115_CHANNEL_COUNT; ++ch) {
+                    cJSON* ch_obj = cJSON_CreateObject();
+                    if (!ch_obj) {
+                        continue;
+                    }
+                    cJSON_AddNumberToObject(ch_obj, "index", (double)ch);
+                    cJSON_AddNullToObject(ch_obj, "raw");
+                    cJSON_AddNullToObject(ch_obj, "voltage");
+                    cJSON_AddItemToArray(channels, ch_obj);
+                }
+            }
+
+            cJSON_AddItemToObject(device, "channels", channels);
+        } else {
+            cJSON_AddItemToObject(device, "channels", cJSON_CreateArray());
+        }
+    }
+
+    return json_reply_cjson(req, root);
+}
+
+
+static esp_err_t api_admin_analog_eol_get(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t analog_count = inputs_analog_zone_count();
+    size_t expected = inputs_ads1115_expected_devices();
+    size_t detected = inputs_ads1115_count();
+
+    cJSON_AddBoolToObject(root, "enabled", analog_count > 0);
+    cJSON_AddNumberToObject(root, "expected_devices", (double)expected);
+    cJSON_AddNumberToObject(root, "detected_devices", (double)detected);
+    cJSON_AddNumberToObject(root, "zones_offset", (double)INPUT_ZONES_COUNT);
+    cJSON_AddNumberToObject(root, "analog_count", (double)analog_count);
+
+    cJSON *zones = cJSON_CreateArray();
+    if (!zones) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddItemToObject(root, "zones", zones);
+
+    for (size_t idx = 0; idx < analog_count; ++idx) {
+        cJSON *item = cJSON_CreateObject();
+        if (!item) {
+            continue;
+        }
+        cJSON_AddItemToArray(zones, item);
+
+        size_t dev = idx / ADS1115_CHANNEL_COUNT;
+        int channel = (int)(idx % ADS1115_CHANNEL_COUNT);
+        size_t zone_index = INPUT_ZONES_COUNT + idx;
+
+        cJSON_AddNumberToObject(item, "index", (double)idx);
+        cJSON_AddNumberToObject(item, "zone_id", (double)(zone_index + 1));
+        cJSON_AddNumberToObject(item, "device_slot", (double)dev);
+        cJSON_AddNumberToObject(item, "channel", (double)(channel + 1));
+
+        input_analog_zone_config_t cfg;
+        esp_err_t cfg_err = inputs_analog_get_zone_config(idx, &cfg);
+        if (cfg_err == ESP_OK) {
+            cJSON_AddNumberToObject(item, "mode", (double)cfg.mode);
+            cJSON_AddNumberToObject(item, "normal_min", cfg.normal_min);
+            cJSON_AddNumberToObject(item, "normal_max", cfg.normal_max);
+            cJSON_AddNumberToObject(item, "alarm_min", cfg.alarm_min);
+            cJSON_AddNumberToObject(item, "alarm_max", cfg.alarm_max);
+            cJSON_AddNumberToObject(item, "tamper_low", cfg.tamper_low);
+            cJSON_AddNumberToObject(item, "tamper_high", cfg.tamper_high);
+        } else {
+            ESP_LOGW(TAG, "analog-eol get: zona %u config assente (%s)",
+                     (unsigned)idx, esp_err_to_name(cfg_err));
+        }
+
+        ads1115_device_config_t expected_cfg;
+        esp_err_t expected_err = inputs_ads1115_get_expected_config(dev, &expected_cfg);
+        if (expected_err == ESP_OK) {
+            cJSON_AddNumberToObject(item, "address", (double)expected_cfg.address);
+            char addr_hex[8];
+            snprintf(addr_hex, sizeof(addr_hex), "0x%02X", expected_cfg.address);
+            cJSON_AddStringToObject(item, "address_hex", addr_hex);
+            int detected_index = inputs_ads1115_detected_index_for_address(expected_cfg.address);
+            cJSON_AddNumberToObject(item, "detected_index", (double)detected_index);
+        } else {
+            ESP_LOGW(TAG, "analog-eol get: config attesa ADS%u non disponibile (%s)",
+                     (unsigned)(dev + 1u), esp_err_to_name(expected_err));
+        }
+
+        input_analog_zone_state_t state;
+        esp_err_t eval_err = inputs_analog_evaluate(idx, pdMS_TO_TICKS(75), &state);
+        bool sample_ok = (eval_err == ESP_OK) && state.sample_valid;
+        cJSON_AddBoolToObject(item, "device_present", state.device_present);
+        cJSON_AddBoolToObject(item, "sample_valid", sample_ok);
+        cJSON_AddBoolToObject(item, "alarm_active", sample_ok && state.alarm);
+        cJSON_AddBoolToObject(item, "tamper_active", sample_ok && state.tamper);
+        if (sample_ok) {
+            cJSON_AddNumberToObject(item, "voltage", state.voltage);
+        } else {
+            cJSON_AddNullToObject(item, "voltage");
+            if (eval_err != ESP_OK && eval_err != ESP_ERR_INVALID_ARG) {
+                cJSON_AddStringToObject(item, "last_error", esp_err_to_name(eval_err));
+                ESP_LOGW(TAG, "analog-eol get: lettura zona %u fallita (%s)",
+                         (unsigned)idx, esp_err_to_name(eval_err));
+            }
+        }
+
+        zone_state_entry_t synthetic = {0};
+        synthetic.analog = true;
+        synthetic.board = (uint8_t)(ZONE_BOARD_ID_ADS1115_BASE + dev);
+        synthetic.board_input = (uint8_t)channel;
+        char label_buf[48];
+        const char *label = zone_entry_display_name((int)zone_index, &synthetic, label_buf, sizeof(label_buf));
+        cJSON_AddStringToObject(item, "name", label ? label : "");
+    }
+
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_admin_analog_eol_post(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    char *body = NULL;
+    size_t blen = 0;
+    esp_err_t read_err = read_body_to_str(req, &body, &blen);
+    if (read_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body");
+        return ESP_FAIL;
+    }
+
+    cJSON *json = cJSON_ParseWithLength(body, blen);
+    free(body);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json");
+        return ESP_FAIL;
+    }
+
+    cJSON *zones = cJSON_GetObjectItemCaseSensitive(json, "zones");
+    if (!cJSON_IsArray(zones)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "zones");
+        return ESP_FAIL;
+    }
+
+    bool any_updated = false;
+    cJSON *zone = NULL;
+    cJSON_ArrayForEach(zone, zones) {
+        cJSON *jindex = cJSON_GetObjectItemCaseSensitive(zone, "index");
+        if (!cJSON_IsNumber(jindex)) {
+            continue;
+        }
+        int index = jindex->valueint;
+        if (index < 0 || (size_t)index >= inputs_analog_zone_count()) {
+            continue;
+        }
+
+        input_analog_zone_config_t cfg;
+        esp_err_t cfg_err = inputs_analog_get_zone_config((size_t)index, &cfg);
+        if (cfg_err != ESP_OK) {
+            ESP_LOGW(TAG, "analog-eol post: lettura zona %d fallita (%s)",
+                     index, esp_err_to_name(cfg_err));
+            continue;
+        }
+
+        cJSON *jmode = cJSON_GetObjectItemCaseSensitive(zone, "mode");
+        cJSON *jnormal_min = cJSON_GetObjectItemCaseSensitive(zone, "normal_min");
+        cJSON *jnormal_max = cJSON_GetObjectItemCaseSensitive(zone, "normal_max");
+        cJSON *jalarm_min = cJSON_GetObjectItemCaseSensitive(zone, "alarm_min");
+        cJSON *jalarm_max = cJSON_GetObjectItemCaseSensitive(zone, "alarm_max");
+        cJSON *jtamper_low = cJSON_GetObjectItemCaseSensitive(zone, "tamper_low");
+        cJSON *jtamper_high = cJSON_GetObjectItemCaseSensitive(zone, "tamper_high");
+
+        if (cJSON_IsNumber(jmode)) cfg.mode = (input_analog_eol_mode_t)jmode->valueint;
+        if (cJSON_IsNumber(jnormal_min)) cfg.normal_min = (float)jnormal_min->valuedouble;
+        if (cJSON_IsNumber(jnormal_max)) cfg.normal_max = (float)jnormal_max->valuedouble;
+        if (cJSON_IsNumber(jalarm_min)) cfg.alarm_min = (float)jalarm_min->valuedouble;
+        if (cJSON_IsNumber(jalarm_max)) cfg.alarm_max = (float)jalarm_max->valuedouble;
+        if (cJSON_IsNumber(jtamper_low)) cfg.tamper_low = (float)jtamper_low->valuedouble;
+        if (cJSON_IsNumber(jtamper_high)) cfg.tamper_high = (float)jtamper_high->valuedouble;
+
+        esp_err_t set_err = inputs_analog_set_zone_config((size_t)index, &cfg, false);
+        if (set_err == ESP_OK) {
+            any_updated = true;
+        } else {
+            ESP_LOGW(TAG, "analog-eol post: applicazione zona %d fallita (%s)",
+                     index, esp_err_to_name(set_err));
+        }
+    }
+
+    cJSON_Delete(json);
+
+    if (any_updated) {
+        esp_err_t save_err = inputs_analog_save_configs();
+        if (save_err != ESP_OK) {
+            ESP_LOGE(TAG, "analog-eol post: salvataggio configurazione fallito (%s)",
+                     esp_err_to_name(save_err));
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "persist");
+            return ESP_FAIL;
+        }
+    }
+
+    return json_bool(req, true);
+}
+
+#else
+static esp_err_t api_admin_ads1115_diag_get(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+    cJSON* root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddBoolToObject(root, "enabled", false);
+    cJSON_AddBoolToObject(root, "all_online", false);
+    cJSON_AddNumberToObject(root, "expected", 0);
+    cJSON_AddNumberToObject(root, "detected", 0);
+    cJSON_AddNumberToObject(root, "channel_count", 0);
+    cJSON_AddNumberToObject(root, "timestamp_ms", 0);
+    cJSON_AddItemToObject(root, "devices", cJSON_CreateArray());
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_admin_analog_eol_get(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddBoolToObject(root, "enabled", false);
+    cJSON_AddNumberToObject(root, "expected_devices", 0);
+    cJSON_AddNumberToObject(root, "detected_devices", 0);
+    cJSON_AddNumberToObject(root, "zones_offset", (double)INPUT_ZONES_COUNT);
+    cJSON_AddNumberToObject(root, "analog_count", 0);
+    cJSON_AddItemToObject(root, "zones", cJSON_CreateArray());
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_admin_analog_eol_post(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "analog disabled");
+    return ESP_FAIL;
+}
+#endif
 
 static esp_err_t zones_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
@@ -4628,18 +5252,8 @@ static esp_err_t zones_get(httpd_req_t* req){
         if (!it) {
             continue;
         }
-        zone_cfg_t *cfg = &s_zone_cfg[idx];
-        const char *zname = NULL;
-        char tmp[48];
-        if (cfg && cfg->name[0]) {
-            zname = cfg->name;
-        } else if (entry->board != 0) {
-            snprintf(tmp, sizeof(tmp), "Exp %u Z%u", (unsigned)entry->board, (unsigned)(entry->board_input + 1));
-            zname = tmp;
-        } else {
-            snprintf(tmp, sizeof(tmp), "Z%d", zone_id);
-            zname = tmp;
-        }
+        char name_buf[48];
+        const char *zname = zone_entry_display_name(idx, entry, name_buf, sizeof(name_buf));
         cJSON_AddNumberToObject(it, "id", zone_id);
         cJSON_AddStringToObject(it, "name", zname ? zname : "");
         cJSON_AddBoolToObject(it, "known", entry->known);
@@ -4647,9 +5261,30 @@ static esp_err_t zones_get(httpd_req_t* req){
         cJSON_AddBoolToObject(it, "board_online", entry->board_online);
         cJSON_AddNumberToObject(it, "board", (double)entry->board);
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
+        cJSON_AddBoolToObject(it, "analog", entry->analog);
+        cJSON_AddBoolToObject(it, "tamper", entry->known ? entry->tamper : false);
+#if ADS1115_COUNT > 0
+        if (entry->analog) {
+            cJSON_AddBoolToObject(it, "analog_device_present", entry->analog_device_present);
+            cJSON_AddBoolToObject(it, "analog_sample_valid", entry->analog_sample_valid);
+            cJSON_AddNumberToObject(it, "analog_mode", (double)entry->analog_mode);
+            cJSON_AddBoolToObject(it, "tamper_capable", entry->analog_mode >= INPUT_ANALOG_EOL_2);
+            if (entry->known) {
+                cJSON_AddNumberToObject(it, "analog_value", entry->analog_value);
+            }
+        } else {
+            cJSON_AddBoolToObject(it, "tamper_capable", false);
+        }
+#else
+        if (entry->analog && entry->known) {
+            cJSON_AddNumberToObject(it, "analog_value", entry->analog_value);
+        }
+        cJSON_AddBoolToObject(it, "tamper_capable", false);
+#endif
         char board_label[sizeof(((roster_node_t *)0)->label)];
         zone_board_label_copy(entry->board, board_label, sizeof(board_label));
         cJSON_AddStringToObject(it, "board_label", board_label);
+        zone_cfg_t *cfg = &s_zone_cfg[idx];
         if (cfg) {
             cJSON_AddBoolToObject(it, "auto_exclude", cfg->auto_exclude);
             cJSON_AddBoolToObject(it, "zone_delay", cfg->zone_delay);
@@ -4864,6 +5499,12 @@ static esp_err_t zones_config_get(httpd_req_t* req){
         cJSON_AddNumberToObject(it, "board", (double)(entry->board ? entry->board : zone_board_for_index(zone_id)));
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
         cJSON_AddBoolToObject(it, "board_online", entry->board_online);
+        cJSON_AddBoolToObject(it, "analog", entry->analog);
+#if ADS1115_COUNT > 0
+        if (entry->analog && entry->known) {
+            cJSON_AddNumberToObject(it, "analog_value", entry->analog_value);
+        }
+#endif
         char board_label[sizeof(((roster_node_t *)0)->label)];
         zone_board_label_copy(entry->board ? entry->board : zone_board_for_index(zone_id),
                               board_label,
@@ -5100,6 +5741,11 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/logout",       .method = HTTP_POST,    .handler = api_logout_post },
     { .uri = "/api/me",           .method = HTTP_GET,     .handler = api_me_get },
     { .uri = "/api/admin/secret", .method = HTTP_GET,     .handler = api_admin_only_get },
+    { .uri = "/api/admin/diagnostics/ads1115", .method = HTTP_GET, .handler = api_admin_ads1115_diag_get },
+#if ADS1115_COUNT > 0
+    { .uri = "/api/admin/inputs/analog-eol", .method = HTTP_GET,  .handler = api_admin_analog_eol_get },
+    { .uri = "/api/admin/inputs/analog-eol", .method = HTTP_POST, .handler = api_admin_analog_eol_post },
+#endif
     { .uri = "/api/provision/status",  .method = HTTP_GET,  .handler = provision_status_get },
     { .uri = "/api/provision/finish",  .method = HTTP_POST, .handler = provision_finish_post },
     { .uri = "/api/provision/reset",   .method = HTTP_POST, .handler = provision_reset_post },

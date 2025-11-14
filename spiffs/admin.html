@@ -28,6 +28,7 @@
     .status-line{margin:.6rem 0 0;font-size:.9rem}
     .status-line.error{color:#f87171}
     .status-line.success{color:#34d399}
+    .status-line.warn{color:#fbbf24}
     .telemetry-grid{display:grid;gap:1rem;margin-top:.75rem}
     @media (min-width:720px){.telemetry-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
     .telemetry-card{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:10px;padding:1rem}
@@ -38,6 +39,39 @@
     .telemetry-metric strong.warn{color:#f87171}
     .telemetry-status{margin:.5rem 0;font-size:.9rem;color:var(--muted)}
     .telemetry-status.error{color:#f87171}
+    .diag-grid{display:grid;gap:.85rem;margin-top:.75rem}
+    @media (min-width:880px){.diag-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    .diag-card{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:12px;padding:.9rem}
+    .diag-card h4{margin:0 0 .35rem}
+    .diag-card-head{display:flex;justify-content:space-between;align-items:center;gap:.5rem;margin-bottom:.35rem}
+    .diag-status{display:inline-flex;align-items:center;gap:.35rem;font-size:.85rem}
+    .diag-meta{font-size:.85rem;color:var(--muted);margin:.15rem 0 .55rem}
+    .diag-meta code{background:rgba(255,255,255,.05);padding:.1rem .3rem;border-radius:6px}
+    .diag-meta-list{list-style:none;margin:0;padding:0;display:flex;flex-wrap:wrap;gap:.55rem}
+    .diag-meta-list li{font-size:.85rem;color:var(--muted)}
+    .diag-meta-list strong{color:var(--text)}
+    .diag-channels{width:100%;border-collapse:collapse;margin-top:.5rem;font-size:.9rem}
+    .diag-channels th,.diag-channels td{padding:.35rem .45rem;border:1px solid rgba(255,255,255,.08);text-align:left}
+    .diag-channels tbody tr:nth-child(even){background:rgba(255,255,255,.03)}
+    .diag-message{margin:.5rem 0 0;font-size:.9rem;color:var(--muted)}
+    .diag-message.warn{color:#fbbf24}
+    .diag-message.error{color:#f87171}
+    .diag-message.ok{color:#34d399}
+    .diag-empty{margin-top:.6rem;font-size:.9rem}
+    .analog-table-wrap{margin-top:.75rem;overflow-x:auto}
+    .analog-table{width:100%;border-collapse:collapse;font-size:.9rem;min-width:520px}
+    .analog-table th,.analog-table td{padding:.55rem .6rem;text-align:left;border:1px solid rgba(255,255,255,.08);vertical-align:top}
+    .analog-zone-title{font-weight:600;margin-bottom:.2rem}
+    .analog-zone-meta{font-size:.82rem;color:var(--muted);margin:.15rem 0}
+    .analog-zone-meta.warn{color:#fbbf24}
+    .analog-zone-meta.error{color:#f87171}
+    .analog-config-grid{display:grid;gap:.45rem}
+    .analog-config-row{display:flex;flex-wrap:wrap;gap:.45rem}
+    .analog-config-row label{flex:1 1 160px;display:flex;flex-direction:column;gap:.2rem;font-size:.8rem;color:var(--muted)}
+    .analog-config-row label span{font-weight:600;color:var(--muted)}
+    .analog-config-row input,.analog-config-row select{background:#0d1525;border:1px solid var(--border);color:var(--text);padding:.35rem .5rem;border-radius:8px}
+    .analog-config-row input:disabled{opacity:.55}
+    .analog-mode-select{min-width:120px}
   </style>
 </head>
 <body>
@@ -85,10 +119,12 @@
           <h4>Sezioni</h4>
           <ul>
             <li><button class="btn w-100 active" data-view="view-users">Utenti</button></li>
+            <li><button class="btn w-100" data-view="view-general">Generale</button></li>
             <li><button class="btn w-100" data-view="view-network">Rete</button></li>
             <li><button class="btn w-100" data-view="view-mqtt">MQTT</button></li>
             <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
             <li><button class="btn w-100" data-view="view-expansions">Espansioni CAN</button></li>
+            <li><button class="btn w-100" data-view="view-diagnostics">Diagnostica</button></li>
           </ul>
         </aside>
 
@@ -106,6 +142,32 @@
                     <tr><th>Username</th><th>Nome</th><th>Cognome</th><th>PIN</th><th>RFID</th><th>TOTP</th><th>Azioni</th></tr>
                   </thead>
                   <tbody id="usersTbody"><tr><td colspan="7">Caricamento…</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
+          <!-- GENERALE -->
+          <section id="view-general" class="view">
+            <div class="card">
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap;">
+                <h3>Impostazioni ingressi analogici</h3>
+                <div class="row" style="gap:.5rem;flex-wrap:wrap;">
+                  <button class="btn secondary" id="analogEolReloadBtn" type="button">Aggiorna</button>
+                  <button class="btn primary" id="analogEolSaveBtn" type="button">Salva configurazione</button>
+                </div>
+              </div>
+              <div id="analogEolStatus" class="status-line muted">Caricamento…</div>
+              <div id="analogEolEmpty" class="status-line hidden">Nessuna zona analogica configurata.</div>
+              <div class="table-wrap analog-table-wrap">
+                <table class="table analog-table">
+                  <thead>
+                    <tr>
+                      <th>Zona</th>
+                      <th>Configurazione</th>
+                    </tr>
+                  </thead>
+                  <tbody id="analogEolTableBody"></tbody>
                 </table>
               </div>
             </div>
@@ -204,6 +266,20 @@
               <p id="adminExpansionStatus" class="status-line muted hidden" role="status"></p>
               <ul id="adminExpansionList" class="expansion-list"></ul>
               <p id="adminExpansionEmpty" class="expansion-empty hidden">Nessuna scheda rilevata.</p>
+            </div>
+          </section>
+
+          <!-- DIAGNOSTICA ADS1115 -->
+          <section id="view-diagnostics" class="view">
+            <div class="card">
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap">
+                <h3>Diagnostica ADS1115</h3>
+                <button class="btn" id="adsDiagRefreshBtn" type="button">Aggiorna</button>
+              </div>
+              <p id="adsDiagSummary" class="status-line muted" role="status">Premi “Aggiorna” per caricare lo stato degli ADS1115.</p>
+              <div id="adsDiagDevices" class="diag-grid"></div>
+              <p id="adsDiagEmpty" class="diag-empty muted hidden">Nessun ADS1115 configurato.</p>
+              <p id="adsDiagTimestamp" class="muted hidden" style="margin-top:.6rem;font-size:.8rem"></p>
             </div>
           </section>
         </section>
