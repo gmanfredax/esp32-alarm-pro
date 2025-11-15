@@ -16,9 +16,24 @@
 #define INPUT_ZONES_COUNT 12
 
 #if ADS1115_COUNT > 0
-#define INPUT_ANALOG_ZONES_COUNT (ADS1115_COUNT * ADS1115_CHANNEL_COUNT)
+#define INPUT_ANALOG_TOTAL_CHANNELS   (ADS1115_COUNT * ADS1115_CHANNEL_COUNT)
+#if ADS1115_COUNT >= 3
+#define INPUT_ANALOG_ZONES_COUNT      10
+#define INPUT_ANALOG_SUPPLY_SLOT      2
+#define INPUT_ANALOG_SUPPLY_CHANNEL   2
+#define INPUT_ANALOG_SUPPLY_INDEX     ((INPUT_ANALOG_SUPPLY_SLOT * ADS1115_CHANNEL_COUNT) + INPUT_ANALOG_SUPPLY_CHANNEL)
 #else
-#define INPUT_ANALOG_ZONES_COUNT 0
+#define INPUT_ANALOG_ZONES_COUNT      INPUT_ANALOG_TOTAL_CHANNELS
+#define INPUT_ANALOG_SUPPLY_SLOT      0
+#define INPUT_ANALOG_SUPPLY_CHANNEL   0
+#define INPUT_ANALOG_SUPPLY_INDEX     0
+#endif
+#else
+#define INPUT_ANALOG_TOTAL_CHANNELS   0
+#define INPUT_ANALOG_ZONES_COUNT      0
+#define INPUT_ANALOG_SUPPLY_SLOT      0
+#define INPUT_ANALOG_SUPPLY_CHANNEL   0
+#define INPUT_ANALOG_SUPPLY_INDEX     0
 #endif
 
 #define INPUT_MASTER_ZONES_COUNT (INPUT_ZONES_COUNT + INPUT_ANALOG_ZONES_COUNT)
@@ -69,6 +84,13 @@ typedef struct {
     bool global_tamper;
     zone_mask_t zone_mask;
 } input_tamper_snapshot_t;
+
+typedef struct {
+    bool device_present;
+    bool sample_valid;
+    float adc_voltage;
+    float supply_voltage;
+} input_supply_state_t;
 #endif
 
 #if ADS1115_COUNT > 0
@@ -89,6 +111,7 @@ esp_err_t inputs_analog_get_zone_config(size_t index, input_analog_zone_config_t
 esp_err_t inputs_analog_set_zone_config(size_t index, const input_analog_zone_config_t* cfg, bool persist);
 esp_err_t inputs_analog_evaluate(size_t index, TickType_t timeout, input_analog_zone_state_t* out_state);
 esp_err_t inputs_collect_tamper_snapshot(uint16_t gpioab, TickType_t timeout, input_tamper_snapshot_t* snapshot);
+esp_err_t inputs_analog_supply_state(TickType_t timeout, input_supply_state_t* out_state);
 #endif
 
 uint16_t inputs_master_zone_capacity(void);
@@ -100,10 +123,10 @@ static inline bool inputs_zone_bit(uint16_t gpioab, int z) {
     if (z < 1 || z > INPUT_ZONES_COUNT) return false;
 
     if (z <= 8) {
-        // Z1..Z8 -> A0..A7 (pull-up: 0 = attivo)
+        // Z1..Z8 -> A0..A7 (pull-up: 1 = circuito aperto / violazione)
         return ((gpioab & (1u << (z - 1))) != 0);
     } else {
-        // Z9..Z12 -> B0..B3 (pull-up: 0 = attivo)
+        // Z9..Z12 -> B0..B3 (pull-up: 1 = circuito aperto / violazione)
         int bbit = z - 9;      // 0..3
         return ((gpioab & (1u << (8 + bbit))) != 0);
     }
@@ -115,6 +138,6 @@ static inline bool inputs_zone_bit(uint16_t gpioab, int z) {
  *        MCPB_TAMPER_BIT deve essere definito in pins.h (0..7).
  */
 static inline bool inputs_tamper(uint16_t gpioab) {
-    // Pull-up: 0 = attivo
+    // Pull-up: 1 = circuito aperto / tamper attivo
     return ((gpioab & (1u << (8 + MCPB_TAMPER_BIT))) != 0);
 }

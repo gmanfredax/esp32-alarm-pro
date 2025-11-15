@@ -4999,6 +4999,35 @@ static esp_err_t api_admin_analog_eol_get(httpd_req_t* req)
     cJSON_AddNumberToObject(root, "zones_offset", (double)INPUT_ZONES_COUNT);
     cJSON_AddNumberToObject(root, "analog_count", (double)analog_count);
 
+    input_analog_zone_config_t cfg = {0};
+    bool have_cfg = false;
+    if (analog_count > 0) {
+        esp_err_t cfg_err = inputs_analog_get_zone_config(0, &cfg);
+        if (cfg_err == ESP_OK) {
+            have_cfg = true;
+        } else {
+            ESP_LOGW(TAG, "analog-eol get: config globale non disponibile (%s)",
+                     esp_err_to_name(cfg_err));
+        }
+    }
+
+    cJSON *config_obj = cJSON_CreateObject();
+    if (!config_obj) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddItemToObject(root, "config", config_obj);
+    if (have_cfg) {
+        cJSON_AddNumberToObject(config_obj, "mode", (double)cfg.mode);
+        cJSON_AddNumberToObject(config_obj, "normal_min", cfg.normal_min);
+        cJSON_AddNumberToObject(config_obj, "normal_max", cfg.normal_max);
+        cJSON_AddNumberToObject(config_obj, "alarm_min", cfg.alarm_min);
+        cJSON_AddNumberToObject(config_obj, "alarm_max", cfg.alarm_max);
+        cJSON_AddNumberToObject(config_obj, "tamper_low", cfg.tamper_low);
+        cJSON_AddNumberToObject(config_obj, "tamper_high", cfg.tamper_high);
+    }
+
     cJSON *zones = cJSON_CreateArray();
     if (!zones) {
         cJSON_Delete(root);
@@ -5023,19 +5052,8 @@ static esp_err_t api_admin_analog_eol_get(httpd_req_t* req)
         cJSON_AddNumberToObject(item, "device_slot", (double)dev);
         cJSON_AddNumberToObject(item, "channel", (double)(channel + 1));
 
-        input_analog_zone_config_t cfg;
-        esp_err_t cfg_err = inputs_analog_get_zone_config(idx, &cfg);
-        if (cfg_err == ESP_OK) {
+        if (have_cfg) {
             cJSON_AddNumberToObject(item, "mode", (double)cfg.mode);
-            cJSON_AddNumberToObject(item, "normal_min", cfg.normal_min);
-            cJSON_AddNumberToObject(item, "normal_max", cfg.normal_max);
-            cJSON_AddNumberToObject(item, "alarm_min", cfg.alarm_min);
-            cJSON_AddNumberToObject(item, "alarm_max", cfg.alarm_max);
-            cJSON_AddNumberToObject(item, "tamper_low", cfg.tamper_low);
-            cJSON_AddNumberToObject(item, "tamper_high", cfg.tamper_high);
-        } else {
-            ESP_LOGW(TAG, "analog-eol get: zona %u config assente (%s)",
-                     (unsigned)idx, esp_err_to_name(cfg_err));
         }
 
         ads1115_device_config_t expected_cfg;
@@ -5079,6 +5097,29 @@ static esp_err_t api_admin_analog_eol_get(httpd_req_t* req)
         cJSON_AddStringToObject(item, "name", label ? label : "");
     }
 
+    cJSON *supply_obj = cJSON_CreateObject();
+    if (supply_obj) {
+        input_supply_state_t supply_state;
+        esp_err_t supply_err = inputs_analog_supply_state(pdMS_TO_TICKS(75), &supply_state);
+        bool available = (supply_err != ESP_ERR_NOT_SUPPORTED);
+        cJSON_AddBoolToObject(supply_obj, "available", available);
+        if (available) {
+            cJSON_AddBoolToObject(supply_obj, "device_present", supply_state.device_present);
+            cJSON_AddBoolToObject(supply_obj, "sample_valid", supply_state.sample_valid);
+            if (supply_state.sample_valid) {
+                cJSON_AddNumberToObject(supply_obj, "adc_voltage", supply_state.adc_voltage);
+                cJSON_AddNumberToObject(supply_obj, "supply_voltage", supply_state.supply_voltage);
+            } else {
+                cJSON_AddNullToObject(supply_obj, "adc_voltage");
+                cJSON_AddNullToObject(supply_obj, "supply_voltage");
+                if (supply_err != ESP_OK && supply_err != ESP_ERR_INVALID_STATE) {
+                    cJSON_AddStringToObject(supply_obj, "last_error", esp_err_to_name(supply_err));
+                }
+            }
+        }
+        cJSON_AddItemToObject(root, "supply", supply_obj);
+    }
+
     return json_reply_cjson(req, root);
 }
 
@@ -5104,69 +5145,54 @@ static esp_err_t api_admin_analog_eol_post(httpd_req_t* req)
         return ESP_FAIL;
     }
 
-    cJSON *zones = cJSON_GetObjectItemCaseSensitive(json, "zones");
-    if (!cJSON_IsArray(zones)) {
+    cJSON *config = cJSON_GetObjectItemCaseSensitive(json, "config");
+    if (!cJSON_IsObject(config)) {
         cJSON_Delete(json);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "zones");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "config");
         return ESP_FAIL;
     }
 
-    bool any_updated = false;
-    cJSON *zone = NULL;
-    cJSON_ArrayForEach(zone, zones) {
-        cJSON *jindex = cJSON_GetObjectItemCaseSensitive(zone, "index");
-        if (!cJSON_IsNumber(jindex)) {
-            continue;
-        }
-        int index = jindex->valueint;
-        if (index < 0 || (size_t)index >= inputs_analog_zone_count()) {
-            continue;
-        }
-
-        input_analog_zone_config_t cfg;
-        esp_err_t cfg_err = inputs_analog_get_zone_config((size_t)index, &cfg);
-        if (cfg_err != ESP_OK) {
-            ESP_LOGW(TAG, "analog-eol post: lettura zona %d fallita (%s)",
-                     index, esp_err_to_name(cfg_err));
-            continue;
-        }
-
-        cJSON *jmode = cJSON_GetObjectItemCaseSensitive(zone, "mode");
-        cJSON *jnormal_min = cJSON_GetObjectItemCaseSensitive(zone, "normal_min");
-        cJSON *jnormal_max = cJSON_GetObjectItemCaseSensitive(zone, "normal_max");
-        cJSON *jalarm_min = cJSON_GetObjectItemCaseSensitive(zone, "alarm_min");
-        cJSON *jalarm_max = cJSON_GetObjectItemCaseSensitive(zone, "alarm_max");
-        cJSON *jtamper_low = cJSON_GetObjectItemCaseSensitive(zone, "tamper_low");
-        cJSON *jtamper_high = cJSON_GetObjectItemCaseSensitive(zone, "tamper_high");
-
-        if (cJSON_IsNumber(jmode)) cfg.mode = (input_analog_eol_mode_t)jmode->valueint;
-        if (cJSON_IsNumber(jnormal_min)) cfg.normal_min = (float)jnormal_min->valuedouble;
-        if (cJSON_IsNumber(jnormal_max)) cfg.normal_max = (float)jnormal_max->valuedouble;
-        if (cJSON_IsNumber(jalarm_min)) cfg.alarm_min = (float)jalarm_min->valuedouble;
-        if (cJSON_IsNumber(jalarm_max)) cfg.alarm_max = (float)jalarm_max->valuedouble;
-        if (cJSON_IsNumber(jtamper_low)) cfg.tamper_low = (float)jtamper_low->valuedouble;
-        if (cJSON_IsNumber(jtamper_high)) cfg.tamper_high = (float)jtamper_high->valuedouble;
-
-        esp_err_t set_err = inputs_analog_set_zone_config((size_t)index, &cfg, false);
-        if (set_err == ESP_OK) {
-            any_updated = true;
-        } else {
-            ESP_LOGW(TAG, "analog-eol post: applicazione zona %d fallita (%s)",
-                     index, esp_err_to_name(set_err));
-        }
+    if (inputs_analog_zone_count() == 0) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "analog");
+        return ESP_FAIL;
     }
+
+    input_analog_zone_config_t cfg;
+    esp_err_t cfg_err = inputs_analog_get_zone_config(0, &cfg);
+    if (cfg_err != ESP_OK) {
+        cJSON_Delete(json);
+        ESP_LOGE(TAG, "analog-eol post: impossibile recuperare la configurazione attuale (%s)",
+                 esp_err_to_name(cfg_err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "state");
+        return ESP_FAIL;
+    }
+
+    cJSON *jmode = cJSON_GetObjectItemCaseSensitive(config, "mode");
+    cJSON *jnormal_min = cJSON_GetObjectItemCaseSensitive(config, "normal_min");
+    cJSON *jnormal_max = cJSON_GetObjectItemCaseSensitive(config, "normal_max");
+    cJSON *jalarm_min = cJSON_GetObjectItemCaseSensitive(config, "alarm_min");
+    cJSON *jalarm_max = cJSON_GetObjectItemCaseSensitive(config, "alarm_max");
+    cJSON *jtamper_low = cJSON_GetObjectItemCaseSensitive(config, "tamper_low");
+    cJSON *jtamper_high = cJSON_GetObjectItemCaseSensitive(config, "tamper_high");
+
+    if (cJSON_IsNumber(jmode)) cfg.mode = (input_analog_eol_mode_t)jmode->valueint;
+    if (cJSON_IsNumber(jnormal_min)) cfg.normal_min = (float)jnormal_min->valuedouble;
+    if (cJSON_IsNumber(jnormal_max)) cfg.normal_max = (float)jnormal_max->valuedouble;
+    if (cJSON_IsNumber(jalarm_min)) cfg.alarm_min = (float)jalarm_min->valuedouble;
+    if (cJSON_IsNumber(jalarm_max)) cfg.alarm_max = (float)jalarm_max->valuedouble;
+    if (cJSON_IsNumber(jtamper_low)) cfg.tamper_low = (float)jtamper_low->valuedouble;
+    if (cJSON_IsNumber(jtamper_high)) cfg.tamper_high = (float)jtamper_high->valuedouble;
 
     cJSON_Delete(json);
 
-    if (any_updated) {
-        esp_err_t save_err = inputs_analog_save_configs();
-        if (save_err != ESP_OK) {
-            ESP_LOGE(TAG, "analog-eol post: salvataggio configurazione fallito (%s)",
-                     esp_err_to_name(save_err));
-            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "persist");
-            return ESP_FAIL;
+    esp_err_t set_err = inputs_analog_set_zone_config(0, &cfg, true);
+    if (set_err != ESP_OK) {
+        ESP_LOGE(TAG, "analog-eol post: salvataggio configurazione fallito (%s)",
+                 esp_err_to_name(set_err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "persist");
+        return ESP_FAIL;
         }
-    }
 
     return json_bool(req, true);
 }

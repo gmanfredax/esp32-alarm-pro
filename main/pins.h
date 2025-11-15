@@ -117,6 +117,13 @@
   #endif
 #endif
 
+#ifndef ANALOG_SUPPLY_DIVIDER_R1_OHMS
+  #define ANALOG_SUPPLY_DIVIDER_R1_OHMS 47000.0f
+#endif
+#ifndef ANALOG_SUPPLY_DIVIDER_R2_OHMS
+  #define ANALOG_SUPPLY_DIVIDER_R2_OHMS 10000.0f
+#endif
+
 _Static_assert(ADS1115_COUNT >= 0 && ADS1115_COUNT <= 3, "Supporto massimo: tre ADS1115");
 
 

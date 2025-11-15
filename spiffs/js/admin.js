@@ -152,7 +152,6 @@
   };
   let adsDiagFetchedOnce = false;
 
-  const ANALOG_MODE_LABELS = { 1: '1EOL', 2: '2EOL', 3: '3EOL' };
   const analogEolState = {
     payload: null,
     loading: false,
@@ -188,11 +187,6 @@
       return String(num);
     }
   }
-
-  const analogModeLabel = (mode) => {
-    const key = Number(mode);
-    return ANALOG_MODE_LABELS[key] || '';
-  };
 
   const formatAnalogValue = (value) => {
     const num = Number(value);
@@ -990,15 +984,18 @@
     }
   }
 
-  function updateAnalogRowMode(row){
-    if (!row) return;
-    const modeSelect = row.querySelector('[data-field="mode"]');
-    const mode = Number(modeSelect?.value ?? 0);
+  function updateAnalogConfigMode(){
+    const modeSelect = $("#analogConfigMode");
+    const mode = Number.parseInt(modeSelect?.value ?? '', 10);
     const disableTamper = mode === 1;
-    row.querySelectorAll('[data-field="tamper_low"], [data-field="tamper_high"]').forEach((input) => {
+    const tamperInputs = [
+      $("#analogConfigTamperLow"),
+      $("#analogConfigTamperHigh"),
+    ];
+    tamperInputs.forEach((input) => {
       if (!(input instanceof HTMLInputElement)) return;
       input.disabled = disableTamper;
-      if (!disableTamper) {
+      if (disableTamper) {
         input.classList.remove('input-error');
       }
     });
@@ -1010,6 +1007,15 @@
     const emptyEl = $("#analogEolEmpty");
     const saveBtn = $("#analogEolSaveBtn");
     const reloadBtn = $("#analogEolReloadBtn");
+    const configWrap = $("#analogEolConfigContainer");
+    const supplyInfo = $("#analogSupplyInfo");
+    const modeSelect = $("#analogConfigMode");
+    const normalMinInput = $("#analogConfigNormalMin");
+    const normalMaxInput = $("#analogConfigNormalMax");
+    const alarmMinInput = $("#analogConfigAlarmMin");
+    const alarmMaxInput = $("#analogConfigAlarmMax");
+    const tamperLowInput = $("#analogConfigTamperLow");
+    const tamperHighInput = $("#analogConfigTamperHigh");
 
     if (reloadBtn) reloadBtn.disabled = analogEolState.loading;
     if (saveBtn) saveBtn.disabled = analogEolState.loading || analogEolState.saving;
@@ -1036,8 +1042,54 @@
       setAnalogStatus('', null);
     }
 
+    const config = analogEolState.payload?.config;
     const zones = Array.isArray(analogEolState.payload?.zones) ? analogEolState.payload.zones : [];
-    const showTable = !analogEolState.error && !analogEolState.loading && analogEolState.payload?.enabled && zones.length > 0;
+    const enabled = !analogEolState.error && !analogEolState.loading && analogEolState.payload?.enabled;
+
+    if (configWrap) {
+      configWrap.classList.toggle('hidden', !(enabled && config));
+    }
+
+    if (enabled && config) {
+      const modeValue = Number.isFinite(Number(config.mode)) ? Number(config.mode) : 2;
+      if (modeSelect) modeSelect.value = String(modeValue);
+      const assignValue = (input, value) => {
+        if (!(input instanceof HTMLInputElement)) return;
+        input.value = Number.isFinite(Number(value)) ? formatAnalogValue(value) : '';
+        input.classList.remove('input-error');
+      };
+      assignValue(normalMinInput, config.normal_min);
+      assignValue(normalMaxInput, config.normal_max);
+      assignValue(alarmMinInput, config.alarm_min);
+      assignValue(alarmMaxInput, config.alarm_max);
+      assignValue(tamperLowInput, config.tamper_low);
+      assignValue(tamperHighInput, config.tamper_high);
+      updateAnalogConfigMode();
+    }
+
+    if (supplyInfo) {
+      const supply = analogEolState.payload?.supply;
+      if (enabled && supply?.available) {
+        supplyInfo.classList.remove('hidden');
+        if (supply.device_present === false) {
+          supplyInfo.textContent = 'Monitor alimentazione: modulo non rilevato.';
+        } else if (supply.sample_valid === false) {
+          const errText = typeof supply.last_error === 'string' ? ` (${supply.last_error})` : '';
+          supplyInfo.textContent = `Monitor alimentazione: lettura non disponibile${errText}.`;
+        } else if (supply.sample_valid) {
+          const supplyVolt = formatAnalogValue(supply.supply_voltage);
+          const adcVolt = formatAnalogValue(supply.adc_voltage);
+          supplyInfo.textContent = `Alimentazione 12V: ${supplyVolt} V (ADC ${adcVolt} V).`;
+        } else {
+          supplyInfo.textContent = '';
+        }
+      } else {
+        supplyInfo.classList.add('hidden');
+        supplyInfo.textContent = '';
+      }
+    }
+
+    const showTable = enabled && zones.length > 0;
     if (tableWrap) tableWrap.classList.toggle('hidden', !showTable);
     if (emptyEl) emptyEl.classList.toggle('hidden', showTable || analogEolState.error || analogEolState.loading);
 
@@ -1056,71 +1108,42 @@
       const title = userName ? `Z${zoneId} • ${userName}` : `Z${zoneId}`;
       const deviceSlot = Number(zone?.device_slot ?? 0) + 1;
       const channel = Number(zone?.channel ?? 0);
-      const mode = Number(zone?.mode ?? 2);
 
-      const metaEntries = [];
-      metaEntries.push({ text: `Dispositivo ${deviceSlot} • Canale ${channel}`, cls: '' });
-      if (zone?.address_hex) metaEntries.push({ text: `Indirizzo ${zone.address_hex}`, cls: '' });
-      const modeLabel = analogModeLabel(mode);
-      if (modeLabel) metaEntries.push({ text: `Modalità ${modeLabel}`, cls: '' });
+      const infoEntries = [];
+      infoEntries.push({ text: `Dispositivo ${deviceSlot} • Canale ${channel}`, cls: '' });
+      if (zone?.address_hex) infoEntries.push({ text: `Indirizzo ${zone.address_hex}`, cls: '' });
+
+      const statusEntries = [];
       if (zone?.device_present === false) {
-        metaEntries.push({ text: 'Modulo non rilevato', cls: 'warn' });
+        statusEntries.push({ text: 'Modulo non rilevato', cls: 'warn' });
       } else if (zone?.sample_valid === false) {
-        metaEntries.push({ text: 'Campione non disponibile', cls: 'warn' });
+        statusEntries.push({ text: 'Campione non disponibile', cls: 'warn' });
       } else if (zone?.sample_valid && zone?.voltage != null) {
-        metaEntries.push({ text: `Ultima lettura ${formatAnalogValue(zone.voltage)} V`, cls: '' });
+        statusEntries.push({ text: `Ultima lettura ${formatAnalogValue(zone.voltage)} V`, cls: '' });
       }
-      if (zone?.alarm_active) metaEntries.push({ text: 'Allarme attivo', cls: 'warn' });
-      if (zone?.tamper_active) metaEntries.push({ text: 'Tamper attivo', cls: 'error' });
-      if (zone?.last_error) metaEntries.push({ text: `Errore: ${zone.last_error}`, cls: 'warn' });
+      if (zone?.alarm_active) statusEntries.push({ text: 'Allarme attivo', cls: 'warn' });
+      if (zone?.tamper_active) statusEntries.push({ text: 'Tamper attivo', cls: 'error' });
+      if (zone?.last_error) statusEntries.push({ text: `Errore: ${zone.last_error}`, cls: 'warn' });
 
-      const metaHtml = metaEntries.map((entry) => `<div class="analog-zone-meta${entry.cls ? ` ${entry.cls}` : ''}">${escapeHtml(entry.text)}</div>`).join('');
-
-      const normalMin = formatAnalogValue(zone?.normal_min);
-      const normalMax = formatAnalogValue(zone?.normal_max);
-      const alarmMin = formatAnalogValue(zone?.alarm_min);
-      const alarmMax = formatAnalogValue(zone?.alarm_max);
-      const tamperLow = formatAnalogValue(zone?.tamper_low);
-      const tamperHigh = formatAnalogValue(zone?.tamper_high);
+      const infoHtml = infoEntries.map((entry) => `<div class="analog-zone-meta${entry.cls ? ` ${entry.cls}` : ''}">${escapeHtml(entry.text)}</div>`).join('');
+      const statusHtml = statusEntries.length
+        ? statusEntries.map((entry) => `<div class="analog-zone-meta${entry.cls ? ` ${entry.cls}` : ''}">${escapeHtml(entry.text)}</div>`).join('')
+        : '<div class="analog-zone-meta muted">In attesa di dati…</div>';
 
       return `
-        <tr data-index="${index}">
+        <tr>
           <td>
             <div class="analog-zone-title">${escapeHtml(title)}</div>
-            ${metaHtml}
+            ${infoHtml}
           </td>
           <td>
-            <div class="analog-config-grid">
-              <div class="analog-config-row">
-                <label>
-                  <span>Modalità</span>
-                  <select class="analog-mode-select" data-field="mode">
-                    <option value="1"${mode === 1 ? ' selected' : ''}>1 EOL</option>
-                    <option value="2"${mode === 2 ? ' selected' : ''}>2 EOL</option>
-                    <option value="3"${mode === 3 ? ' selected' : ''}>3 EOL</option>
-                  </select>
-                </label>
-              </div>
-              <div class="analog-config-row">
-                <label><span>Normale min (V)</span><input type="number" step="0.01" data-field="normal_min" value="${normalMin}"></label>
-                <label><span>Normale max (V)</span><input type="number" step="0.01" data-field="normal_max" value="${normalMax}"></label>
-              </div>
-              <div class="analog-config-row">
-                <label><span>Allarme min (V)</span><input type="number" step="0.01" data-field="alarm_min" value="${alarmMin}"></label>
-                <label><span>Allarme max (V)</span><input type="number" step="0.01" data-field="alarm_max" value="${alarmMax}"></label>
-              </div>
-              <div class="analog-config-row">
-                <label><span>Tamper bassa (V)</span><input type="number" step="0.01" data-field="tamper_low" value="${tamperLow}"></label>
-                <label><span>Tamper alta (V)</span><input type="number" step="0.01" data-field="tamper_high" value="${tamperHigh}"></label>
-              </div>
-            </div>
+            ${statusHtml}
           </td>
         </tr>`;
     }).join('');
 
     if (tbody) {
       tbody.innerHTML = rowsHtml;
-      tbody.querySelectorAll('tr').forEach(updateAnalogRowMode);
     }
   }
 
@@ -1150,17 +1173,32 @@
 
   async function saveAnalogEolConfig(){
     if (analogEolState.loading || analogEolState.saving) return;
-    const tbody = $("#analogEolTableBody");
-    if (!tbody) return;
-    const rows = Array.from(tbody.querySelectorAll('tr[data-index]'));
-    if (!rows.length) return;
+
+    const modeSelect = $("#analogConfigMode");
+    const normalMinInput = $("#analogConfigNormalMin");
+    const normalMaxInput = $("#analogConfigNormalMax");
+    const alarmMinInput = $("#analogConfigAlarmMin");
+    const alarmMaxInput = $("#analogConfigAlarmMax");
+    const tamperLowInput = $("#analogConfigTamperLow");
+    const tamperHighInput = $("#analogConfigTamperHigh");
 
     let hasError = false;
-    const payload = [];
+
+    const mode = Number.parseInt(modeSelect?.value ?? '', 10);
+    if (!Number.isInteger(mode) || mode < 1 || mode > 3) {
+      modeSelect?.classList.add('input-error');
+      hasError = true;
+    } else {
+      modeSelect?.classList.remove('input-error');
+    }
 
     const readNumber = (input) => {
       if (!(input instanceof HTMLInputElement)) return null;
       input.classList.remove('input-error');
+      if (input.disabled) {
+        const disabledValue = Number.parseFloat(input.value);
+        return Number.isFinite(disabledValue) ? disabledValue : 0;
+      }
       const value = Number.parseFloat(input.value);
       if (!Number.isFinite(value)) {
         input.classList.add('input-error');
@@ -1170,40 +1208,14 @@
       return value;
     };
 
-    rows.forEach((row) => {
-      const index = Number.parseInt(row.dataset.index, 10);
-      if (!Number.isFinite(index) || index < 0) return;
-      const modeSelect = row.querySelector('[data-field="mode"]');
-      const mode = Number.parseInt(modeSelect?.value ?? '', 10);
-      if (!Number.isInteger(mode) || mode < 1 || mode > 3) {
-        modeSelect?.classList.add('input-error');
-        hasError = true;
-        return;
-      }
-      modeSelect?.classList.remove('input-error');
+    const normalMin = readNumber(normalMinInput);
+    const normalMax = readNumber(normalMaxInput);
+    const alarmMin = readNumber(alarmMinInput);
+    const alarmMax = readNumber(alarmMaxInput);
+    const tamperLow = readNumber(tamperLowInput);
+    const tamperHigh = readNumber(tamperHighInput);
 
-      const normalMin = readNumber(row.querySelector('[data-field="normal_min"]'));
-      const normalMax = readNumber(row.querySelector('[data-field="normal_max"]'));
-      const alarmMin = readNumber(row.querySelector('[data-field="alarm_min"]'));
-      const alarmMax = readNumber(row.querySelector('[data-field="alarm_max"]'));
-      const tamperLow = readNumber(row.querySelector('[data-field="tamper_low"]'));
-      const tamperHigh = readNumber(row.querySelector('[data-field="tamper_high"]'));
-
-      if (hasError) return;
-
-      payload.push({
-        index,
-        mode,
-        normal_min: normalMin,
-        normal_max: normalMax,
-        alarm_min: alarmMin,
-        alarm_max: alarmMax,
-        tamper_low: tamperLow,
-        tamper_high: tamperHigh,
-      });
-    });
-
-    if (hasError || !payload.length) {
+    if (hasError) {
       toast('Correggi i valori evidenziati.', false);
       return;
     }
@@ -1211,7 +1223,17 @@
     analogEolState.saving = true;
     renderAnalogEolSection();
     try {
-      await apiPost('/api/admin/inputs/analog-eol', { zones: payload });
+      await apiPost('/api/admin/inputs/analog-eol', {
+        config: {
+          mode,
+          normal_min: normalMin,
+          normal_max: normalMax,
+          alarm_min: alarmMin,
+          alarm_max: alarmMax,
+          tamper_low: tamperLow,
+          tamper_high: tamperHigh,
+        },
+      });
       analogEolState.saving = false;
       analogEolState.error = "";
       toast('Configurazione analogica salvata');
@@ -1235,14 +1257,10 @@
       saveBtn.addEventListener('click', () => saveAnalogEolConfig());
       saveBtn._analogBound = true;
     }
-    const tbody = $("#analogEolTableBody");
-    if (tbody && !tbody._analogBound){
-      tbody.addEventListener('change', (event) => {
-        if (event.target?.matches('[data-field="mode"]')) {
-          updateAnalogRowMode(event.target.closest('tr'));
-        }
-      });
-      tbody._analogBound = true;
+    const modeSelect = $("#analogConfigMode");
+    if (modeSelect && !modeSelect._analogBound){
+      modeSelect.addEventListener('change', () => updateAnalogConfigMode());
+      modeSelect._analogBound = true;
     }
     await loadAnalogEolConfig(true);
   }

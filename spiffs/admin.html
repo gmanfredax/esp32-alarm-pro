@@ -159,12 +159,37 @@
               </div>
               <div id="analogEolStatus" class="status-line muted">Caricamento…</div>
               <div id="analogEolEmpty" class="status-line hidden">Nessuna zona analogica configurata.</div>
+              <div id="analogEolConfigContainer" class="analog-config-grid hidden">
+                <div class="analog-config-row">
+                  <label>
+                    <span>Modalità</span>
+                    <select class="analog-mode-select" id="analogConfigMode">
+                      <option value="1">1 EOL</option>
+                      <option value="2">2 EOL</option>
+                      <option value="3">3 EOL</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="analog-config-row">
+                  <label><span>Normale min (V)</span><input id="analogConfigNormalMin" type="number" step="0.01" /></label>
+                  <label><span>Normale max (V)</span><input id="analogConfigNormalMax" type="number" step="0.01" /></label>
+                </div>
+                <div class="analog-config-row">
+                  <label><span>Allarme min (V)</span><input id="analogConfigAlarmMin" type="number" step="0.01" /></label>
+                  <label><span>Allarme max (V)</span><input id="analogConfigAlarmMax" type="number" step="0.01" /></label>
+                </div>
+                <div class="analog-config-row">
+                  <label><span>Tamper bassa (V)</span><input id="analogConfigTamperLow" type="number" step="0.01" /></label>
+                  <label><span>Tamper alta (V)</span><input id="analogConfigTamperHigh" type="number" step="0.01" /></label>
+                </div>
+              </div>
+              <div id="analogSupplyInfo" class="status-line muted hidden"></div>
               <div class="table-wrap analog-table-wrap">
                 <table class="table analog-table">
                   <thead>
                     <tr>
                       <th>Zona</th>
-                      <th>Configurazione</th>
+                      <th>Stato</th>
                     </tr>
                   </thead>
                   <tbody id="analogEolTableBody"></tbody>

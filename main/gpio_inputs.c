@@ -5,12 +5,25 @@
 #include "esp_check.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 static size_t s_ads_devices = 0;
 #if ADS1115_COUNT > 0
-static input_analog_zone_config_t s_analog_cfg[INPUT_ANALOG_ZONES_COUNT];
+static input_analog_zone_config_t s_analog_cfg;
+static StaticSemaphore_t s_ads_mutex_buffer;
+static SemaphoreHandle_t s_ads_mutex = NULL;
+
+_Static_assert(INPUT_ANALOG_ZONES_COUNT <= INPUT_ANALOG_TOTAL_CHANNELS,
+               "Analog zone count exceeds available ADS1115 channels");
+#if INPUT_ANALOG_SUPPLY_INDEX > 0
+_Static_assert(INPUT_ANALOG_SUPPLY_INDEX < INPUT_ANALOG_TOTAL_CHANNELS,
+               "Supply channel index outside ADS1115 channel range");
+#endif
 #endif
 
 static const char* TAG = "inputs";
@@ -69,6 +82,70 @@ static inline size_t ads_config_count(void)
     return sizeof(s_ads_configs) / sizeof(s_ads_configs[0]);
 }
 
+static bool ads_lock_take(TickType_t ticks)
+{
+    if (!s_ads_mutex) {
+        return true;
+    }
+
+    TickType_t wait = ticks;
+    if (wait == 0) {
+        wait = pdMS_TO_TICKS(100);
+        if (wait == 0) {
+            wait = 1;
+        }
+    }
+
+    if (xSemaphoreTake(s_ads_mutex, wait) == pdTRUE) {
+        return true;
+    }
+
+    ESP_LOGW(TAG, "Timeout acquisendo il mutex ADS1115 (%lu ticks)", (unsigned long)wait);
+    return false;
+}
+
+static void ads_lock_give(void)
+{
+    if (s_ads_mutex) {
+        xSemaphoreGive(s_ads_mutex);
+    }
+}
+
+static TickType_t ads_lock_timeout_for_single(TickType_t timeout)
+{
+    if (timeout == portMAX_DELAY) {
+        return portMAX_DELAY;
+    }
+
+    TickType_t base = timeout;
+    if (base == 0) {
+        base = pdMS_TO_TICKS(100);
+        if (base == 0) {
+            base = 1;
+        }
+    }
+
+    TickType_t extra = pdMS_TO_TICKS(100);
+    if (extra == 0) {
+        extra = 1;
+    }
+
+    if (base > portMAX_DELAY - extra) {
+        return portMAX_DELAY;
+    }
+
+    return base + extra;
+}
+
+static esp_err_t single_channel_mux(int channel, ads1115_mux_t* mux);
+
+static esp_err_t ads_single_shot_locked(size_t index, int channel, TickType_t timeout, int16_t* raw)
+{
+    ads1115_mux_t mux = ADS1115_MUX_AIN0_GND;
+    ESP_RETURN_ON_ERROR(single_channel_mux(channel, &mux), TAG, "channel");
+    return ads1115_single_shot(index, mux, timeout, raw);
+}
+
 static esp_err_t ensure_ads_index(size_t index)
 {
     if (index >= s_ads_devices) {
@@ -96,6 +173,47 @@ static esp_err_t single_channel_mux(int channel, ads1115_mux_t* mux)
 }
 #endif
 
+#if ADS1115_COUNT > 0
+static float analog_supply_from_adc(float adc_voltage)
+{
+    const float divider_ratio = (float)((ANALOG_SUPPLY_DIVIDER_R1_OHMS + ANALOG_SUPPLY_DIVIDER_R2_OHMS) /
+                                        ANALOG_SUPPLY_DIVIDER_R2_OHMS);
+    return adc_voltage * divider_ratio;
+}
+
+static esp_err_t read_ads_slot_channel_voltage(size_t slot,
+                                               int channel,
+                                               TickType_t timeout,
+                                               float* voltage,
+                                               bool* device_present)
+{
+    if (!voltage) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t expected_devices = inputs_ads1115_expected_devices();
+    if (slot >= expected_devices) {
+        if (device_present) {
+            *device_present = false;
+        }
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ads1115_device_config_t expected;
+    ESP_RETURN_ON_ERROR(inputs_ads1115_get_expected_config(slot, &expected), TAG, "expected cfg");
+
+    int detected = inputs_ads1115_detected_index_for_address(expected.address);
+    if (device_present) {
+        *device_present = (detected >= 0);
+    }
+    if (detected < 0) {
+        return ESP_OK;
+    }
+
+    return inputs_ads1115_read_channel_voltage((size_t)detected, channel, timeout, voltage);
+}
+#endif
+
 esp_err_t inputs_init(void)
 {
     esp_err_t e = mcp23017_init();
@@ -115,6 +233,9 @@ esp_err_t inputs_init(void)
     s_ads_devices = ads1115_device_count();
     if (s_ads_devices > 0) {
         ESP_LOGI(TAG, "ADS1115 ready: %zu device(s)", s_ads_devices);
+        if (!s_ads_mutex) {
+            s_ads_mutex = xSemaphoreCreateMutexStatic(&s_ads_mutex_buffer);
+        }
     }
 
     esp_err_t cfg_err = inputs_analog_load_configs();
@@ -149,9 +270,13 @@ esp_err_t inputs_ads1115_read_channel_raw(size_t index, int channel, TickType_t 
 {
     ESP_RETURN_ON_ERROR(ensure_ads_index(index), TAG, "index");
     ESP_RETURN_ON_FALSE(raw != NULL, ESP_ERR_INVALID_ARG, TAG, "raw null");
-    ads1115_mux_t mux = ADS1115_MUX_AIN0_GND;
-    ESP_RETURN_ON_ERROR(single_channel_mux(channel, &mux), TAG, "channel");
-    return ads1115_single_shot(index, mux, timeout, raw);
+    TickType_t wait = ads_lock_timeout_for_single(timeout);
+    if (!ads_lock_take(wait)) {
+        return ESP_ERR_TIMEOUT;
+    }
+    esp_err_t res = ads_single_shot_locked(index, channel, timeout, raw);
+    ads_lock_give();
+    return res;
 }
 
 esp_err_t inputs_ads1115_read_channel_voltage(size_t index, int channel, TickType_t timeout, float* voltage)
@@ -168,10 +293,16 @@ esp_err_t inputs_ads1115_read_channel_voltage(size_t index, int channel, TickTyp
 esp_err_t inputs_ads1115_read_all_raw(size_t index, TickType_t timeout_per_channel, int16_t out_raw[ADS1115_CHANNEL_COUNT])
 {
     ESP_RETURN_ON_FALSE(out_raw != NULL, ESP_ERR_INVALID_ARG, TAG, "out_raw null");
+    ESP_RETURN_ON_ERROR(ensure_ads_index(index), TAG, "index");
+
+    esp_err_t res = ESP_OK;
     for (int ch = 0; ch < ADS1115_CHANNEL_COUNT; ++ch) {
-        ESP_RETURN_ON_ERROR(inputs_ads1115_read_channel_raw(index, ch, timeout_per_channel, &out_raw[ch]), TAG, "read ch");
+        res = inputs_ads1115_read_channel_raw(index, ch, timeout_per_channel, &out_raw[ch]);
+        if (res != ESP_OK) {
+            break;
+        }
     }
-    return ESP_OK;
+    return res;
 }
 
 esp_err_t inputs_ads1115_read_all_voltage(size_t index, TickType_t timeout_per_channel, float out_voltage[ADS1115_CHANNEL_COUNT])
@@ -179,12 +310,17 @@ esp_err_t inputs_ads1115_read_all_voltage(size_t index, TickType_t timeout_per_c
     ESP_RETURN_ON_FALSE(out_voltage != NULL, ESP_ERR_INVALID_ARG, TAG, "out_voltage null");
     ads1115_operating_config_t cfg;
     ESP_RETURN_ON_ERROR(ads1115_get_config(index, &cfg), TAG, "cfg");
+
+    esp_err_t res = ESP_OK;
     for (int ch = 0; ch < ADS1115_CHANNEL_COUNT; ++ch) {
         int16_t raw = 0;
-        ESP_RETURN_ON_ERROR(inputs_ads1115_read_channel_raw(index, ch, timeout_per_channel, &raw), TAG, "read ch");
+        res = inputs_ads1115_read_channel_raw(index, ch, timeout_per_channel, &raw);
+        if (res != ESP_OK) {
+            break;
+        }
         out_voltage[ch] = ads1115_raw_to_voltage(raw, cfg.gain);
     }
-    return ESP_OK;
+    return res;
 }
 
 esp_err_t inputs_ads1115_get_expected_config(size_t index, ads1115_device_config_t* out_cfg)
@@ -276,6 +412,23 @@ static void analog_cfg_normalize(input_analog_zone_config_t* cfg)
     }
 }
 
+static bool analog_cfg_is_valid(const input_analog_zone_config_t* cfg)
+{
+    if (!cfg) {
+        return false;
+    }
+    const float min_span = 0.05f;
+    bool normal_ok = (cfg->normal_max - cfg->normal_min) >= min_span;
+    bool alarm_ok = (cfg->alarm_max - cfg->alarm_min) >= min_span;
+    if (!normal_ok || !alarm_ok) {
+        return false;
+    }
+    if (cfg->mode == INPUT_ANALOG_EOL_1) {
+        return true;
+    }
+    return (cfg->tamper_high - cfg->tamper_low) >= min_span;
+}
+
 size_t inputs_analog_zone_count(void)
 {
     return INPUT_ANALOG_ZONES_COUNT;
@@ -283,9 +436,7 @@ size_t inputs_analog_zone_count(void)
 
 void inputs_analog_load_defaults(void)
 {
-    for (size_t i = 0; i < INPUT_ANALOG_ZONES_COUNT; ++i) {
-        analog_cfg_default(&s_analog_cfg[i]);
-    }
+    analog_cfg_default(&s_analog_cfg);
 }
 
 esp_err_t inputs_analog_load_configs(void)
@@ -299,27 +450,30 @@ esp_err_t inputs_analog_load_configs(void)
     nvs_handle_t handle;
     esp_err_t err = nvs_open("analog", NVS_READONLY, &handle);
     if (err != ESP_OK) {
-        return err == ESP_ERR_NVS_NOT_FOUND ? ESP_OK : err;
+        return (err == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : err;
     }
 
     size_t required = 0;
     err = nvs_get_blob(handle, "cfg", NULL, &required);
-    if (err == ESP_OK && required > 0) {
-        if (required > sizeof(s_analog_cfg)) {
-            required = sizeof(s_analog_cfg);
+    if (err == ESP_OK && required >= sizeof(input_analog_zone_config_t)) {
+        void* blob = malloc(required);
+        if (!blob) {
+            nvs_close(handle);
+            return ESP_ERR_NO_MEM;
         }
-        err = nvs_get_blob(handle, "cfg", s_analog_cfg, &required);
+        esp_err_t read_err = nvs_get_blob(handle, "cfg", blob, &required);
+        if (read_err == ESP_OK) {
+            memcpy(&s_analog_cfg, blob, sizeof(input_analog_zone_config_t));
+            analog_cfg_normalize(&s_analog_cfg);
+            if (!analog_cfg_is_valid(&s_analog_cfg)) {
+                ESP_LOGW(TAG, "Config EOL analogica non valida in NVS, ripristino default");
+                analog_cfg_default(&s_analog_cfg);
+            }
+        }
+        free(blob);
+        err = read_err;
     }
     nvs_close(handle);
-    if (err == ESP_OK) {
-        size_t items = required / sizeof(input_analog_zone_config_t);
-        if (items > INPUT_ANALOG_ZONES_COUNT) {
-            items = INPUT_ANALOG_ZONES_COUNT;
-        }
-        for (size_t i = 0; i < items; ++i) {
-            analog_cfg_normalize(&s_analog_cfg[i]);
-        }
-    }
     return (err == ESP_ERR_NVS_NOT_FOUND) ? ESP_OK : err;
 }
 
@@ -330,7 +484,7 @@ esp_err_t inputs_analog_save_configs(void)
     }
     nvs_handle_t handle;
     ESP_RETURN_ON_ERROR(nvs_open("analog", NVS_READWRITE, &handle), TAG, "analog nvs");
-    esp_err_t err = nvs_set_blob(handle, "cfg", s_analog_cfg, sizeof(s_analog_cfg));
+    esp_err_t err = nvs_set_blob(handle, "cfg", &s_analog_cfg, sizeof(s_analog_cfg));
     if (err == ESP_OK) {
         err = nvs_commit(handle);
     }
@@ -342,7 +496,7 @@ esp_err_t inputs_analog_get_zone_config(size_t index, input_analog_zone_config_t
 {
     ESP_RETURN_ON_FALSE(out_cfg != NULL, ESP_ERR_INVALID_ARG, TAG, "analog cfg null");
     ESP_RETURN_ON_FALSE(index < INPUT_ANALOG_ZONES_COUNT, ESP_ERR_INVALID_ARG, TAG, "analog cfg index");
-    *out_cfg = s_analog_cfg[index];
+    *out_cfg = s_analog_cfg;
     return ESP_OK;
 }
 
@@ -353,12 +507,37 @@ esp_err_t inputs_analog_set_zone_config(size_t index, const input_analog_zone_co
 
     input_analog_zone_config_t temp = *cfg;
     analog_cfg_normalize(&temp);
-    s_analog_cfg[index] = temp;
+    ESP_RETURN_ON_FALSE(analog_cfg_is_valid(&temp), ESP_ERR_INVALID_ARG, TAG, "analog cfg invalid");
+    s_analog_cfg = temp;
 
     if (persist) {
         return inputs_analog_save_configs();
     }
     return ESP_OK;
+}
+
+static void analog_cfg_eval_multi_resistor(const input_analog_zone_config_t* cfg,
+                                           float voltage,
+                                           bool* alarm_val,
+                                           bool* tamper_val)
+{
+    if (!cfg || !alarm_val || !tamper_val) {
+        return;
+    }
+
+    if (voltage <= cfg->tamper_low || voltage >= cfg->tamper_high) {
+        *tamper_val = true;
+        return;
+    }
+
+    if (voltage >= cfg->alarm_min && voltage <= cfg->alarm_max) {
+        *alarm_val = true;
+        return;
+    }
+
+    if (!(voltage >= cfg->normal_min && voltage <= cfg->normal_max)) {
+        *tamper_val = true;
+    }
 }
 
 static void analog_cfg_evaluate(const input_analog_zone_config_t* cfg, float voltage, bool* alarm, bool* tamper)
@@ -374,22 +553,16 @@ static void analog_cfg_evaluate(const input_analog_zone_config_t* cfg, float vol
 
     switch (cfg->mode) {
         case INPUT_ANALOG_EOL_1:
-            if (voltage <= cfg->alarm_min || voltage >= cfg->alarm_max) {
-                alarm_val = true;
-            } else if (voltage < cfg->normal_min || voltage > cfg->normal_max) {
+            if (!(voltage >= cfg->normal_min && voltage <= cfg->normal_max)) {
                 alarm_val = true;
             }
             break;
         case INPUT_ANALOG_EOL_2:
+            analog_cfg_eval_multi_resistor(cfg, voltage, &alarm_val, &tamper_val);
+            break;
         case INPUT_ANALOG_EOL_3:
         default:
-            if (voltage <= cfg->tamper_low || voltage >= cfg->tamper_high) {
-                tamper_val = true;
-            } else if (voltage >= cfg->alarm_min && voltage <= cfg->alarm_max) {
-                alarm_val = true;
-            } else if (!(voltage >= cfg->normal_min && voltage <= cfg->normal_max)) {
-                tamper_val = true;
-            }
+            analog_cfg_eval_multi_resistor(cfg, voltage, &alarm_val, &tamper_val);
             break;
     }
 
@@ -407,7 +580,7 @@ esp_err_t inputs_analog_evaluate(size_t index, TickType_t timeout, input_analog_
     ESP_RETURN_ON_FALSE(index < INPUT_ANALOG_ZONES_COUNT, ESP_ERR_INVALID_ARG, TAG, "analog index");
 
     memset(out_state, 0, sizeof(*out_state));
-    const input_analog_zone_config_t* cfg = &s_analog_cfg[index];
+    const input_analog_zone_config_t* cfg = &s_analog_cfg;
     out_state->mode = cfg->mode;
 
     size_t expected_devices = inputs_ads1115_expected_devices();
@@ -417,17 +590,13 @@ esp_err_t inputs_analog_evaluate(size_t index, TickType_t timeout, input_analog_
         return ESP_ERR_INVALID_ARG;
     }
 
-    ads1115_device_config_t expected;
-    ESP_RETURN_ON_ERROR(inputs_ads1115_get_expected_config(dev_index, &expected), TAG, "expected cfg");
-    int detected = inputs_ads1115_detected_index_for_address(expected.address);
-    if (detected < 0) {
-        out_state->device_present = false;
+    bool device_present = false;
+    float voltage = 0.0f;
+    esp_err_t err = read_ads_slot_channel_voltage(dev_index, channel, timeout, &voltage, &device_present);
+    out_state->device_present = device_present;
+    if (!device_present) {
         return ESP_OK;
     }
-    out_state->device_present = true;
-
-    float voltage = 0.0f;
-    esp_err_t err = inputs_ads1115_read_channel_voltage((size_t)detected, channel, timeout, &voltage);
     if (err != ESP_OK) {
         return err;
     }
@@ -462,6 +631,45 @@ esp_err_t inputs_collect_tamper_snapshot(uint16_t gpioab, TickType_t timeout, in
     }
 
     return ESP_OK;
+}
+
+esp_err_t inputs_analog_supply_state(TickType_t timeout, input_supply_state_t* out_state)
+{
+#if ADS1115_COUNT < 3
+    (void)timeout;
+    ESP_RETURN_ON_FALSE(out_state != NULL, ESP_ERR_INVALID_ARG, TAG, "supply state null");
+    memset(out_state, 0, sizeof(*out_state));
+    return ESP_ERR_NOT_SUPPORTED;
+#else
+    ESP_RETURN_ON_FALSE(out_state != NULL, ESP_ERR_INVALID_ARG, TAG, "supply state null");
+
+    memset(out_state, 0, sizeof(*out_state));
+
+    size_t expected_devices = inputs_ads1115_expected_devices();
+    if (INPUT_ANALOG_SUPPLY_SLOT >= expected_devices) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    bool device_present = false;
+    float adc_voltage = 0.0f;
+    esp_err_t err = read_ads_slot_channel_voltage(INPUT_ANALOG_SUPPLY_SLOT,
+                                                  INPUT_ANALOG_SUPPLY_CHANNEL,
+                                                  timeout,
+                                                  &adc_voltage,
+                                                  &device_present);
+    out_state->device_present = device_present;
+    if (!device_present) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    out_state->sample_valid = true;
+    out_state->adc_voltage = adc_voltage;
+    out_state->supply_voltage = analog_supply_from_adc(adc_voltage);
+    return ESP_OK;
+#endif
 }
 #endif
 
