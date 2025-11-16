@@ -68,8 +68,11 @@ void           alarm_set_bypass_mask(const zone_mask_t *mask);     // bitfield z
 void           alarm_get_bypass_mask(zone_mask_t *out_mask);
 void           alarm_begin_exit(uint32_t duration_ms);   // imposta exit-window (ms) a partire da “ora”
 
-// Tick di valutazione (chiamalo ciclicamente; zmask: bit0→Z1,...; tamper: true se attivo)
-void           alarm_tick(const zone_mask_t *zmask, bool tamper);
+// Tick di valutazione (maschere separate per allarme e tamper)
+void           alarm_tick(const zone_mask_t *alarm_mask,
+                          const zone_mask_t *tamper_mask,
+                          bool tamper_any,
+                          bool tamper_global);
 
 // Comandi
 void           alarm_arm_home(void);
@@ -80,7 +83,9 @@ void           alarm_disarm(void);
 
 // Uscite (verso il layer outputs.c)
 void           alarm_set_siren(bool on);
+void           alarm_set_sirens(bool internal, bool external);
 void           alarm_set_led_state(bool on);
+void           alarm_set_led_alarm(bool on);
 void           alarm_set_led_maint(bool on);
 
 // Info diagnostica

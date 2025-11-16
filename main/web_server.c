@@ -50,7 +50,7 @@
 #include "audit_log.h"
 #include "pn532_spi.h"
 #include "log_system.h"
-#include "gpio_inputs.h"
+#include "zone_inputs.h"
 #include "outputs.h"
 #include "utils.h"
 #include "scenes.h"
@@ -183,6 +183,7 @@ static char s_cloudflare_ui_url[128] = DEFAULT_CF_UI_URL;
 
 typedef struct {
     char central_name[64];
+    zone_eol_mode_t eol_mode;
 } provisioning_general_config_t;
 
 typedef struct {
@@ -1905,8 +1906,15 @@ static void provisioning_load_general(provisioning_general_config_t* cfg){
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
     nvs_handle_t nvs;
+    cfg->eol_mode = zone_inputs_get_eol_mode();
     if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
         nvs_get_str_def(nvs, "central_name", cfg->central_name, sizeof(cfg->central_name), "");
+        uint8_t mode_u8 = (uint8_t)cfg->eol_mode;
+        if (nvs_get_u8(nvs, "zone_eol_mode", &mode_u8) == ESP_OK){
+            if (mode_u8 <= (uint8_t)ZONE_EOL_MODE_3){
+                cfg->eol_mode = (zone_eol_mode_t)mode_u8;
+            }
+        }
         nvs_close(nvs);
     }
 }
@@ -2591,6 +2599,7 @@ static esp_err_t provision_status_get(httpd_req_t* req){
     cJSON* jgeneral = cJSON_AddObjectToObject(root, "general");
     if (jgeneral){
         cJSON_AddStringToObject(jgeneral, "central_name", general.central_name);
+        cJSON_AddStringToObject(jgeneral, "eol_mode", zone_inputs_eol_mode_name(general.eol_mode));
     }
     cJSON_AddStringToObject(root, "device_id", mqtt.cid);
 
@@ -2642,6 +2651,36 @@ static esp_err_t provision_general_post(httpd_req_t* req){
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "name"), ESP_FAIL;
     }
 
+    zone_eol_mode_t new_mode = zone_inputs_get_eol_mode();
+    const cJSON* jeol = cJSON_GetObjectItemCaseSensitive(root, "eol_mode");
+    if (jeol) {
+        zone_eol_mode_t parsed = new_mode;
+        if (cJSON_IsString(jeol) && jeol->valuestring) {
+            if (strcasecmp(jeol->valuestring, "1eol") == 0 || strcmp(jeol->valuestring, "1") == 0) {
+                parsed = ZONE_EOL_MODE_1;
+            } else if (strcasecmp(jeol->valuestring, "2eol") == 0 || strcmp(jeol->valuestring, "2") == 0) {
+                parsed = ZONE_EOL_MODE_2;
+            } else if (strcasecmp(jeol->valuestring, "3eol") == 0 || strcmp(jeol->valuestring, "3") == 0) {
+                parsed = ZONE_EOL_MODE_3;
+            } else {
+                cJSON_Delete(root);
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "eol_mode"), ESP_FAIL;
+            }
+        } else if (cJSON_IsNumber(jeol)) {
+            int v = (int)jeol->valuedouble;
+            if (v >= 1 && v <= 3) {
+                parsed = (zone_eol_mode_t)(v - 1);
+            } else {
+                cJSON_Delete(root);
+                return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "eol_mode"), ESP_FAIL;
+            }
+        } else {
+            cJSON_Delete(root);
+            return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "eol_mode"), ESP_FAIL;
+        }
+        new_mode = parsed;
+    }
+
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("sys", NVS_READWRITE, &nvs);
     if (err != ESP_OK){
@@ -2650,10 +2689,14 @@ static esp_err_t provision_general_post(httpd_req_t* req){
     }
 
     err = nvs_set_str(nvs, "central_name", name_buf);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs, "zone_eol_mode", (uint8_t)new_mode);
+    }
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     cJSON_Delete(root);
     if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "commit"), ESP_FAIL;
+    zone_inputs_set_eol_mode(new_mode);
     return json_reply(req, "{\"ok\":true}");
 }
 
@@ -3387,6 +3430,9 @@ typedef struct {
 typedef struct {
     bool known;
     bool active;
+    bool tamper;
+    float analog_ratio;
+    uint32_t raw_value;
     uint8_t board;
     uint8_t board_input;
     bool board_online;
@@ -3395,6 +3441,9 @@ typedef struct {
 typedef struct {
     int total;
     int master_total;
+    bool tamper_global;
+    float supply_voltage;
+    zone_eol_mode_t eol_mode;
     zone_state_entry_t entries[ZONE_CONFIG_CAPACITY];
 } zones_snapshot_t;
 
@@ -3442,20 +3491,28 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
     }
     memset(snap, 0, sizeof(*snap));
 
-    snap->master_total = INPUT_ZONES_COUNT;
+    zone_inputs_snapshot_t analog;
+    bool analog_ok = (zone_inputs_sample(&analog) == ESP_OK);
+    snap->master_total = analog_ok ? analog.zone_count : ZONE_INPUT_COUNT;
     if (snap->master_total > ZONE_CONFIG_CAPACITY) {
         snap->master_total = ZONE_CONFIG_CAPACITY;
     }
 
-    uint16_t gpioab = 0;
-    bool gpio_ok = (inputs_read_all(&gpioab) == ESP_OK);
+    snap->tamper_global = analog_ok ? analog.global_tamper : false;
+    snap->supply_voltage = analog_ok ? analog.supply_voltage : 0.0f;
+    snap->eol_mode = analog_ok ? analog.eol_mode : zone_inputs_get_eol_mode();
+
     for (int i = 0; i < snap->master_total; ++i) {
         zone_state_entry_t *entry = &snap->entries[i];
         entry->board = 0;
         entry->board_input = (uint8_t)i;
-        entry->board_online = gpio_ok;
-        entry->known = gpio_ok;
-        entry->active = gpio_ok ? inputs_zone_bit(gpioab, i + 1) : false;
+        bool within = analog_ok && (i < analog.zone_count);
+        entry->board_online = analog_ok;
+        entry->known = within;
+        entry->active = within && zone_inputs_zone_alarm(&analog, (uint8_t)i);
+        entry->tamper = within && zone_inputs_zone_tamper(&analog, (uint8_t)i);
+        entry->analog_ratio = within ? analog.zones[i].ratio : 0.0f;
+        entry->raw_value = within ? analog.zones[i].raw : 0u;
         s_zone_board_map[i] = 0;
         snap->total++;
     }
@@ -3477,6 +3534,9 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
             entry->board_online = (node->state == ROSTER_NODE_STATE_OPERATIONAL);
             entry->known = entry->board_online && node->inputs_valid;
             entry->active = entry->known ? ((node->inputs_bitmap & (1u << bit)) != 0u) : false;
+            entry->tamper = false;
+            entry->analog_ratio = 0.0f;
+            entry->raw_value = 0u;
             s_zone_board_map[snap->total] = entry->board;
             snap->total++;
         }
@@ -3489,6 +3549,9 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
         s_zone_board_map[i] = 0;
         snap->entries[i].known = false;
         snap->entries[i].active = false;
+        snap->entries[i].tamper = false;
+        snap->entries[i].analog_ratio = 0.0f;
+        snap->entries[i].raw_value = 0u;
         snap->entries[i].board = 0;
         snap->entries[i].board_input = 0;
         snap->entries[i].board_online = false;
@@ -3498,7 +3561,7 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
 static int zones_snapshot_total(const zones_snapshot_t *snap)
 {
     if (!snap) {
-        return INPUT_ZONES_COUNT;
+        return ZONE_INPUT_COUNT;
     }
     if (snap->total <= 0) {
         return snap->master_total;
@@ -3508,7 +3571,7 @@ static int zones_snapshot_total(const zones_snapshot_t *snap)
 
 static int zones_effective_total(void)
 {
-    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t total = roster_effective_zones(ZONE_INPUT_COUNT);
     if (total > ZONE_CONFIG_CAPACITY) {
         total = ZONE_CONFIG_CAPACITY;
     }
@@ -4535,17 +4598,20 @@ static esp_err_t status_get(httpd_req_t* req){
     if (entry_p && is_armed) state = "PRE_DISARM";
     else if (exit_p && is_armed) state = "PRE_ARM";
 
-    uint16_t gpioab = 0;
-    inputs_read_all(&gpioab);
-    bool tamper = inputs_tamper(gpioab);
-    bool tamper_alarm = (alarm_last_alarm_was_tamper() && _st == ALARM_ALARM);
-
     uint16_t outmask = 0;
     outputs_get_mask(&outmask);
 
     zones_snapshot_t snapshot;
     zones_snapshot_build(&snapshot);
     const int zones_total = zones_snapshot_total(&snapshot);
+    bool tamper_alarm = (alarm_last_alarm_was_tamper() && _st == ALARM_ALARM);
+    bool tamper_any = snapshot.tamper_global;
+    for (int idx = 0; idx < zones_total; ++idx) {
+        if (snapshot.entries[idx].tamper) {
+            tamper_any = true;
+            break;
+        }
+    }
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
@@ -4554,26 +4620,42 @@ static esp_err_t status_get(httpd_req_t* req){
 
     cJSON_AddStringToObject(root, "state", state);
     cJSON_AddNumberToObject(root, "zones_count", zones_total);
+    cJSON_AddBoolToObject(root, "tamper_global", snapshot.tamper_global);
+    cJSON_AddBoolToObject(root, "tamper_alarm", tamper_alarm);
+    cJSON_AddBoolToObject(root, "tamper_any", tamper_any);
+    cJSON_AddNumberToObject(root, "supply_voltage", snapshot.supply_voltage);
+    cJSON_AddStringToObject(root, "eol_mode", zone_inputs_eol_mode_name(snapshot.eol_mode));
 
     cJSON *zones = cJSON_CreateArray();
     cJSON *zones_known = cJSON_CreateArray();
-    if (zones && zones_known) {
+    cJSON *zones_tamper = cJSON_CreateArray();
+    cJSON *zones_ratio = cJSON_CreateArray();
+    cJSON *zones_raw = cJSON_CreateArray();
+    if (zones && zones_known && zones_tamper && zones_ratio && zones_raw) {
         for (int idx = 0; idx < zones_total; ++idx) {
             const zone_state_entry_t *entry = &snapshot.entries[idx];
             cJSON_AddItemToArray(zones, cJSON_CreateBool(entry->active));
             cJSON_AddItemToArray(zones_known, cJSON_CreateBool(entry->known));
+            cJSON_AddItemToArray(zones_tamper, cJSON_CreateBool(entry->tamper));
+            cJSON_AddItemToArray(zones_ratio, cJSON_CreateNumber(entry->analog_ratio));
+            cJSON_AddItemToArray(zones_raw, cJSON_CreateNumber(entry->raw_value));
         }
         cJSON_AddItemToObject(root, "zones_active", zones);
         cJSON_AddItemToObject(root, "zones_known", zones_known);
+        cJSON_AddItemToObject(root, "zones_tamper", zones_tamper);
+        cJSON_AddItemToObject(root, "zones_ratio", zones_ratio);
+        cJSON_AddItemToObject(root, "zones_raw", zones_raw);
     } else {
         if (zones) cJSON_Delete(zones);
         if (zones_known) cJSON_Delete(zones_known);
+        if (zones_tamper) cJSON_Delete(zones_tamper);
+        if (zones_ratio) cJSON_Delete(zones_ratio);
+        if (zones_raw) cJSON_Delete(zones_raw);
         cJSON_AddNullToObject(root, "zones_active");
         cJSON_AddNullToObject(root, "zones_known");
     }
 
-    cJSON_AddBoolToObject(root, "tamper", tamper);
-    cJSON_AddBoolToObject(root, "tamper_alarm", tamper_alarm);
+    cJSON_AddBoolToObject(root, "tamper", tamper_any);
     cJSON_AddNumberToObject(root, "outputs_mask", (unsigned)outmask);
     zone_mask_t bypass_mask;
     alarm_get_bypass_mask(&bypass_mask);
@@ -5478,9 +5560,17 @@ static esp_err_t tamper_reset_post(httpd_req_t* req)
         return json_reply(req, "{\"error\":\"notamper\",\"message\":\"Allarme non generato dal tamper.\"}");
     }
 
-    uint16_t gpioab = 0;
-    inputs_read_all(&gpioab);
-    if (inputs_tamper(gpioab)) {
+    zone_inputs_snapshot_t tamper_snapshot;
+    bool tamper_active = false;
+    if (zone_inputs_sample(&tamper_snapshot) == ESP_OK) {
+        tamper_active = tamper_snapshot.global_tamper;
+        for (uint8_t i = 0; i < tamper_snapshot.zone_count && !tamper_active; ++i) {
+            if (zone_inputs_zone_tamper(&tamper_snapshot, i)) {
+                tamper_active = true;
+            }
+        }
+    }
+    if (tamper_active) {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "409 Conflict");
         return json_reply(req, "{\"error\":\"tamper_open\",\"message\":\"Linea tamper ancora aperta.\"}");

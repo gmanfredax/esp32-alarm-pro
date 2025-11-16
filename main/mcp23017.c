@@ -95,17 +95,15 @@ esp_err_t mcp23017_init(void)
     // Qui lasciamo def. power-on, oppure imposta esplicitamente:
     // ESP_RETURN_ON_ERROR(mcp_wr(MCP_IOCON, 0x20 /* SEQOP=1 */), TAG, "IOCON");
 
-    // Direzioni = input su tutte le linee
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRA, 0xFF), TAG, "IODIRA");
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRB, 0x1F), TAG, "IODIRB");
+    const uint8_t portb_input_mask = (uint8_t)(1u << MCP_PORTB_GLOBAL_TAMPER_BIT);
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRA, 0x00), TAG, "IODIRA");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_IODIRB, portb_input_mask), TAG, "IODIRB");
 
-    // Pull-up interni abilitati su tutte le linee
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUA,  0xFF), TAG, "GPPUA");
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUB,  0x1F), TAG, "GPPUB");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUA,  0x00), TAG, "GPPUA");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUB,  portb_input_mask), TAG, "GPPUB");
 
-    uint8_t olatb = 0x00;
-
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_OLATB, olatb), TAG, "OLATB");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_OLATB, 0x00), TAG, "OLATA");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_OLATB, 0x00), TAG, "OLATB");
 
     // Lettura di prova + dump
     uint8_t a=0, b=0;

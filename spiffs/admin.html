@@ -85,6 +85,7 @@
           <h4>Sezioni</h4>
           <ul>
             <li><button class="btn w-100 active" data-view="view-users">Utenti</button></li>
+            <li><button class="btn w-100" data-view="view-system">Sistema</button></li>
             <li><button class="btn w-100" data-view="view-network">Rete</button></li>
             <li><button class="btn w-100" data-view="view-mqtt">MQTT</button></li>
             <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
@@ -108,6 +109,30 @@
                   <tbody id="usersTbody"><tr><td colspan="7">Caricamento…</td></tr></tbody>
                 </table>
               </div>
+            </div>
+          </section>
+
+          <section id="view-system" class="view">
+            <div class="card">
+              <h3>Impostazioni generali</h3>
+              <form class="form" id="generalForm">
+                <div class="field">
+                  <span>Nome centrale</span>
+                  <input id="general_name" type="text" maxlength="63" placeholder="Centrale Allarme" />
+                </div>
+                <div class="field">
+                  <span>Modalità EOL zone</span>
+                  <select id="general_eol">
+                    <option value="1EOL">1 EOL (contatto singolo)</option>
+                    <option value="2EOL">2 EOL (contatto + tamper)</option>
+                    <option value="3EOL">3 EOL (tamper avanzato)</option>
+                  </select>
+                </div>
+                <small class="muted">La modalità EOL viene applicata a tutte le zone cablate. Impostala in base alle resistenze presenti sui sensori.</small>
+                <div class="row" style="justify-content:flex-end;margin-top:.75rem">
+                  <button class="btn" id="btnGeneralSave" type="button">Salva impostazioni</button>
+                </div>
+              </form>
             </div>
           </section>
 

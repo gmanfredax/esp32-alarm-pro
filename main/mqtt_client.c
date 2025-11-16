@@ -25,7 +25,7 @@
 
 #include "alarm_core.h"
 #include "device_identity.h"
-#include "gpio_inputs.h"
+#include "zone_inputs.h"
 #include "outputs.h"
 #include "scenes.h"
 #include "roster.h"
@@ -59,6 +59,8 @@ static char                     s_topic_cmd_base[128];
 static char                     s_topic_cmd_sub[160];
 static size_t                   s_cmd_base_len = 0;
 static zone_mask_t              s_last_zone_mask;
+static zone_mask_t              s_last_tamper_mask;
+static bool                     s_last_tamper_global = false;
 static int                      s_last_zone_count = -1;
 static bool                     s_secret_ready = false;
 
@@ -238,25 +240,42 @@ esp_err_t mqtt_publish_state(void)
     zone_mask_t bypass_mask;
     alarm_get_bypass_mask(&bypass_mask);
 
-    uint16_t gpioab = 0;
-    inputs_read_all(&gpioab);
-    bool tamper = inputs_tamper(gpioab);
+    zone_inputs_snapshot_t snapshot;
+    zone_mask_t tamper_mask;
+    zone_mask_clear(&tamper_mask);
+    bool tamper_global = false;
+    bool tamper_any = false;
+    if (zone_inputs_sample(&snapshot) == ESP_OK) {
+        tamper_global = snapshot.global_tamper;
+        for (uint16_t i = 0; i < snapshot.zone_count && i < ALARM_MAX_ZONES; ++i) {
+            if (zone_inputs_zone_tamper(&snapshot, i)) {
+                zone_mask_set(&tamper_mask, i);
+            }
+        }
+        tamper_any = tamper_global || zone_mask_any(&tamper_mask);
+    }
     bool tamper_alarm = (alarm_last_alarm_was_tamper() && st == ALARM_ALARM);
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
 
-    uint16_t zones_total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t zones_total = roster_effective_zones(ZONE_INPUT_COUNT);
     zone_mask_limit(&bypass_mask, zones_total);
+    zone_mask_limit(&tamper_mask, zones_total);
     char bypass_hex[ZONE_MASK_WORDS * 8u + 1u];
     zone_mask_to_hex(&bypass_mask, zones_total, bypass_hex, sizeof(bypass_hex));
+    char tamper_hex[ZONE_MASK_WORDS * 8u + 1u];
+    zone_mask_to_hex(&tamper_mask, zones_total, tamper_hex, sizeof(tamper_hex));
 
     cJSON_AddStringToObject(root, "state", state_name);
     cJSON_AddNumberToObject(root, "zones_count", (double)zones_total);
     cJSON_AddNumberToObject(root, "outputs_mask", (double)outputs_mask);
     cJSON_AddStringToObject(root, "bypass_mask", bypass_hex);
     cJSON_AddNumberToObject(root, "bypass_mask_legacy", (double)zone_mask_to_u32(&bypass_mask));
-    cJSON_AddItemToObject(root, "tamper", cJSON_CreateBool(tamper));
+    cJSON_AddStringToObject(root, "tamper_mask", tamper_hex);
+    cJSON_AddNumberToObject(root, "tamper_mask_legacy", (double)zone_mask_to_u32(&tamper_mask));
+    cJSON_AddItemToObject(root, "tamper", cJSON_CreateBool(tamper_any));
+    cJSON_AddItemToObject(root, "tamper_global", cJSON_CreateBool(tamper_global));
     cJSON_AddItemToObject(root, "tamper_alarm", cJSON_CreateBool(tamper_alarm));
     cJSON_AddNumberToObject(root, "exit_pending_ms", (double)exit_ms);
     cJSON_AddNumberToObject(root, "entry_pending_ms", (double)entry_ms);
@@ -272,36 +291,57 @@ esp_err_t mqtt_publish_state(void)
     return err;
 }
 
-static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
+static esp_err_t publish_zones_internal(const zone_mask_t *alarm_mask,
+                                        const zone_mask_t *tamper_mask,
+                                        bool tamper_global,
+                                        bool force)
 {
     if (!s_client) return ESP_ERR_INVALID_STATE;
-    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t total = roster_effective_zones(ZONE_INPUT_COUNT);
     if (total > SCENES_MAX_ZONES) {
         total = SCENES_MAX_ZONES;
     }
 
-    zone_mask_t limited;
-    if (mask) {
-        zone_mask_copy(&limited, mask);
+    zone_mask_t limited_alarm;
+    if (alarm_mask) {
+        zone_mask_copy(&limited_alarm, alarm_mask);
     } else {
-        zone_mask_clear(&limited);
+        zone_mask_clear(&limited_alarm);
     }
-    zone_mask_limit(&limited, total);
+    zone_mask_limit(&limited_alarm, total);
 
-    if (!force && zone_mask_equal(&limited, &s_last_zone_mask) && s_last_zone_count == (int)total) {
+    zone_mask_t limited_tamper;
+    if (tamper_mask) {
+        zone_mask_copy(&limited_tamper, tamper_mask);
+    } else {
+        zone_mask_clear(&limited_tamper);
+    }
+    zone_mask_limit(&limited_tamper, total);
+
+    if (!force && zone_mask_equal(&limited_alarm, &s_last_zone_mask) &&
+        zone_mask_equal(&limited_tamper, &s_last_tamper_mask) &&
+        s_last_tamper_global == tamper_global &&
+        s_last_zone_count == (int)total) {
         return ESP_OK;
     }
 
-    zone_mask_copy(&s_last_zone_mask, &limited);
+    zone_mask_copy(&s_last_zone_mask, &limited_alarm);
+    zone_mask_copy(&s_last_tamper_mask, &limited_tamper);
+    s_last_tamper_global = tamper_global;
     s_last_zone_count = (int)total;
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
 
     char mask_hex[ZONE_MASK_WORDS * 8u + 1u];
-    zone_mask_to_hex(&limited, total, mask_hex, sizeof(mask_hex));
+    char tamper_hex[ZONE_MASK_WORDS * 8u + 1u];
+    zone_mask_to_hex(&limited_alarm, total, mask_hex, sizeof(mask_hex));
+    zone_mask_to_hex(&limited_tamper, total, tamper_hex, sizeof(tamper_hex));
     cJSON_AddStringToObject(root, "mask", mask_hex);
-    cJSON_AddNumberToObject(root, "mask_legacy", (double)zone_mask_to_u32(&limited));
+    cJSON_AddNumberToObject(root, "mask_legacy", (double)zone_mask_to_u32(&limited_alarm));
+    cJSON_AddStringToObject(root, "tamper_mask", tamper_hex);
+    cJSON_AddNumberToObject(root, "tamper_mask_legacy", (double)zone_mask_to_u32(&limited_tamper));
+    cJSON_AddItemToObject(root, "tamper_global", cJSON_CreateBool(tamper_global));
     ensure_timestamp(root);
 
     cJSON *arr = cJSON_AddArrayToObject(root, "zones");
@@ -310,8 +350,18 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
         return ESP_ERR_NO_MEM;
     }
     for (int i = 0; i < total; ++i) {
-        bool active = zone_mask_test(&limited, (uint16_t)i);
+        bool active = zone_mask_test(&limited_alarm, (uint16_t)i);
         cJSON_AddItemToArray(arr, cJSON_CreateBool(active));
+    }
+
+    cJSON *tamper_arr = cJSON_AddArrayToObject(root, "tamper_zones");
+    if (!tamper_arr) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    for (int i = 0; i < total; ++i) {
+        bool tz = zone_mask_test(&limited_tamper, (uint16_t)i);
+        cJSON_AddItemToArray(tamper_arr, cJSON_CreateBool(tz));
     }
 
     char *payload = cJSON_PrintUnformatted(root);
@@ -323,9 +373,11 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
     return err;
 }
 
-esp_err_t mqtt_publish_zones(const zone_mask_t *mask)
+esp_err_t mqtt_publish_zones(const zone_mask_t *alarm_mask,
+                             const zone_mask_t *tamper_mask,
+                             bool tamper_global)
 {
-    return publish_zones_internal(mask, false);
+    return publish_zones_internal(alarm_mask, tamper_mask, tamper_global, false);
 }
 
 esp_err_t mqtt_publish_scenes(void)
@@ -342,7 +394,7 @@ esp_err_t mqtt_publish_scenes(void)
 
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
-    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t total = roster_effective_zones(ZONE_INPUT_COUNT);
     if (total > SCENES_MAX_ZONES) {
         total = SCENES_MAX_ZONES;
     }
@@ -424,7 +476,7 @@ static void handle_arm_command(const char *payload)
             bypass_present = true;
         }
     }
-    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t total = roster_effective_zones(ZONE_INPUT_COUNT);
     if (total > SCENES_MAX_ZONES) {
         total = SCENES_MAX_ZONES;
     }
@@ -497,7 +549,7 @@ static void handle_disarm_command(void)
     alarm_state_t prev_state = alarm_get_state();
     zone_mask_t scene_mask;
     scenes_get_active_mask(&scene_mask);
-    uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+    uint16_t total = roster_effective_zones(ZONE_INPUT_COUNT);
     if (total > SCENES_MAX_ZONES) {
         total = SCENES_MAX_ZONES;
     }
@@ -600,7 +652,7 @@ static void handle_bypass_set(const char *payload)
         ok = true;
     }
     if (ok) {
-        uint16_t total = roster_effective_zones(INPUT_ZONES_COUNT);
+        uint16_t total = roster_effective_zones(ZONE_INPUT_COUNT);
         if (total > SCENES_MAX_ZONES) {
             total = SCENES_MAX_ZONES;
         }
@@ -633,7 +685,7 @@ static void handle_command(const char *topic, const char *payload)
         mqtt_publish_scenes();
     } else if (strcmp(suffix, "status/get") == 0) {
         mqtt_publish_state();
-        publish_zones_internal(&s_last_zone_mask, true);
+        publish_zones_internal(&s_last_zone_mask, &s_last_tamper_mask, s_last_tamper_global, true);
     } else if (strcmp(suffix, "bypass/set") == 0) {
         handle_bypass_set(payload);
     } else {
@@ -654,7 +706,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         publish_availability("online");
         esp_mqtt_client_subscribe(s_client, s_topic_cmd_sub, CONFIG_APP_CLOUD_QOS_COMMANDS);
         mqtt_publish_state();
-        publish_zones_internal(&s_last_zone_mask, true);
+        publish_zones_internal(&s_last_zone_mask, &s_last_tamper_mask, s_last_tamper_global, true);
         mqtt_publish_scenes();
         break;
     case MQTT_EVENT_DISCONNECTED:

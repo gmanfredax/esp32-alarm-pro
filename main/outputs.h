@@ -4,12 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/**
- * Inizializza l’expander uscite (MCP23017).
- * - IODIRA/IODIRB = 0x00 (tutte uscite)
- * - GPPUA/GPPUB = 0x00 (niente pull-up su uscite)
- * - Uscite tutte a 0
- */
+/** Inizializza l'expander uscite (MCP23017). per sirene/led */
 esp_err_t outputs_init(void);
 
 /** Imposta una singola uscita (1..16). true=ON, false=OFF
@@ -29,7 +24,13 @@ esp_err_t outputs_get_mask(uint16_t *out_mask);
 /** Spegne tutte le uscite. */
 esp_err_t outputs_all_off(void);
 
-/* ───────── Uscite semantiche dedicate (usano i bit di PORTB definiti in pins.h) ───────── */
 void outputs_siren(bool on);
+void outputs_sirens(bool internal, bool external);
+void outputs_siren_internal(bool on);
+void outputs_siren_external(bool on);
+void outputs_fog(bool on);
+
 void outputs_led_state(bool on);
+void outputs_led_alarm(bool on);
 void outputs_led_maint(bool on);
+void outputs_led_provisioning_rgb(bool red, bool green, bool blue);

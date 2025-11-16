@@ -1,67 +1,61 @@
-// main/pins.h
+// main/pins.h - Mappatura pin hardware per ESP32-P4NRW32 + IPI01GRI
 #pragma once
+
 #include "driver/gpio.h"
-#include "driver/spi_master.h"   // per SPIx_HOST
-#include "sdkconfig.h"
+#include "driver/spi_master.h"
 #include "driver/i2c_master.h"
+#include "sdkconfig.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
-// OVERRIDE UTENTE (opzionale):
-// Crea un file "pins_user.h" nella cartella del progetto e definisci lì
-// le macro dei pin che vuoi cambiare. Verrà incluso qui sotto.
+// OVERRIDE UTENTE (opzionale)
+// Crea un file "pins_user.h" con le tue definizioni personalizzate
 #if __has_include("pins_user.h")
-  #include "pins_user.h"
+#  include "pins_user.h"
 #endif
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ========================= ETHERNET (RMII, ESP32-P4) ============================
+// Mappatura fissata dal layout ESP32-P4NRW32 + IP101GRI
+#define ETH_RMII_REF_CLK_GPIO   GPIO_NUM_50   // 50 MHz IN da IP101GRI (doppia frequenza)
+#define ETH_RMII_TX_EN_GPIO     GPIO_NUM_49
+#define ETH_RMII_TXD0_GPIO      GPIO_NUM_34
+#define ETH_RMII_TXD1_GPIO      GPIO_NUM_35
+#define ETH_RMII_RXD0_GPIO      GPIO_NUM_29
+#define ETH_RMII_RXD1_GPIO      GPIO_NUM_30
+#define ETH_RMII_CRS_DV_GPIO    GPIO_NUM_28
 
-// ========================= ETHERNET (RMII, ESP32) ============================
-// Pin RMII fissi lato ESP32 (NON cambiarli nel codice: sono cablati in HW).
-// ATTENZIONE: non impostare pull/direzioni su questi pin dall'app.
-#define ETH_RMII_REF_CLK_GPIO   GPIO_NUM_0   // 50 MHz IN (da PHY) o OUT (APLL)
-#define ETH_RMII_TX_EN_GPIO     GPIO_NUM_21
-#define ETH_RMII_TXD0_GPIO      GPIO_NUM_19
-#define ETH_RMII_TXD1_GPIO      GPIO_NUM_22
-#define ETH_RMII_RXD0_GPIO      GPIO_NUM_25
-#define ETH_RMII_RXD1_GPIO      GPIO_NUM_26
-#define ETH_RMII_CRS_DV_GPIO    GPIO_NUM_27
-
-// Pin SMI (MDC/MDIO) — configurabili
-#ifndef ETH_MDC_GPIO
-  #define ETH_MDC_GPIO          GPIO_NUM_23
-#endif
-#ifndef ETH_MDIO_GPIO
-  #define ETH_MDIO_GPIO         GPIO_NUM_18
-#endif
 #ifndef ETH_PHY_ADDR
-  #define ETH_PHY_ADDR          1           // 0 o 1 tipici
+#  define ETH_PHY_ADDR          1 
 #endif
 #ifndef ETH_PHY_RST_GPIO
-  #define ETH_PHY_RST_GPIO      -1          // -1 se non cablato a GPIO
+#  define ETH_PHY_RST_GPIO      GPIO_NUM_51
+#endif
+#ifndef ETH_MDC_GPIO
+#  define ETH_MDC_GPIO          GPIO_NUM_31
+#endif
+#ifndef ETH_MDIO_GPIO
+#  define ETH_MDIO_GPIO         GPIO_NUM_52
 #endif
 #ifndef ETH_USE_EXT_REF_CLK
-  #define ETH_USE_EXT_REF_CLK   1           // 1 = 50 MHz dal PHY su GPIO0; 0 = APLL interno
+#  define ETH_USE_EXT_REF_CLK   1           // clock da PHY
 #endif
-
 
 // =============================== PN532 (SPI) =================================
-// Rimappati per evitare conflitti con RMII
 #ifndef PN532_SPI_HOST
-  #define PN532_SPI_HOST        2   // VSPI
+#  define PN532_SPI_HOST        SPI2_HOST
 #endif
 #ifndef PN532_PIN_SCK
-  #define PN532_PIN_SCK         GPIO_NUM_14
+#  define PN532_PIN_SCK         GPIO_NUM_14
 #endif
 #ifndef PN532_PIN_MOSI
-  #define PN532_PIN_MOSI        GPIO_NUM_13
+#  define PN532_PIN_MOSI        GPIO_NUM_13
 #endif
 #ifndef PN532_PIN_MISO
-  #define PN532_PIN_MISO        GPIO_NUM_12   // input-only: perfetto per MISO
+#  define PN532_PIN_MISO        GPIO_NUM_12
 #endif
 #ifndef PN532_PIN_CS
-  #define PN532_PIN_CS          GPIO_NUM_16
+#  define PN532_PIN_CS          GPIO_NUM_11
 #endif
-
 
 // =============================== CAN / TWAI ==================================
 #if defined(CONFIG_APP_CAN_ENABLED)
@@ -73,95 +67,99 @@
   #endif
 #endif
 
-
 // ================================ I2C ========================================
 // Nota: NON usare 21/22 perché sono coinvolti nel bus RMII.
 #ifndef I2C_PORT
-  #define I2C_PORT              0
+  #define I2C_PORT              I2C_NUM_0
 #endif
 #ifndef I2C_SDA_GPIO
-  #define I2C_SDA_GPIO          33
+  #define I2C_SDA_GPIO          GPIO_NUM_7
 #endif
 #ifndef I2C_SCL_GPIO
-  #define I2C_SCL_GPIO          32
+  #define I2C_SCL_GPIO          GPIO_NUM_8
 #endif
 #ifndef I2C_SPEED_HZ
-  #define I2C_SPEED_HZ          100000   // con pull-up esterne da 10k è l’ideale
+  #define I2C_SPEED_HZ          400000
 #endif
-
 
 // ============================== 1-Wire (DS18B20) =============================
 #ifndef ONEWIRE_GPIO
-  #define ONEWIRE_GPIO          GPIO_NUM_15
+  #define ONEWIRE_GPIO          GPIO_NUM_24
 #endif
 
+// ============================ ZONE ANALOGICHE ================================
+#ifndef ZONE_INPUT_COUNT
+  #define ZONE_INPUT_COUNT      10
+#endif
 
+#ifndef ZONE_INPUT_GPIO_1
+  #define ZONE_INPUT_GPIO_1     GPIO_NUM_16
+#endif
+#ifndef ZONE_INPUT_GPIO_2
+  #define ZONE_INPUT_GPIO_2     GPIO_NUM_17
+#endif
+#ifndef ZONE_INPUT_GPIO_3
+  #define ZONE_INPUT_GPIO_3     GPIO_NUM_18
+#endif
+#ifndef ZONE_INPUT_GPIO_4
+  #define ZONE_INPUT_GPIO_4     GPIO_NUM_19
+#endif
+#ifndef ZONE_INPUT_GPIO_5
+  #define ZONE_INPUT_GPIO_5     GPIO_NUM_20
+#endif
+#ifndef ZONE_INPUT_GPIO_6
+  #define ZONE_INPUT_GPIO_6     GPIO_NUM_21
+#endif
+#ifndef ZONE_INPUT_GPIO_7
+  #define ZONE_INPUT_GPIO_7     GPIO_NUM_22
+#endif
+#ifndef ZONE_INPUT_GPIO_8
+  #define ZONE_INPUT_GPIO_8     GPIO_NUM_23
+#endif
+#ifndef ZONE_INPUT_GPIO_9
+  #define ZONE_INPUT_GPIO_9     GPIO_NUM_53
+#endif
+#ifndef ZONE_INPUT_GPIO_10
+  #define ZONE_INPUT_GPIO_10    GPIO_NUM_54
+#endif
+
+#ifndef ZONE_SUPPLY_MONITOR_GPIO
+  #define ZONE_SUPPLY_MONITOR_GPIO GPIO_NUM_NC
+#endif
+
+#ifndef ZONE_SUPPLY_DIVIDER_R1_OHMS   // Resistenza lato ingresso (verso Vin)
+  #define ZONE_SUPPLY_DIVIDER_R1_OHMS 47000.0f
+#endif
+#ifndef ZONE_SUPPLY_DIVIDER_R2_OHMS   // Resistenza lato GND
+  #define ZONE_SUPPLY_DIVIDER_R2_OHMS 10000.0f
+#endif
+  
 // ================================ MCP23017 ===================================
 // Indirizzo 7-bit NON shiftato (modifica se A2..A0 != 111)
 #ifndef MCP23017_ADDR
   #define MCP23017_ADDR         0x27
 #endif
 
-// Mappatura **BIT** (0..7) su PORTB del MCP23017 (NON sono GPIO dell’ESP32)
-#ifndef MCPB_RELAY_BIT
-  #define MCPB_RELAY_BIT        5
-#endif
-#ifndef MCPB_LED_STATO_BIT
-  #define MCPB_LED_STATO_BIT    6
-#endif
-#ifndef MCPB_LED_MANUT_BIT
-  #define MCPB_LED_MANUT_BIT    7
-#endif
-#ifndef MCPB_TAMPER_BIT
-  #define MCPB_TAMPER_BIT       4
-#endif
+// PORTA -> LED di stato
+#define MCP_PORTA_LED_STATE_BIT     0
+#define MCP_PORTA_LED_ALARM_BIT     1
+#define MCP_PORTA_LED_MAINT_BIT     2
+#define MCP_PORTA_LED_PROV_R_BIT    3
+#define MCP_PORTA_LED_PROV_G_BIT    4
+#define MCP_PORTA_LED_PROV_B_BIT    5
 
-// Controlli compile-time: bit validi 0..7
-_Static_assert(MCPB_RELAY_BIT      >= 0 && MCPB_RELAY_BIT      <= 7, "MCPB_RELAY_BIT fuori range (0..7)");
-_Static_assert(MCPB_LED_STATO_BIT  >= 0 && MCPB_LED_STATO_BIT  <= 7, "MCPB_LED_STATO_BIT fuori range (0..7)");
-_Static_assert(MCPB_LED_MANUT_BIT  >= 0 && MCPB_LED_MANUT_BIT  <= 7, "MCPB_LED_MANUT_BIT fuori range (0..7)");
-_Static_assert(MCPB_TAMPER_BIT     >= 0 && MCPB_TAMPER_BIT     <= 7, "MCPB_TAMPER_BIT fuori range (0..7)");
+// PORTB -> attuatori + tamper globale
+#define MCP_PORTB_SIREN_INT_BIT     0
+#define MCP_PORTB_SIREN_EXT_BIT     1
+#define MCP_PORTB_FOG_BIT           2
+#define MCP_PORTB_GLOBAL_TAMPER_BIT 5
 
-// Utility: maschera per bit di PORTB (PORTB mappato su bit 8..15 del valore combinato)
-#define MCPB_MASK(b)            (1u << (8 + (b)))
-
-
-// ============================== USCITE / INGRESSI ============================
-// Esempi (lasciati commentati finché non servono):
-// #ifndef PIN_SIREN_RELAY
-//   #define PIN_SIREN_RELAY       GPIO_NUM_12
-// #endif
-// #ifndef PIN_LED_STATE
-//   #define PIN_LED_STATE         GPIO_NUM_2
-// #endif
-// #ifndef PIN_LED_MAINT
-//   #define PIN_LED_MAINT         GPIO_NUM_15
-// #endif
-
-// #ifndef PIN_HW_RESET_BTN_A
-//   #define PIN_HW_RESET_BTN_A     GPIO_NUM_4
-// #endif
-// #ifndef PIN_HW_RESET_BTN_B
-//   #define PIN_HW_RESET_BTN_B     GPIO_NUM_5
-// #endif
-
-// _ASSERT_NOT_RMII(PIN_HW_RESET_BTN_A);
-// _ASSERT_NOT_RMII(PIN_HW_RESET_BTN_B);
-// _Static_assert(PIN_HW_RESET_BTN_A != PIN_HW_RESET_BTN_B, "I pulsanti di reset devono usare GPIO distinti");
-// … aggiungi qui eventuali altre definizioni relative a GPIO ESP32 …
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// CONTROLLI COMPILAZIONE: evita conflitti con RMII
-// Usa _Static_assert per fallire a compile-time se assegni pin vietati agli I/O ESP32.
-
-// Helper macro (valuta a compile-time)
+// ============================ CONTROLLI DI COERENZA ===========================
 #define _ASSERT_NOT_RMII(pin) \
   _Static_assert((pin)!=ETH_RMII_REF_CLK_GPIO && (pin)!=ETH_RMII_TX_EN_GPIO && \
                  (pin)!=ETH_RMII_TXD0_GPIO   && (pin)!=ETH_RMII_TXD1_GPIO   && \
                  (pin)!=ETH_RMII_RXD0_GPIO   && (pin)!=ETH_RMII_RXD1_GPIO   && \
-                 (pin)!=ETH_RMII_CRS_DV_GPIO, \
-                 "PIN CONFLITTO con Ethernet RMII")
+                 (pin)!=ETH_RMII_CRS_DV_GPIO, "GPIO in conflitto con RMII")
 
 // PN532 non deve usare linee RMII
 _ASSERT_NOT_RMII(PN532_PIN_SCK);
@@ -189,35 +187,50 @@ _ASSERT_NOT_RMII(CAN_RX_GPIO);
 // Utility a runtime: stampa mappa pin (chiamala all’avvio, es. in app_main)
 static inline void pins_print_map(void) {
     printf("\n--- PIN MAP ---\n");
-    printf("ETH  RMII  REF_CLK=%d TX_EN=%d TXD0=%d TXD1=%d RXD0=%d RXD1=%d CRS_DV=%d\n",
-           ETH_RMII_REF_CLK_GPIO, ETH_RMII_TX_EN_GPIO, ETH_RMII_TXD0_GPIO, ETH_RMII_TXD1_GPIO,
-           ETH_RMII_RXD0_GPIO, ETH_RMII_RXD1_GPIO, ETH_RMII_CRS_DV_GPIO);
-    printf("ETH  SMI   MDC=%d MDIO=%d PHY_ADDR=%d RST=%d ext_refclk=%d\n",
-           ETH_MDC_GPIO, ETH_MDIO_GPIO, ETH_PHY_ADDR, ETH_PHY_RST_GPIO, ETH_USE_EXT_REF_CLK);
-
-    printf("PN532 SPI host=%d  SCK=%d MOSI=%d MISO=%d CS=%d\n",
-           (int)PN532_SPI_HOST, PN532_PIN_SCK, PN532_PIN_MOSI, PN532_PIN_MISO, PN532_PIN_CS);
-
-    printf("I2C  port=%d  SDA=%d SCL=%d @ %d Hz\n",
-           I2C_PORT, I2C_SDA_GPIO, I2C_SCL_GPIO, I2C_SPEED_HZ);
-
+    printf("ETH RMII: REF_CLK=%d TX_EN=%d TXD0=%d TXD1=%d RXD0=%d RXD1=%d CRS_DV=%d\n",
+           ETH_RMII_REF_CLK_GPIO, ETH_RMII_TX_EN_GPIO, ETH_RMII_TXD0_GPIO,
+           ETH_RMII_TXD1_GPIO, ETH_RMII_RXD0_GPIO, ETH_RMII_RXD1_GPIO,
+           ETH_RMII_CRS_DV_GPIO);
+    printf("ETH SMI: MDC=%d MDIO=%d PHY_ADDR=%d RESET=%d ext_clk=%d\n",
+           ETH_MDC_GPIO, ETH_MDIO_GPIO, ETH_PHY_ADDR, ETH_PHY_RST_GPIO,
+           ETH_USE_EXT_REF_CLK);
+    printf("I2C: SDA=%d SCL=%d @%dHz\n", I2C_SDA_GPIO, I2C_SCL_GPIO, I2C_SPEED_HZ);
+    printf("PN532 SPI host=%d SCK=%d MOSI=%d MISO=%d CS=%d\n",
+           PN532_SPI_HOST, PN532_PIN_SCK, PN532_PIN_MOSI, PN532_PIN_MISO,
+           PN532_PIN_CS);
+    printf("Zone analogiche (%u): %d %d %d %d %d %d %d %d %d %d\n",
+           ZONE_INPUT_COUNT,
+           ZONE_INPUT_GPIO_1, ZONE_INPUT_GPIO_2, ZONE_INPUT_GPIO_3,
+           ZONE_INPUT_GPIO_4, ZONE_INPUT_GPIO_5, ZONE_INPUT_GPIO_6,
+           ZONE_INPUT_GPIO_7, ZONE_INPUT_GPIO_8, ZONE_INPUT_GPIO_9,
+           ZONE_INPUT_GPIO_10);
+    printf("Monitor 12V GPIO=%d (R1=%.0fΩ R2=%.0fΩ)\n",
+           ZONE_SUPPLY_MONITOR_GPIO,
+           (double)ZONE_SUPPLY_DIVIDER_R1_OHMS,
+           (double)ZONE_SUPPLY_DIVIDER_R2_OHMS);
+    printf("MCP23017 addr=0x%02X\n", MCP23017_ADDR);
+    printf("PORTA LED bits: state=%d alarm=%d maint=%d provRGB=%d/%d/%d\n",
+           MCP_PORTA_LED_STATE_BIT, MCP_PORTA_LED_ALARM_BIT,
+           MCP_PORTA_LED_MAINT_BIT, MCP_PORTA_LED_PROV_R_BIT,
+           MCP_PORTA_LED_PROV_G_BIT, MCP_PORTA_LED_PROV_B_BIT);
+    printf("PORTB attuatori: siren_int=%d siren_ext=%d fog=%d tamper=%d\n",
+           MCP_PORTB_SIREN_INT_BIT, MCP_PORTB_SIREN_EXT_BIT,
+           MCP_PORTB_FOG_BIT, MCP_PORTB_GLOBAL_TAMPER_BIT);
     printf("1-Wire GPIO=%d\n", ONEWIRE_GPIO);
 
-#if defined(CONFIG_APP_CAN_ENABLED)
-    int can_bitrate = 0;
-#if defined(CONFIG_APP_CAN_BITRATE_125K)
-    can_bitrate = 125000;
-#elif defined(CONFIG_APP_CAN_BITRATE_500K)
-    can_bitrate = 500000;
-#else
-    can_bitrate = 250000;
-#endif
-    printf("CAN  TWAI  TX=%d RX=%d bitrate=%d\n", CAN_TX_GPIO, CAN_RX_GPIO, can_bitrate);
-#else
-    printf("CAN  TWAI  disabled\n");
-#endif
+// #if defined(CONFIG_APP_CAN_ENABLED)
+//     int can_bitrate = 0;
+// #if defined(CONFIG_APP_CAN_BITRATE_125K)
+//     can_bitrate = 125000;
+// #elif defined(CONFIG_APP_CAN_BITRATE_500K)
+//     can_bitrate = 500000;
+// #else
+//     can_bitrate = 250000;
+// #endif
+//     printf("CAN  TWAI  TX=%d RX=%d bitrate=%d\n", CAN_TX_GPIO, CAN_RX_GPIO, can_bitrate);
+// #else
+//     printf("CAN  TWAI  disabled\n");
+// #endif
 
-    printf("MCP23017 addr=0x%02X  PORTB bits: RELAY=%d LED_STATO=%d LED_MANUT=%d TAMPER=%d\n",
-           MCP23017_ADDR, MCPB_RELAY_BIT, MCPB_LED_STATO_BIT, MCPB_LED_MANUT_BIT, MCPB_TAMPER_BIT);
     printf("---------------\n\n");
 }

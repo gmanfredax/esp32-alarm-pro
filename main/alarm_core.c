@@ -6,7 +6,6 @@
 #include <stdio.h>
 #include "esp_timer.h"
 #include "scenes.h"
-#include "gpio_inputs.h"   // per INPUT_ZONES_COUNT e inputs_zone_bit()
 #include "app_mqtt.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,8 +174,10 @@ void alarm_init(void)
     profiles[ALARM_MAINTENANCE] = (profile_t){ .active_mask = NONE, .entry_delay_ms =     0, .exit_delay_ms =     0 };
 
     outputs_led_state(false);
+    outputs_led_alarm(false);
     outputs_led_maint(false);
-    outputs_siren(false);
+    outputs_sirens(false, false);
+    outputs_fog(false);
     ESP_LOGI(TAG, "Alarm core initialized");
 }
 
@@ -301,7 +302,7 @@ void alarm_disarm(void)
     s_state = ALARM_DISARMED;
     outputs_led_state(false);
     outputs_led_maint(false);
-    outputs_siren(false);
+    alarm_set_siren(false);
 
     // Reset stato dinamico della sessione
     zone_mask_clear(&s_bypass_mask);
@@ -321,35 +322,62 @@ void alarm_disarm(void)
 // ─────────────────────────────────────────────────────────────────────────────
 // Uscite
 // ─────────────────────────────────────────────────────────────────────────────
-void alarm_set_siren(bool on)      { outputs_siren(on); }
+void alarm_set_siren(bool on)
+{
+    outputs_sirens(on, on);
+    outputs_led_alarm(on);
+}
+
+void alarm_set_sirens(bool internal, bool external)
+{
+    outputs_sirens(internal, external);
+    outputs_led_alarm(internal || external);
+}
+
 void alarm_set_led_state(bool on)  { outputs_led_state(on); }
+void alarm_set_led_alarm(bool on)  { outputs_led_alarm(on); }
 void alarm_set_led_maint(bool on)  { outputs_led_maint(on); }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Ciclo logico
-//  - zmask: bitfield Z1..Z32 -> bit0..bit31
-//  - tamper: TRUE se tamper attivo
+//  - alarm_mask: bitfield Z1..Z32 -> bit0..bit31
+//  - tamper_mask: bitfield zone in tamper (se disponibile)
+//  - tamper_any: TRUE se tamper globale o di zona attivo
+//  - tamper_global: TRUE se il tamper globale è attivo
 // ─────────────────────────────────────────────────────────────────────────────
-void alarm_tick(const zone_mask_t *zmask, bool tamper)
+void alarm_tick(const zone_mask_t *alarm_mask,
+                const zone_mask_t *tamper_mask,
+                bool tamper_any,
+                bool tamper_global)
 {
-    if (!zmask) {
+    if (!alarm_mask) {
         return;
     }
-    // Tamper ha priorità (eccetto manutenzione)
-    if (tamper) {
+    zone_mask_t tamper_copy;
+    zone_mask_clear(&tamper_copy);
+    if (tamper_mask) {
+        zone_mask_copy(&tamper_copy, tamper_mask);
+        zone_mask_limit(&tamper_copy, ALARM_MAX_ZONES);
+    }
+
+    if (tamper_any) {
         if (!s_tamper_latched) {
             const char *prev_label = alarm_state_name(s_state);
             audit_tamper_alarm_event(prev_label);
+            if (tamper_global) {
+                audit_alarm_trigger_event("tamper_global", NULL, -1);
+            }
+            if (zone_mask_any(&tamper_copy)) {
+                audit_alarm_trigger_event("tamper_zone", &tamper_copy, -1);
+            }
             s_tamper_latched = true;
         }
-        if (s_state != ALARM_MAINTENANCE) {
-            if (s_state != ALARM_ALARM) {
-                s_state = ALARM_ALARM;
-                s_alarm_from_tamper = true;
-                outputs_siren(true);
-                ESP_LOGW(TAG, "TAMPER -> ALARM");
-                mqtt_publish_state();
-            }
+        if (s_state != ALARM_MAINTENANCE && s_state != ALARM_ALARM) {
+            s_state = ALARM_ALARM;
+            s_alarm_from_tamper = true;
+            alarm_set_siren(true);
+            ESP_LOGW(TAG, "%s", tamper_global ? "TAMPER GLOBALE -> ALARM" : "TAMPER ZONA -> ALARM");
+            mqtt_publish_state();
         }
         return;
     }
@@ -375,15 +403,15 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
         // Ritardo unico: se la finestra di uscita è stata avviata perché c'erano zone a ritardo già aperte,
         // allora allo scadere dell'exit, se una di quelle zone è ANCORA aperta, scatta l'allarme.
         if (s_exit_unified && s_exit_deadline_us != 0 && now >= s_exit_deadline_us) {
-            if (zone_mask_intersects(zmask, &s_exit_guard_mask)) {
+            if (zone_mask_intersects(alarm_mask, &s_exit_guard_mask)) {
                 if (s_state != ALARM_ALARM) {
                     s_state = ALARM_ALARM;
                     s_alarm_from_tamper = false;
-                    outputs_siren(true);
+                    alarm_set_siren(true);
                     ESP_LOGW(TAG, "EXIT timeout (ritardo unico) con zona ancora aperta -> ALARM");
                     mqtt_publish_state();
                     zone_mask_t triggered;
-                    zone_mask_and(&triggered, zmask, &s_exit_guard_mask);
+                    zone_mask_and(&triggered, alarm_mask, &s_exit_guard_mask);
                     audit_alarm_trigger_event("exit", &triggered, -1);
                 }
                 // reset stato entry eventuale
@@ -406,7 +434,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
                 if (s_state != ALARM_ALARM) {
                     s_state = ALARM_ALARM;
                     s_alarm_from_tamper = false;
-                    outputs_siren(true);
+                    alarm_set_siren(true);
                     ESP_LOGW(TAG, "ENTRY timeout -> ALARM (Z%d)", s_entry_zone >= 0 ? (s_entry_zone + 1) : -1);
                     mqtt_publish_state();
                     audit_alarm_trigger_event("entry_timeout", &s_entry_zmask, s_entry_zone);
@@ -422,7 +450,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
 
         // Trigger effettivi sulle zone attive (profilo + scenari − bypass)
         zone_mask_t trig;
-        zone_mask_and(&trig, zmask, &eff_mask);
+        zone_mask_and(&trig, alarm_mask, &eff_mask);
         if (!zone_mask_any(&trig)) return;
 
         // Durante exit window: ignora i trigger di sole zone marcate exit_delay
@@ -456,7 +484,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
             if (s_state != ALARM_ALARM) {
                 s_state = ALARM_ALARM;
                 s_alarm_from_tamper = false;
-                outputs_siren(true);
+        alarm_set_siren(true);
                 ESP_LOGW(TAG, "ZONE instant -> ALARM");
                 mqtt_publish_state();
                 audit_alarm_trigger_event("instant", &trig, -1);

@@ -252,6 +252,51 @@
     });
   }
 
+  async function loadGeneralConfig(){
+    try {
+      const data = await apiGet("/api/provision/status");
+      const general = data?.general || {};
+      const nameInput = $("#general_name");
+      if (nameInput) {
+        nameInput.value = general.central_name || "";
+      }
+      const eolSelect = $("#general_eol");
+      if (eolSelect) {
+        const raw = (general.eol_mode || "").toString().toUpperCase();
+        if (raw === "1" || raw === "1EOL") eolSelect.value = "1EOL";
+        else if (raw === "3" || raw === "3EOL") eolSelect.value = "3EOL";
+        else eolSelect.value = "2EOL";
+      }
+    } catch (err) {
+      console.error("General config", err);
+      toast("Errore caricamento impostazioni: " + (err?.message || err), false);
+    }
+  }
+
+  function setupGeneralForm(){
+    const saveBtn = $("#btnGeneralSave");
+    if (!saveBtn || saveBtn._bound) return;
+    saveBtn._bound = true;
+    saveBtn.addEventListener("click", async () => {
+      const nameInput = $("#general_name");
+      const eolSelect = $("#general_eol");
+      const name = (nameInput?.value || "").trim();
+      if (!name) {
+        toast("Inserisci il nome della centrale", false);
+        nameInput?.focus();
+        return;
+      }
+      const eol = (eolSelect?.value || "2EOL").toUpperCase();
+      try {
+        await apiPost("/api/provision/general", { central_name: name, eol_mode: eol });
+        toast("Impostazioni generali salvate");
+        await loadGeneralConfig();
+      } catch (err) {
+        toast("Errore salvataggio impostazioni: " + (err?.message || err), false);
+      }
+    });
+  }
+
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) maskMqttPassword();
   });
@@ -1813,7 +1858,8 @@
     mountUserMenu();
     updateAdminVisibility();
     setupSidebar();
-    const setupPromises = [setupNetMqttForms(), setupWebSecForm(), setupExpansionsSection()];
+    setupGeneralForm();
+    const setupPromises = [setupNetMqttForms(), setupWebSecForm(), setupExpansionsSection(), loadGeneralConfig()];
     document.querySelector('[data-tab="home"]')?.addEventListener('click', (e) => {
       e.preventDefault();
       location.href = "/index.html";

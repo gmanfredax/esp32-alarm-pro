@@ -46,6 +46,7 @@ idf_component_register(
         mqtt
         fatfs
         spiffs
+        esp_adc
     PRIV_REQUIRES
         # esp_https_server removed: we run plain HTTP server
         driver
