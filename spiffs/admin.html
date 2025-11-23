@@ -38,6 +38,14 @@
     .telemetry-metric strong.warn{color:#f87171}
     .telemetry-status{margin:.5rem 0;font-size:.9rem;color:var(--muted)}
     .telemetry-status.error{color:#f87171}
+    .diag-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.75rem;margin:.75rem 0}
+    .diag-card{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:10px;padding:.75rem}
+    .diag-card span{color:var(--muted);display:block;margin-bottom:.2rem}
+    .diag-card strong{font-size:1rem}
+    .diag-card .warn{color:#f87171}
+    .diag-th-row{display:flex;justify-content:space-between;align-items:center;padding:.3rem 0;border-bottom:1px solid rgba(255,255,255,.04)}
+    .diag-th-row:last-child{border-bottom:none}
+    .zone-threshold-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.75rem}
   </style>
 </head>
 <body>
@@ -89,7 +97,9 @@
             <li><button class="btn w-100" data-view="view-network">Rete</button></li>
             <li><button class="btn w-100" data-view="view-mqtt">MQTT</button></li>
             <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
+            <li><button class="btn w-100" data-view="view-zones">Zone</button></li>
             <li><button class="btn w-100" data-view="view-expansions">Espansioni CAN</button></li>
+            <li><button class="btn w-100" data-view="view-diagnostics">Diagnostica</button></li>
           </ul>
         </aside>
 
@@ -183,6 +193,27 @@
             </div>
           </section>
 
+          <section id="view-zones" class="view">
+            <div class="card">
+              <h3>Soglie modalità EOL</h3>
+              <p class="muted">Le soglie valgono per tutte le zone cablate. Inserisci i valori come rapporto (0–1). Vengono applicate immediatamente dal firmware.</p>
+              <div class="zone-threshold-grid" style="margin:.5rem 0 1rem 0;">
+                <label class="field"><span>1EOL — Fault max</span><input id="thr_1_fault" type="number" min="0" max="1" step="0.01" placeholder="0.08"></label>
+                <label class="field"><span>1EOL — Allarme min</span><input id="thr_1_alarm" type="number" min="0" max="1" step="0.01" placeholder="0.80"></label>
+                <label class="field"><span>2EOL — Tamper basso max</span><input id="thr_2_tamper" type="number" min="0" max="1" step="0.01" placeholder="0.10"></label>
+                <label class="field"><span>2EOL — Riposo max</span><input id="thr_2_normal" type="number" min="0" max="1" step="0.01" placeholder="0.50"></label>
+                <label class="field"><span>2EOL — Allarme max</span><input id="thr_2_alarm" type="number" min="0" max="1" step="0.01" placeholder="0.80"></label>
+                <label class="field"><span>3EOL — Tamper basso max</span><input id="thr_3_tamper" type="number" min="0" max="1" step="0.01" placeholder="0.07"></label>
+                <label class="field"><span>3EOL — Riposo max</span><input id="thr_3_normal" type="number" min="0" max="1" step="0.01" placeholder="0.38"></label>
+                <label class="field"><span>3EOL — Allarme max</span><input id="thr_3_alarm" type="number" min="0" max="1" step="0.01" placeholder="0.72"></label>
+              </div>
+              <div class="row" style="justify-content:flex-end;gap:.5rem;flex-wrap:wrap">
+                <button class="btn" id="btnZoneThresholdsSave" type="button">Salva soglie</button>
+              </div>
+              <div id="zoneThresholdsMsg" class="muted" style="margin-top:.4rem"></div>
+            </div>
+          </section>
+
           <!-- SICUREZZA WEB -->
           <section id="view-websec" class="view">
             <div class="card">
@@ -206,6 +237,7 @@
               <div id="websecFeedback" class="muted" style="margin-top:.4rem;font-size:.85rem"></div>
             </div>
           </section>
+
           <!-- ESPANSIONI CAN -->
           <section id="view-expansions" class="view">
             <div class="card">
@@ -231,6 +263,41 @@
               <p id="adminExpansionEmpty" class="expansion-empty hidden">Nessuna scheda rilevata.</p>
             </div>
           </section>
+          
+          <!-- DIAGNOSTICA -->
+          <section id="view-diagnostics" class="view">
+            <div class="card">
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap">
+                <h3>Diagnostica avanzata</h3>
+                <div class="row" style="gap:.4rem;align-items:center;flex-wrap:wrap">
+                  <button class="btn" id="btnDiagRefresh" type="button">Aggiorna</button>
+                </div>
+              </div>
+              <div class="diag-grid">
+                <div class="diag-card"><span>Uptime</span><strong data-diag="uptime">—</strong></div>
+                <div class="diag-card"><span>Firmware</span><strong data-diag="firmware">—</strong></div>
+                <div class="diag-card"><span>IDF</span><strong data-diag="idf">—</strong></div>
+                <div class="diag-card"><span>EOL</span><strong data-diag="eol_mode">—</strong></div>
+                <div class="diag-card"><span>Riferimento ADC</span><strong data-diag="adc_ref">—</strong></div>
+                <div class="diag-card"><span>Alimentazione zone</span><strong data-diag="supply">—</strong></div>
+                <div class="diag-card"><span>Tamper globale</span><strong data-diag="tamper_global">—</strong></div>
+              </div>
+              <div class="diag-card" style="margin-top:.5rem;">
+                <span>Soglie correnti</span>
+                <div id="diagThresholds"></div>
+                <small class="muted">Valori espressi come percentuale rispetto al riferimento ADC e come millivolt.</small>
+              </div>
+              <div class="table-wrap" style="margin-top:1rem;">
+                <table class="table">
+                  <thead>
+                    <tr><th>Zona</th><th>Stato</th><th>mV</th><th>Step</th><th>Rapporto</th><th>Linea</th><th>Scheda</th></tr>
+                  </thead>
+                  <tbody id="diagZonesBody"><tr><td colspan="7" class="muted">Premi Aggiorna per leggere i dati.</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
         </section>
       </div>
     </main>

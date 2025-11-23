@@ -1,5 +1,5 @@
 # Colleziona tutti i .c nella cartella main (comodo se aggiungi file spesso)
-#file(GLOB MAIN_SRCS "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
+#file(GLOB MAIN_SRCS "zone_inputs.c" "main.c" "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
 file(GLOB MAIN_SRCS "*.c")
 
 #set(MAIN_EMBED_TXTFILES
@@ -41,6 +41,7 @@ idf_component_register(
         spi_flash
         esp_timer
         esp_system
+        app_update
         json
         lwip
         mqtt

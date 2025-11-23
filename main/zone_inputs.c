@@ -12,6 +12,7 @@
 #include "esp_adc/adc_oneshot.h"
 
 #include "mcp23017.h"
+#include "storage.h"
 
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -43,6 +44,17 @@ static adc_oneshot_unit_handle_t s_unit_handles[MAX_ADC_UNITS];
 static bool                     s_unit_ready[MAX_ADC_UNITS];
 
 static zone_eol_mode_t          s_eol_mode = ZONE_EOL_MODE_2;
+static zone_eol_thresholds_t    s_eol_thresholds = {
+    .eol1_fault_max      = 0.08f,
+    .eol1_alarm_min      = 0.80f,
+    .eol2_tamper_low_max = 0.10f,
+    .eol2_normal_max     = 0.50f,
+    .eol2_alarm_max      = 0.80f,
+    .eol3_tamper_low_max = 0.07f,
+    .eol3_normal_max     = 0.38f,
+    .eol3_alarm_max      = 0.72f,
+};
+static const char *ZONE_THRESHOLDS_KEY = "zone_eol_thr";
 
 // ── NUOVO: snapshot globale e sincronizzazione ──────────────────────────────
 static zone_inputs_snapshot_t    s_last_snapshot;
@@ -63,6 +75,46 @@ static inline uint32_t zone_mask_bit(uint8_t index)
 
 static esp_err_t zone_inputs_do_sample(zone_inputs_snapshot_t *snapshot);
 static void zone_inputs_task(void *arg);
+
+static float clamp_ratio(float value)
+{
+    if (value < 0.0f) return 0.0f;
+    if (value > 1.0f) return 1.0f;
+    return value;
+}
+
+static void sanitize_thresholds(zone_eol_thresholds_t *thr)
+{
+    if (!thr) return;
+    thr->eol1_fault_max      = clamp_ratio(thr->eol1_fault_max);
+    thr->eol1_alarm_min      = clamp_ratio(thr->eol1_alarm_min);
+    thr->eol2_tamper_low_max = clamp_ratio(thr->eol2_tamper_low_max);
+    thr->eol2_normal_max     = clamp_ratio(thr->eol2_normal_max);
+    thr->eol2_alarm_max      = clamp_ratio(thr->eol2_alarm_max);
+    thr->eol3_tamper_low_max = clamp_ratio(thr->eol3_tamper_low_max);
+    thr->eol3_normal_max     = clamp_ratio(thr->eol3_normal_max);
+    thr->eol3_alarm_max      = clamp_ratio(thr->eol3_alarm_max);
+
+    if (thr->eol1_alarm_min < thr->eol1_fault_max) {
+        thr->eol1_alarm_min = thr->eol1_fault_max;
+    }
+
+    // Mantiene un ordine coerente tra le soglie 2EOL
+    if (thr->eol2_normal_max < thr->eol2_tamper_low_max) {
+        thr->eol2_normal_max = thr->eol2_tamper_low_max;
+    }
+    if (thr->eol2_alarm_max < thr->eol2_normal_max) {
+        thr->eol2_alarm_max = thr->eol2_normal_max;
+    }
+
+    // Mantiene un ordine coerente tra le soglie 3EOL
+    if (thr->eol3_normal_max < thr->eol3_tamper_low_max) {
+        thr->eol3_normal_max = thr->eol3_tamper_low_max;
+    }
+    if (thr->eol3_alarm_max < thr->eol3_normal_max) {
+        thr->eol3_alarm_max = thr->eol3_normal_max;
+    }
+}
 
 static esp_err_t ensure_unit_handle(adc_unit_t unit)
 {
@@ -142,51 +194,45 @@ static esp_err_t sample_raw(const zone_adc_entry_t *entry, int *out_raw)
 static float compute_ratio(uint32_t mv)
 {
     if (mv <= 0) return 0.0f;
-    if (mv >= 1100) return 1.0f;
-    return (float)mv / 1100.0f;
+    if (mv >= ZONE_INPUTS_ADC_REFERENCE_MV) return 1.0f;
+    return (float)mv / ZONE_INPUTS_ADC_REFERENCE_MV;
 }
 
-typedef enum {
-    ZONE_CLASS_NORMAL = 0,
-    ZONE_CLASS_ALARM,
-    ZONE_CLASS_TAMPER,
-    ZONE_CLASS_FAULT,
-} zone_class_t;
-
-static zone_class_t classify_ratio(zone_eol_mode_t mode, float ratio)
+static zone_input_state_t classify_ratio(zone_eol_mode_t mode, float ratio)
 {
+    const zone_eol_thresholds_t *thr = &s_eol_thresholds;
     switch (mode) {
     case ZONE_EOL_MODE_1:
-        if (ratio < 0.08f) {
-            return ZONE_CLASS_FAULT;
+        if (ratio < thr->eol1_fault_max) {
+            return ZONE_INPUT_STATE_FAULT;
         }
-        if (ratio > 0.80f) {
-            return ZONE_CLASS_ALARM;
+        if (ratio > thr->eol1_alarm_min) {
+            return ZONE_INPUT_STATE_ALARM;
         }
-        return ZONE_CLASS_NORMAL;
+        return ZONE_INPUT_STATE_NORMAL;
     case ZONE_EOL_MODE_2:
-        if (ratio < 0.10f) {
-            return ZONE_CLASS_TAMPER;
+        if (ratio < thr->eol2_tamper_low_max) {
+            return ZONE_INPUT_STATE_TAMPER;
         }
-        if (ratio < 0.50f) {
-            return ZONE_CLASS_NORMAL;
+        if (ratio < thr->eol2_normal_max) {
+            return ZONE_INPUT_STATE_NORMAL;
         }
-        if (ratio < 0.80f) {
-            return ZONE_CLASS_ALARM;
+        if (ratio < thr->eol2_alarm_max) {
+            return ZONE_INPUT_STATE_ALARM;
         }
-        return ZONE_CLASS_TAMPER;
+        return ZONE_INPUT_STATE_TAMPER;
     case ZONE_EOL_MODE_3:
     default:
-        if (ratio < 0.07f) {
-            return ZONE_CLASS_TAMPER;
+        if (ratio < thr->eol3_tamper_low_max) {
+            return ZONE_INPUT_STATE_TAMPER;
         }
-        if (ratio < 0.38f) {
-            return ZONE_CLASS_NORMAL;
+        if (ratio < thr->eol3_normal_max) {
+            return ZONE_INPUT_STATE_NORMAL;
         }
-        if (ratio < 0.72f) {
-            return ZONE_CLASS_ALARM;
+        if (ratio < thr->eol3_alarm_max) {
+            return ZONE_INPUT_STATE_ALARM;
         }
-        return ZONE_CLASS_TAMPER;
+        return ZONE_INPUT_STATE_TAMPER;
     }
 }
 
@@ -315,26 +361,26 @@ static esp_err_t zone_inputs_do_sample(zone_inputs_snapshot_t *snapshot)
             continue;
         }
         float ratio = compute_ratio((uint32_t)raw);
-        zone_class_t cls = classify_ratio(s_eol_mode, ratio);
+        zone_input_state_t cls = classify_ratio(s_eol_mode, ratio);
 
         snapshot->zones[i].raw = (uint32_t)raw;
         snapshot->zones[i].ratio = ratio;
 
         switch (cls) {
-        case ZONE_CLASS_ALARM:
+        case ZONE_INPUT_STATE_ALARM:
             snapshot->alarm_mask |= zone_mask_bit(i);
             break;
-        case ZONE_CLASS_TAMPER:
+        case ZONE_INPUT_STATE_TAMPER:
             snapshot->tamper_mask |= zone_mask_bit(i);
             break;
-        case ZONE_CLASS_FAULT:
+        case ZONE_INPUT_STATE_FAULT:
             // In 1EOL il fault NON deve generare tamper globale.
             // In 2EOL/3EOL lo assimiliamo a tamper di zona (anomalia sulla linea).
             if (s_eol_mode != ZONE_EOL_MODE_1) {
                 snapshot->tamper_mask |= zone_mask_bit(i);
             }
             break;
-        case ZONE_CLASS_NORMAL:
+        case ZONE_INPUT_STATE_NORMAL:
         default:
             break;
         }
@@ -409,6 +455,81 @@ const char *zone_inputs_eol_mode_name(zone_eol_mode_t mode)
     case ZONE_EOL_MODE_3: return "3EOL";
     default:              return "unknown";
     }
+}
+
+void zone_inputs_get_thresholds(zone_eol_thresholds_t *out)
+{
+    if (!out) return;
+    *out = s_eol_thresholds;
+}
+
+esp_err_t zone_inputs_set_thresholds(const zone_eol_thresholds_t *cfg, bool persist)
+{
+    if (!cfg) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    zone_eol_thresholds_t tmp = *cfg;
+    sanitize_thresholds(&tmp);
+    s_eol_thresholds = tmp;
+    ESP_LOGI(TAG, "Soglie EOL aggiornate: 1EOL[%.2f/%.2f] 2EOL[%.2f/%.2f/%.2f] 3EOL[%.2f/%.2f/%.2f]",
+             (double)s_eol_thresholds.eol1_fault_max,
+             (double)s_eol_thresholds.eol1_alarm_min,
+             (double)s_eol_thresholds.eol2_tamper_low_max,
+             (double)s_eol_thresholds.eol2_normal_max,
+             (double)s_eol_thresholds.eol2_alarm_max,
+             (double)s_eol_thresholds.eol3_tamper_low_max,
+             (double)s_eol_thresholds.eol3_normal_max,
+             (double)s_eol_thresholds.eol3_alarm_max);
+
+    if (!persist) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = storage_set_blob("sys", ZONE_THRESHOLDS_KEY, &s_eol_thresholds, sizeof(s_eol_thresholds));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Impossibile salvare le soglie EOL: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t zone_inputs_load_thresholds_from_nvs(void)
+{
+    zone_eol_thresholds_t tmp = {0};
+    size_t len = sizeof(tmp);
+    esp_err_t err = storage_get_blob("sys", ZONE_THRESHOLDS_KEY, &tmp, &len);
+    if (err != ESP_OK || len != sizeof(tmp)) {
+        return err;
+    }
+    sanitize_thresholds(&tmp);
+    s_eol_thresholds = tmp;
+    ESP_LOGI(TAG, "Soglie EOL caricate da NVS");
+    return ESP_OK;
+}
+
+zone_input_state_t zone_inputs_classify_ratio(zone_eol_mode_t mode, float ratio)
+{
+    return classify_ratio(mode, ratio);
+}
+
+float zone_inputs_reference_mv(void)
+{
+    return ZONE_INPUTS_ADC_REFERENCE_MV;
+}
+
+const char *zone_inputs_state_label(zone_input_state_t state)
+{
+    switch (state) {
+    case ZONE_INPUT_STATE_ALARM:  return "ALARM";
+    case ZONE_INPUT_STATE_TAMPER: return "TAMPER";
+    case ZONE_INPUT_STATE_FAULT:  return "FAULT";
+    case ZONE_INPUT_STATE_NORMAL:
+    default: return "NORMAL";
+    }
+}
+
+void zone_inputs_set_supply_voltage(float supply_v)
+{
+    s_last_snapshot.supply_voltage = supply_v;
 }
 
 bool zone_inputs_zone_alarm(const zone_inputs_snapshot_t *snapshot, uint8_t zone_index)

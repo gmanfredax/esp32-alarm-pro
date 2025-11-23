@@ -145,6 +145,9 @@
   let telemetryNodeId = null;
   let telemetryFetchPending = false;
   const modalCleanupHandlers = new Set();
+  const DIAG_DEFAULT_REF_MV = 1100;
+  const thresholdsState = { values: null, refMv: DIAG_DEFAULT_REF_MV, loaded: false };
+  const diagnosticsState = { loading: false, last: null };
 
   function formatDateTime(ts){
     if (ts == null) return "";
@@ -166,6 +169,22 @@
     } catch {
       return String(num);
     }
+  }
+
+  function formatDuration(ms){
+    const totalMs = Number(ms);
+    if (!Number.isFinite(totalMs) || totalMs < 0) return "—";
+    const totalSeconds = Math.floor(totalMs / 1000);
+    const days = Math.floor(totalSeconds / 86400);
+    const hours = Math.floor((totalSeconds % 86400) / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const parts = [];
+    if (days > 0) parts.push(`${days}g`);
+    if (hours > 0 || parts.length) parts.push(`${hours}h`);
+    if (minutes > 0 || parts.length) parts.push(`${minutes}m`);
+    parts.push(`${seconds}s`);
+    return parts.join(" ");
   }
 
   const normalizeRole = (roleValue) => {
@@ -248,6 +267,14 @@
           if (current) current.classList.add("active");
         }
         if (id !== "view-mqtt") maskMqttPassword();
+        if (id === "view-diagnostics") {
+          setupDiagnosticsSection();
+          loadDiagnostics(true);
+        }
+        if (id === "view-zones") {
+          loadZoneThresholds();
+          setupZoneThresholdForm();
+        }
       });
     });
   }
@@ -267,10 +294,82 @@
         else if (raw === "3" || raw === "3EOL") eolSelect.value = "3EOL";
         else eolSelect.value = "2EOL";
       }
+      const refMv = Number(general.adc_reference_mv);
+      if (Number.isFinite(refMv) && refMv > 0) {
+        thresholdsState.refMv = refMv;
+      }
+      if (general.eol_thresholds) {
+        applyThresholdsToForm(general.eol_thresholds);
+      }
     } catch (err) {
       console.error("General config", err);
       toast("Errore caricamento impostazioni: " + (err?.message || err), false);
     }
+  }
+
+  function applyThresholdsToForm(thr){
+    if (!thr) return;
+    thresholdsState.values = { ...thr };
+    thresholdsState.loaded = true;
+    const map = [
+      ["thr_1_fault", thr.e1_fault_max],
+      ["thr_1_alarm", thr.e1_alarm_min],
+      ["thr_2_tamper", thr.e2_tamper_low_max],
+      ["thr_2_normal", thr.e2_normal_max],
+      ["thr_2_alarm", thr.e2_alarm_max],
+      ["thr_3_tamper", thr.e3_tamper_low_max],
+      ["thr_3_normal", thr.e3_normal_max],
+      ["thr_3_alarm", thr.e3_alarm_max],
+    ];
+    map.forEach(([id, value]) => {
+      const input = document.getElementById(id);
+      if (input && Number.isFinite(Number(value))) {
+        input.value = Number(value);
+      }
+    });
+    renderThresholdPreview();
+  }
+
+  function collectThresholdPayload(){
+    const read = (id) => {
+      const input = document.getElementById(id);
+      if (!input) return null;
+      const num = Number.parseFloat(input.value);
+      return Number.isFinite(num) ? num : null;
+    };
+    const payload = {
+      e1_fault_max: read("thr_1_fault"),
+      e1_alarm_min: read("thr_1_alarm"),
+      e2_tamper_low_max: read("thr_2_tamper"),
+      e2_normal_max: read("thr_2_normal"),
+      e2_alarm_max: read("thr_2_alarm"),
+      e3_tamper_low_max: read("thr_3_tamper"),
+      e3_normal_max: read("thr_3_normal"),
+      e3_alarm_max: read("thr_3_alarm"),
+    };
+    return payload;
+  }
+
+  function renderThresholdPreview(){
+    const box = document.getElementById("diagThresholds");
+    if (!box || !thresholdsState.values) return;
+    const t = thresholdsState.values;
+    const ref = thresholdsState.refMv || DIAG_DEFAULT_REF_MV;
+    const fmt = (ratio) => {
+      const num = Number(ratio);
+      if (!Number.isFinite(num)) return "—";
+      return `${(num * 100).toFixed(1)}% · ${(num * ref).toFixed(0)} mV`;
+    };
+    box.innerHTML = `
+      <div class="diag-th-row"><span>1EOL — Fault</span><strong>${fmt(t.e1_fault_max)}</strong></div>
+      <div class="diag-th-row"><span>1EOL — Allarme</span><strong>${fmt(t.e1_alarm_min)}</strong></div>
+      <div class="diag-th-row"><span>2EOL — Tamper basso</span><strong>${fmt(t.e2_tamper_low_max)}</strong></div>
+      <div class="diag-th-row"><span>2EOL — Riposo max</span><strong>${fmt(t.e2_normal_max)}</strong></div>
+      <div class="diag-th-row"><span>2EOL — Allarme</span><strong>${fmt(t.e2_alarm_max)}</strong></div>
+      <div class="diag-th-row"><span>3EOL — Tamper basso</span><strong>${fmt(t.e3_tamper_low_max)}</strong></div>
+      <div class="diag-th-row"><span>3EOL — Riposo max</span><strong>${fmt(t.e3_normal_max)}</strong></div>
+      <div class="diag-th-row"><span>3EOL — Allarme</span><strong>${fmt(t.e3_alarm_max)}</strong></div>
+    `;
   }
 
   function setupGeneralForm(){
@@ -293,6 +392,66 @@
         await loadGeneralConfig();
       } catch (err) {
         toast("Errore salvataggio impostazioni: " + (err?.message || err), false);
+      }
+    });
+  }
+
+  async function loadZoneThresholds(force = false){
+    if (thresholdsState.loaded && !force) return;
+    try {
+      const data = await apiGet("/api/zones/config");
+      const refMv = Number(data?.adc_reference_mv);
+      if (Number.isFinite(refMv) && refMv > 0) {
+        thresholdsState.refMv = refMv;
+      }
+      if (data?.eol_thresholds) {
+        applyThresholdsToForm(data.eol_thresholds);
+      }
+    } catch (err) {
+      toast("Impossibile caricare le soglie EOL: " + (err?.message || err), false);
+    }
+  }
+
+  function setupZoneThresholdForm(){
+    const saveBtn = $("#btnZoneThresholdsSave");
+    if (!saveBtn || saveBtn._bound) return;
+    saveBtn._bound = true;
+    saveBtn.addEventListener("click", async () => {
+      const msg = $("#zoneThresholdsMsg");
+      const payload = collectThresholdPayload();
+      const values = Object.values(payload || {});
+      if (values.some((v) => !Number.isFinite(v))) {
+        if (msg) {
+          msg.textContent = "Compila tutti i campi con valori numerici.";
+          msg.classList.remove("hidden");
+          msg.style.color = "#f87171";
+        }
+        return;
+      }
+      if (msg) {
+        msg.textContent = "Salvataggio in corso…";
+        msg.classList.remove("hidden");
+        msg.style.color = "";
+      }
+      saveBtn.disabled = true;
+      try {
+        await apiPost("/api/zones/config", { eol_thresholds: payload });
+        thresholdsState.values = payload;
+        thresholdsState.loaded = true;
+        renderThresholdPreview();
+        if (msg) {
+          msg.textContent = "Soglie EOL aggiornate.";
+          msg.style.color = "";
+        }
+        toast("Soglie salvate");
+      } catch (err) {
+        if (msg) {
+          msg.textContent = err?.message || "Errore durante il salvataggio.";
+          msg.style.color = "#f87171";
+        }
+        toast("Salvataggio soglie: " + (err?.message || err), false);
+      } finally {
+        saveBtn.disabled = false;
       }
     });
   }
@@ -1088,6 +1247,111 @@
     await loadExpansionNodes();
   }
 
+  // ========== Diagnostica e soglie EOL ==========
+  function setDiagValue(key, value, { warn = false } = {}){
+    const el = document.querySelector(`[data-diag="${key}"]`);
+    if (!el) return;
+    el.textContent = value || "—";
+    el.classList.toggle("warn", !!warn);
+  }
+
+  function renderDiagnosticsZones(zones, refMv){
+    const tbody = document.getElementById("diagZonesBody");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+    if (!Array.isArray(zones) || zones.length === 0){
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 7;
+      td.className = "muted";
+      td.textContent = "Nessun dato disponibile";
+      tr.appendChild(td);
+      tbody.appendChild(tr);
+      return;
+    }
+    const fmtMv = (mv) => {
+      const num = Number(mv);
+      if (!Number.isFinite(num)) return "—";
+      return `${num.toFixed(0)} mV`;
+    };
+    const fmtRatio = (r) => {
+      const num = Number(r);
+      if (!Number.isFinite(num)) return "—";
+      return `${(num * 100).toFixed(2)}%`;
+    };
+    const fmtSteps = (steps) => {
+      const num = Number(steps);
+      if (!Number.isFinite(num)) return "—";
+      return num.toFixed(0);
+    };
+    zones.forEach((z) => {
+      const tr = document.createElement("tr");
+      const cells = [
+        z?.id,
+        z?.state,
+        fmtMv(z?.raw_mv),
+        fmtSteps(z?.adc_steps),
+        fmtRatio(z?.ratio),
+        z?.tamper ? "TAMPER" : (z?.alarm ? "ALLARME" : "OK"),
+        z?.board_label || (z?.board ? `Nodo ${z.board}` : "Centrale"),
+      ];
+      cells.forEach((value) => {
+        const td = document.createElement("td");
+        td.textContent = value ?? "—";
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+  }
+
+  function renderDiagnostics(data){
+    diagnosticsState.last = data;
+    const ref = Number(data?.adc_reference_mv) || thresholdsState.refMv || DIAG_DEFAULT_REF_MV;
+    thresholdsState.refMv = ref;
+    setDiagValue('uptime', formatDuration(data?.uptime_ms));
+    setDiagValue('eol_mode', data?.eol_mode || '—');
+    setDiagValue('adc_ref', Number.isFinite(ref) ? `${ref.toFixed(0)} mV` : '—');
+    setDiagValue('supply', Number.isFinite(Number(data?.supply_voltage)) ? `${Number(data.supply_voltage).toFixed(2)} V` : '—');
+    setDiagValue('tamper_global', data?.tamper_global ? 'ATTIVO' : '—', { warn: !!data?.tamper_global });
+
+    const fw = data?.firmware || {};
+    const fwLabel = fw.version ? `${fw.project || 'App'} ${fw.version}` : '—';
+    setDiagValue('firmware', fwLabel);
+    if (fw.idf) {
+      setDiagValue('idf', fw.idf);
+    }
+
+    if (data?.eol_thresholds) {
+      applyThresholdsToForm(data.eol_thresholds);
+    }
+    renderThresholdPreview();
+    renderDiagnosticsZones(data?.zones || [], ref);
+  }
+
+  async function loadDiagnostics(force = false){
+    if (diagnosticsState.loading && !force) return;
+    diagnosticsState.loading = true;
+    const btn = document.getElementById("btnDiagRefresh");
+    if (btn) btn.disabled = true;
+    try {
+      const data = await apiGet("/api/zones/diagnostics");
+      renderDiagnostics(data);
+    } catch (err) {
+      toast("Diagnostica: " + (err?.message || err), false);
+    } finally {
+      diagnosticsState.loading = false;
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function setupDiagnosticsSection(){
+    const btn = document.getElementById("btnDiagRefresh");
+    if (btn && !btn._bound){
+      btn._bound = true;
+      btn.addEventListener("click", () => loadDiagnostics(true));
+    }
+  }
+
   // ========== USERS
   function renderUsers(list){
     const tb = $("#usersTbody");
@@ -1859,7 +2123,9 @@
     updateAdminVisibility();
     setupSidebar();
     setupGeneralForm();
-    const setupPromises = [setupNetMqttForms(), setupWebSecForm(), setupExpansionsSection(), loadGeneralConfig()];
+    setupZoneThresholdForm();
+    setupDiagnosticsSection();
+    const setupPromises = [setupNetMqttForms(), setupWebSecForm(), setupExpansionsSection(), loadGeneralConfig(), loadZoneThresholds()];
     document.querySelector('[data-tab="home"]')?.addEventListener('click', (e) => {
       e.preventDefault();
       location.href = "/index.html";

@@ -16,6 +16,8 @@
 #include "esp_err.h"
 #include "esp_system.h"
 #include "esp_http_server.h"
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
 #include "esp_netif.h"
 
 #include "freertos/FreeRTOS.h"
@@ -52,6 +54,7 @@
 #include "log_system.h"
 #include "zone_inputs.h"
 #include "outputs.h"
+#include "pins.h"
 #include "utils.h"
 #include "scenes.h"
 #include "roster.h"
@@ -184,6 +187,8 @@ static char s_cloudflare_ui_url[128] = DEFAULT_CF_UI_URL;
 typedef struct {
     char central_name[64];
     zone_eol_mode_t eol_mode;
+    zone_eol_thresholds_t thresholds;
+    float adc_ref_mv;
 } provisioning_general_config_t;
 
 typedef struct {
@@ -1875,6 +1880,78 @@ static void provisioning_set_ui_url(const char* url){
     }
 }
 
+static cJSON *json_build_eol_thresholds(float ref_mv)
+{
+    zone_eol_thresholds_t thr;
+    zone_inputs_get_thresholds(&thr);
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+
+    cJSON_AddNumberToObject(root, "e1_fault_max", thr.eol1_fault_max);
+    cJSON_AddNumberToObject(root, "e1_alarm_min", thr.eol1_alarm_min);
+
+    cJSON *e1_mv = cJSON_AddObjectToObject(root, "e1_mv");
+    if (e1_mv) {
+        cJSON_AddNumberToObject(e1_mv, "fault_max", thr.eol1_fault_max * ref_mv);
+        cJSON_AddNumberToObject(e1_mv, "alarm_min", thr.eol1_alarm_min * ref_mv);
+    }
+
+    cJSON_AddNumberToObject(root, "e2_tamper_low_max", thr.eol2_tamper_low_max);
+    cJSON_AddNumberToObject(root, "e2_normal_max", thr.eol2_normal_max);
+    cJSON_AddNumberToObject(root, "e2_alarm_max", thr.eol2_alarm_max);
+
+    cJSON *e2_mv = cJSON_AddObjectToObject(root, "e2_mv");
+    if (e2_mv) {
+        cJSON_AddNumberToObject(e2_mv, "tamper_low_max", thr.eol2_tamper_low_max * ref_mv);
+        cJSON_AddNumberToObject(e2_mv, "normal_max", thr.eol2_normal_max * ref_mv);
+        cJSON_AddNumberToObject(e2_mv, "alarm_max", thr.eol2_alarm_max * ref_mv);
+    }
+
+    cJSON_AddNumberToObject(root, "e3_tamper_low_max", thr.eol3_tamper_low_max);
+    cJSON_AddNumberToObject(root, "e3_normal_max", thr.eol3_normal_max);
+    cJSON_AddNumberToObject(root, "e3_alarm_max", thr.eol3_alarm_max);
+
+    cJSON *e3_mv = cJSON_AddObjectToObject(root, "e3_mv");
+    if (e3_mv) {
+        cJSON_AddNumberToObject(e3_mv, "tamper_low_max", thr.eol3_tamper_low_max * ref_mv);
+        cJSON_AddNumberToObject(e3_mv, "normal_max", thr.eol3_normal_max * ref_mv);
+        cJSON_AddNumberToObject(e3_mv, "alarm_max", thr.eol3_alarm_max * ref_mv);
+    }
+    return root;
+}
+
+static bool json_parse_eol_thresholds(const cJSON *obj, zone_eol_thresholds_t *out)
+{
+    if (!obj || !out || !cJSON_IsObject(obj)) {
+        return false;
+    }
+    zone_eol_thresholds_t tmp;
+    zone_inputs_get_thresholds(&tmp);
+
+    const cJSON *v = NULL;
+    v = cJSON_GetObjectItemCaseSensitive(obj, "e1_fault_max");
+    if (cJSON_IsNumber(v)) tmp.eol1_fault_max = (float)v->valuedouble;
+    v = cJSON_GetObjectItemCaseSensitive(obj, "e1_alarm_min");
+    if (cJSON_IsNumber(v)) tmp.eol1_alarm_min = (float)v->valuedouble;
+
+    v = cJSON_GetObjectItemCaseSensitive(obj, "e2_tamper_low_max");
+    if (cJSON_IsNumber(v)) tmp.eol2_tamper_low_max = (float)v->valuedouble;
+    v = cJSON_GetObjectItemCaseSensitive(obj, "e2_normal_max");
+    if (cJSON_IsNumber(v)) tmp.eol2_normal_max = (float)v->valuedouble;
+    v = cJSON_GetObjectItemCaseSensitive(obj, "e2_alarm_max");
+    if (cJSON_IsNumber(v)) tmp.eol2_alarm_max = (float)v->valuedouble;
+
+    v = cJSON_GetObjectItemCaseSensitive(obj, "e3_tamper_low_max");
+    if (cJSON_IsNumber(v)) tmp.eol3_tamper_low_max = (float)v->valuedouble;
+    v = cJSON_GetObjectItemCaseSensitive(obj, "e3_normal_max");
+    if (cJSON_IsNumber(v)) tmp.eol3_normal_max = (float)v->valuedouble;
+    v = cJSON_GetObjectItemCaseSensitive(obj, "e3_alarm_max");
+    if (cJSON_IsNumber(v)) tmp.eol3_alarm_max = (float)v->valuedouble;
+
+    *out = tmp;
+    return true;
+}
+
 static void provisioning_load_state(void){
     s_provisioned = false;
     provisioning_set_ui_url(DEFAULT_CF_UI_URL);
@@ -1907,6 +1984,8 @@ static void provisioning_load_general(provisioning_general_config_t* cfg){
     memset(cfg, 0, sizeof(*cfg));
     nvs_handle_t nvs;
     cfg->eol_mode = zone_inputs_get_eol_mode();
+    cfg->adc_ref_mv = zone_inputs_reference_mv();
+    zone_inputs_get_thresholds(&cfg->thresholds);
     if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
         nvs_get_str_def(nvs, "central_name", cfg->central_name, sizeof(cfg->central_name), "");
         uint8_t mode_u8 = (uint8_t)cfg->eol_mode;
@@ -1914,6 +1993,12 @@ static void provisioning_load_general(provisioning_general_config_t* cfg){
             if (mode_u8 <= (uint8_t)ZONE_EOL_MODE_3){
                 cfg->eol_mode = (zone_eol_mode_t)mode_u8;
             }
+        }
+        zone_eol_thresholds_t tmp_thr = cfg->thresholds;
+        size_t len = sizeof(tmp_thr);
+        if (nvs_get_blob(nvs, "zone_eol_thr", &tmp_thr, &len) == ESP_OK && len == sizeof(tmp_thr)) {
+            zone_inputs_set_thresholds(&tmp_thr, false);
+            zone_inputs_get_thresholds(&cfg->thresholds);
         }
         nvs_close(nvs);
     }
@@ -2600,6 +2685,9 @@ static esp_err_t provision_status_get(httpd_req_t* req){
     if (jgeneral){
         cJSON_AddStringToObject(jgeneral, "central_name", general.central_name);
         cJSON_AddStringToObject(jgeneral, "eol_mode", zone_inputs_eol_mode_name(general.eol_mode));
+        cJSON_AddNumberToObject(jgeneral, "adc_reference_mv", general.adc_ref_mv);
+        cJSON *thr = json_build_eol_thresholds(general.adc_ref_mv);
+        if (thr) cJSON_AddItemToObject(jgeneral, "eol_thresholds", thr);
     }
     cJSON_AddStringToObject(root, "device_id", mqtt.cid);
 
@@ -2635,7 +2723,7 @@ static esp_err_t provision_status_get(httpd_req_t* req){
 
 static esp_err_t provision_general_post(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
-    char body[160]; size_t bl = 0;
+    char body[320]; size_t bl = 0;
     if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body"), ESP_FAIL;
     cJSON* root = cJSON_ParseWithLength(body, bl);
     if (!root) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json"), ESP_FAIL;
@@ -2681,6 +2769,9 @@ static esp_err_t provision_general_post(httpd_req_t* req){
         new_mode = parsed;
     }
 
+    zone_eol_thresholds_t new_thr;
+    bool update_thresholds = json_parse_eol_thresholds(cJSON_GetObjectItemCaseSensitive(root, "eol_thresholds"), &new_thr);
+
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("sys", NVS_READWRITE, &nvs);
     if (err != ESP_OK){
@@ -2692,11 +2783,17 @@ static esp_err_t provision_general_post(httpd_req_t* req){
     if (err == ESP_OK) {
         err = nvs_set_u8(nvs, "zone_eol_mode", (uint8_t)new_mode);
     }
+    if (err == ESP_OK && update_thresholds) {
+        err = nvs_set_blob(nvs, "zone_eol_thr", &new_thr, sizeof(new_thr));
+    }
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     cJSON_Delete(root);
     if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "commit"), ESP_FAIL;
     zone_inputs_set_eol_mode(new_mode);
+    if (update_thresholds) {
+        zone_inputs_set_thresholds(&new_thr, false);
+    }
     return json_reply(req, "{\"ok\":true}");
 }
 
@@ -4618,6 +4715,11 @@ static esp_err_t status_get(httpd_req_t* req){
         return ESP_ERR_NO_MEM;
     }
 
+    const float ref_mv = zone_inputs_reference_mv();
+    cJSON_AddNumberToObject(root, "adc_reference_mv", ref_mv);
+    cJSON *thr = json_build_eol_thresholds(ref_mv);
+    if (thr) cJSON_AddItemToObject(root, "eol_thresholds", thr);
+
     cJSON_AddStringToObject(root, "state", state);
     cJSON_AddNumberToObject(root, "zones_count", zones_total);
     cJSON_AddBoolToObject(root, "tamper_global", snapshot.tamper_global);
@@ -4680,6 +4782,83 @@ static esp_err_t status_get(httpd_req_t* req){
     cJSON_free(out);
     cJSON_Delete(root);
     return err;
+}
+
+static esp_err_t zones_diag_get(httpd_req_t* req){
+    if(!check_bearer(req) || !is_admin_user(req)) { httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden"); return ESP_FAIL; }
+
+    zones_snapshot_t snapshot;
+    zones_snapshot_build(&snapshot);
+    const int total = zones_snapshot_total(&snapshot);
+    const float ref_mv = zone_inputs_reference_mv();
+    const int64_t uptime_ms = esp_timer_get_time() / 1000;
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddNumberToObject(root, "uptime_ms", (double)uptime_ms);
+    cJSON_AddStringToObject(root, "eol_mode", zone_inputs_eol_mode_name(snapshot.eol_mode));
+    cJSON_AddNumberToObject(root, "adc_reference_mv", ref_mv);
+    cJSON_AddNumberToObject(root, "adc_max_steps", (double)ZONE_INPUTS_ADC_MAX_STEPS);
+    cJSON_AddNumberToObject(root, "adc_samples", (double)ZONE_INPUTS_SAMPLES);
+    cJSON_AddNumberToObject(root, "supply_voltage", snapshot.supply_voltage);
+    cJSON_AddBoolToObject(root, "tamper_global", snapshot.tamper_global);
+
+    cJSON *thr = json_build_eol_thresholds(ref_mv);
+    if (thr) cJSON_AddItemToObject(root, "eol_thresholds", thr);
+
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    cJSON *fw = cJSON_AddObjectToObject(root, "firmware");
+    if (fw && app_desc) {
+        cJSON_AddStringToObject(fw, "project", app_desc->project_name);
+        cJSON_AddStringToObject(fw, "version", app_desc->version);
+        cJSON_AddStringToObject(fw, "idf", esp_get_idf_version());
+        cJSON_AddStringToObject(fw, "build_date", app_desc->date);
+        cJSON_AddStringToObject(fw, "build_time", app_desc->time);
+    }
+
+    cJSON *hw = cJSON_AddObjectToObject(root, "hardware");
+    if (hw) {
+        cJSON_AddNumberToObject(hw, "supply_divider_r1_ohm", ZONE_SUPPLY_DIVIDER_R1_OHMS);
+        cJSON_AddNumberToObject(hw, "supply_divider_r2_ohm", ZONE_SUPPLY_DIVIDER_R2_OHMS);
+        cJSON_AddNumberToObject(hw, "zones_local", snapshot.master_total);
+    }
+
+    cJSON *zones = cJSON_AddArrayToObject(root, "zones");
+    if (zones) {
+        for (int idx = 0; idx < total; ++idx) {
+            const zone_state_entry_t *entry = &snapshot.entries[idx];
+            cJSON *it = cJSON_CreateObject();
+            if (!it) continue;
+
+            const float ratio = entry->analog_ratio;
+            const zone_input_state_t state = zone_inputs_classify_ratio(snapshot.eol_mode, ratio);
+            char board_label[sizeof(((roster_node_t *)0)->label)];
+            zone_board_label_copy(entry->board, board_label, sizeof(board_label));
+
+            cJSON_AddNumberToObject(it, "id", (double)(idx + 1));
+            cJSON_AddNumberToObject(it, "ratio", ratio);
+            cJSON_AddNumberToObject(it, "raw_mv", (double)entry->raw_value);
+            cJSON_AddNumberToObject(it, "adc_steps", ratio * (float)ZONE_INPUTS_ADC_MAX_STEPS);
+            cJSON_AddStringToObject(it, "state", zone_inputs_state_label(state));
+            cJSON_AddBoolToObject(it, "known", entry->known);
+            cJSON_AddBoolToObject(it, "tamper", entry->tamper);
+            cJSON_AddBoolToObject(it, "alarm", entry->active);
+            cJSON_AddNumberToObject(it, "board", (double)entry->board);
+            cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
+            cJSON_AddStringToObject(it, "board_label", board_label);
+            cJSON_AddItemToArray(zones, it);
+        }
+    }
+
+    char *out = cJSON_PrintUnformatted(root);
+    esp_err_t res = json_reply(req, out);
+    cJSON_free(out);
+    cJSON_Delete(root);
+    return res;
 }
 
 static esp_err_t zones_get(httpd_req_t* req){
@@ -4969,60 +5148,77 @@ static esp_err_t zones_config_post(httpd_req_t* req){
     cJSON *json = cJSON_ParseWithLength(body, blen);
     if(!json){ httpd_resp_send_err(req, 400, "json"); return ESP_FAIL; }
     cJSON *items = cJSON_GetObjectItemCaseSensitive(json, "items");
-    if(!cJSON_IsArray(items)){ cJSON_Delete(json); httpd_resp_send_err(req, 400, "items"); return ESP_FAIL; }
-    cJSON *it = NULL;
-    cJSON_ArrayForEach(it, items){
-        cJSON *jid = cJSON_GetObjectItemCaseSensitive(it, "id");
-        if(!cJSON_IsNumber(jid)) continue;
-        int id = jid->valueint;
-        if(id<1 || id>ZONE_CONFIG_CAPACITY) continue;
-        zone_cfg_t *c = &s_zone_cfg[id-1];
-        cJSON *jn=NULL;
-        jn = cJSON_GetObjectItemCaseSensitive(it, "name");
-        if(cJSON_IsString(jn)){
-            size_t maxlen = sizeof(c->name)-1;
-            strncpy(c->name, jn->valuestring, maxlen);
-            c->name[maxlen]=0;
+    bool has_items = cJSON_IsArray(items);
+    if (has_items) {
+        cJSON *it = NULL;
+        cJSON_ArrayForEach(it, items){
+            cJSON *jid = cJSON_GetObjectItemCaseSensitive(it, "id");
+            if(!cJSON_IsNumber(jid)) continue;
+            int id = jid->valueint;
+            if(id<1 || id>ZONE_CONFIG_CAPACITY) continue;
+            zone_cfg_t *c = &s_zone_cfg[id-1];
+            cJSON *jn=NULL;
+            jn = cJSON_GetObjectItemCaseSensitive(it, "name");
+            if(cJSON_IsString(jn)){
+                size_t maxlen = sizeof(c->name)-1;
+                strncpy(c->name, jn->valuestring, maxlen);
+                c->name[maxlen]=0;
+            }
+            // nuovo schema: zone_delay/zone_time (con fallback legacy)
+            bool z_delay = c->zone_delay;
+            uint16_t z_time = c->zone_time;
+
+            jn = cJSON_GetObjectItemCaseSensitive(it, "zone_delay");
+            if(cJSON_IsBool(jn)) z_delay = cJSON_IsTrue(jn);
+
+            jn = cJSON_GetObjectItemCaseSensitive(it, "zone_time");
+            if(cJSON_IsNumber(jn)) z_time = (uint16_t)jn->valuedouble;
+
+            // fallback legacy
+            jn = cJSON_GetObjectItemCaseSensitive(it, "entry_delay");
+            if(cJSON_IsBool(jn)) z_delay = cJSON_IsTrue(jn);
+            jn = cJSON_GetObjectItemCaseSensitive(it, "exit_delay");
+            if(cJSON_IsBool(jn)) z_delay = (z_delay || cJSON_IsTrue(jn));
+
+            jn = cJSON_GetObjectItemCaseSensitive(it, "entry_time");
+            if(cJSON_IsNumber(jn) && (uint16_t)jn->valuedouble>0) z_time = (uint16_t)jn->valuedouble;
+            jn = cJSON_GetObjectItemCaseSensitive(it, "exit_time");
+            if(cJSON_IsNumber(jn) && (uint16_t)jn->valuedouble>0) z_time = (uint16_t)jn->valuedouble;
+
+            jn = cJSON_GetObjectItemCaseSensitive(it, "auto_exclude");
+            if(cJSON_IsBool(jn)) c->auto_exclude = cJSON_IsTrue(jn);
+
+            uint8_t board = zone_board_for_index(id);
+            jn = cJSON_GetObjectItemCaseSensitive(it, "board");
+            if (cJSON_IsNumber(jn)) {
+                int raw = (int)jn->valuedouble;
+                if (raw < 0) raw = 0;
+                if (raw > 255) raw = 255;
+                board = (uint8_t)raw;
+            }
+
+            c->zone_delay = z_delay;
+            c->zone_time  = z_time;
+            s_zone_board_map[id-1] = board;
         }
-        // nuovo schema: zone_delay/zone_time (con fallback legacy)
-        bool z_delay = c->zone_delay;
-        uint16_t z_time = c->zone_time;
+    }
 
-        jn = cJSON_GetObjectItemCaseSensitive(it, "zone_delay");
-        if(cJSON_IsBool(jn)) z_delay = cJSON_IsTrue(jn);
+    zone_eol_thresholds_t new_thr;
+    bool update_thresholds = json_parse_eol_thresholds(cJSON_GetObjectItemCaseSensitive(json, "eol_thresholds"), &new_thr);
 
-        jn = cJSON_GetObjectItemCaseSensitive(it, "zone_time");
-        if(cJSON_IsNumber(jn)) z_time = (uint16_t)jn->valuedouble;
+    if (!has_items && !update_thresholds) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "payload");
+        return ESP_FAIL;
+    }
 
-        // fallback legacy
-        jn = cJSON_GetObjectItemCaseSensitive(it, "entry_delay");
-        if(cJSON_IsBool(jn)) z_delay = cJSON_IsTrue(jn);
-        jn = cJSON_GetObjectItemCaseSensitive(it, "exit_delay");
-        if(cJSON_IsBool(jn)) z_delay = (z_delay || cJSON_IsTrue(jn));
-
-        jn = cJSON_GetObjectItemCaseSensitive(it, "entry_time");
-        if(cJSON_IsNumber(jn) && (uint16_t)jn->valuedouble>0) z_time = (uint16_t)jn->valuedouble;
-        jn = cJSON_GetObjectItemCaseSensitive(it, "exit_time");
-        if(cJSON_IsNumber(jn) && (uint16_t)jn->valuedouble>0) z_time = (uint16_t)jn->valuedouble;
-
-        jn = cJSON_GetObjectItemCaseSensitive(it, "auto_exclude");
-        if(cJSON_IsBool(jn)) c->auto_exclude = cJSON_IsTrue(jn);
-
-        uint8_t board = zone_board_for_index(id);
-        jn = cJSON_GetObjectItemCaseSensitive(it, "board");
-        if (cJSON_IsNumber(jn)) {
-            int raw = (int)jn->valuedouble;
-            if (raw < 0) raw = 0;
-            if (raw > 255) raw = 255;
-            board = (uint8_t)raw;
-        }
-
-        c->zone_delay = z_delay;
-        c->zone_time  = z_time;
-        s_zone_board_map[id-1] = board;
+    if (has_items) {
+        zones_save_to_nvs();
+    }
+    if (update_thresholds) {
+        zone_inputs_set_thresholds(&new_thr, true);
     }
     cJSON_Delete(json);
-    zones_save_to_nvs();
     return json_bool(req, true);
 }
 
@@ -5208,6 +5404,7 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/can/node/*/identify", .method = HTTP_OPTIONS, .handler = api_can_node_identify_options },
     { .uri = "/api/status",             .method = HTTP_GET,  .handler = status_get },
     { .uri = "/api/zones",              .method = HTTP_GET,  .handler = zones_get },
+    { .uri = "/api/zones/diagnostics",  .method = HTTP_GET,  .handler = zones_diag_get },
     { .uri = "/api/zones/config",       .method = HTTP_GET,  .handler = zones_config_get },
     { .uri = "/api/zones/config",       .method = HTTP_POST, .handler = zones_config_post },
     { .uri = "/api/scenes",             .method = HTTP_GET,  .handler = scenes_get },

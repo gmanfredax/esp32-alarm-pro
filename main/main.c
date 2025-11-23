@@ -242,6 +242,7 @@ static void system_main_task(void *arg)
 
     // Init componenti applicativi
     ESP_ERROR_CHECK(storage_init());
+    (void)zone_inputs_load_thresholds_from_nvs();
     {
         nvs_handle_t nvs_mode;
         if (nvs_open("sys", NVS_READONLY, &nvs_mode) == ESP_OK) {
