@@ -5,15 +5,26 @@
 #include "esp_timer.h"
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
 #include "esp_adc/adc_oneshot.h"
 
 #include "mcp23017.h"
+
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
 #define TAG "zones"
 
 #define MAX_ADC_UNITS 2
 #define ADC_SAMPLES_PER_CHANNEL 8
 #define ADC_MAX_RAW 4095.0f
+
+#define ZONE_INPUTS_TASK_STACK        4096
+#define ZONE_INPUTS_TASK_PRIORITY     5
+#define ZONE_INPUTS_TASK_PERIOD_MS    100
 
 typedef struct {
     gpio_num_t     gpio;
@@ -22,6 +33,9 @@ typedef struct {
     bool           configured;
 } zone_adc_entry_t;
 
+static adc_cali_handle_t s_cali_handles[MAX_ADC_UNITS] = {0};
+static bool              s_cali_ready[MAX_ADC_UNITS] = {0};
+
 static zone_adc_entry_t s_zone_entries[ZONE_INPUT_COUNT];
 //static zone_adc_entry_t s_supply_entry;
 
@@ -29,6 +43,12 @@ static adc_oneshot_unit_handle_t s_unit_handles[MAX_ADC_UNITS];
 static bool                     s_unit_ready[MAX_ADC_UNITS];
 
 static zone_eol_mode_t          s_eol_mode = ZONE_EOL_MODE_2;
+
+// ── NUOVO: snapshot globale e sincronizzazione ──────────────────────────────
+static zone_inputs_snapshot_t    s_last_snapshot;
+static bool                      s_snapshot_valid = false;
+static SemaphoreHandle_t         s_snapshot_mutex = NULL;
+static TaskHandle_t              s_zone_task_handle = NULL;
 
 static const gpio_num_t s_zone_gpio_map[ZONE_INPUT_COUNT] = {
     ZONE_INPUT_GPIO_1, ZONE_INPUT_GPIO_2, ZONE_INPUT_GPIO_3, ZONE_INPUT_GPIO_4,
@@ -40,6 +60,9 @@ static inline uint32_t zone_mask_bit(uint8_t index)
 {
     return (1u << index);
 }
+
+static esp_err_t zone_inputs_do_sample(zone_inputs_snapshot_t *snapshot);
+static void zone_inputs_task(void *arg);
 
 static esp_err_t ensure_unit_handle(adc_unit_t unit)
 {
@@ -56,6 +79,16 @@ static esp_err_t ensure_unit_handle(adc_unit_t unit)
     };
     ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&cfg, &s_unit_handles[unit]), TAG, "adc_oneshot_new_unit");
     s_unit_ready[unit] = true;
+
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id  = unit,
+        .atten    = ADC_ATTEN_DB_0,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    if (adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_cali_handles[unit]) == ESP_OK) {
+        s_cali_ready[unit] = true;
+    }
+
     return ESP_OK;
 }
 
@@ -68,7 +101,7 @@ static esp_err_t configure_channel(zone_adc_entry_t *entry)
 
     adc_oneshot_chan_cfg_t chan_cfg = {
         .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten = ADC_ATTEN_DB_12,
+        .atten = ADC_ATTEN_DB_0,
     };
     ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_unit_handles[entry->unit], entry->channel, &chan_cfg),
                         TAG, "adc_oneshot_config_channel");
@@ -81,28 +114,36 @@ static esp_err_t sample_raw(const zone_adc_entry_t *entry, int *out_raw)
     if (!entry || !out_raw || !entry->configured) {
         return ESP_ERR_INVALID_STATE;
     }
-    int sum = 0;
+    int sum_mv = 0;
     for (int i = 0; i < ADC_SAMPLES_PER_CHANNEL; ++i) {
-        int value = 0;
-        esp_err_t err = adc_oneshot_read(s_unit_handles[entry->unit], entry->channel, &value);
+        int raw = 0;
+        esp_err_t err = adc_oneshot_read(s_unit_handles[entry->unit], entry->channel, &raw);
         if (err != ESP_OK) {
             return err;
         }
-        sum += value;
+
+        int mv = 0;
+        if (s_cali_ready[entry->unit] && s_cali_handles[entry->unit]) {
+            if (adc_cali_raw_to_voltage(s_cali_handles[entry->unit], raw, &mv) != ESP_OK) {
+                // fallback se la conversione fallisce
+                mv = (int)((raw / ADC_MAX_RAW) * 1100.0f);
+            }
+        } else {
+            // fallback lineare 0–1.1 V se la calibrazione non è disponibile
+            mv = (int)((raw / ADC_MAX_RAW) * 1100.0f);
+        }
+        sum_mv += mv;
     }
-    *out_raw = sum / ADC_SAMPLES_PER_CHANNEL;
+    // media in mV
+    *out_raw = sum_mv / ADC_SAMPLES_PER_CHANNEL;
     return ESP_OK;
 }
 
-static float compute_ratio(uint32_t raw)
+static float compute_ratio(uint32_t mv)
 {
-    if (raw == 0) {
-        return 0.0f;
-    }
-    if (raw >= ADC_MAX_RAW) {
-        return 1.0f;
-    }
-    return (float)raw / ADC_MAX_RAW;
+    if (mv <= 0) return 0.0f;
+    if (mv >= 1100) return 1.0f;
+    return (float)mv / 1100.0f;
 }
 
 typedef enum {
@@ -153,10 +194,13 @@ static bool read_global_tamper(void)
 {
     uint16_t gpioab = 0;
     if (mcp23017_read_gpioab(&gpioab) != ESP_OK) {
-        return false;
+        ESP_LOGE(TAG, "Errore lettura MCP23017: forzo tamper globale attivo");
+        return true; // fail-safe
     }
     uint16_t mask = (uint16_t)(1u << (8 + MCP_PORTB_GLOBAL_TAMPER_BIT));
-    return (gpioab & mask) == 0; // attivo basso con pull-up
+    // PB5 con pull-up: LOW=OK, HIGH=TAMPER
+    bool tamper = (gpioab & mask) != 0;
+    return tamper;
 }
 
 esp_err_t zone_inputs_init(void)
@@ -199,11 +243,58 @@ esp_err_t zone_inputs_init(void)
     //     ESP_RETURN_ON_ERROR(configure_channel(&s_supply_entry), TAG, "config_channel supply");
     // }
 
+    // ── NUOVO: mutex + task che legge periodicamente le zone ────────────────
+    if (!s_snapshot_mutex) {
+        s_snapshot_mutex = xSemaphoreCreateMutex();
+        if (!s_snapshot_mutex) {
+            ESP_LOGE(TAG, "Impossibile creare mutex snapshot zone");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (!s_zone_task_handle) {
+        BaseType_t rc = xTaskCreate(
+            zone_inputs_task,
+            "zone_inputs",
+            ZONE_INPUTS_TASK_STACK,
+            NULL,
+            ZONE_INPUTS_TASK_PRIORITY,
+            &s_zone_task_handle
+        );
+        if (rc != pdPASS) {
+            ESP_LOGE(TAG, "Impossibile creare task zone_inputs");
+            return ESP_FAIL;
+        }
+    }
+
     ESP_LOGI(TAG, "Zone analogiche inizializzate (mode=%d)", (int)s_eol_mode);
     return ESP_OK;
 }
 
-esp_err_t zone_inputs_sample(zone_inputs_snapshot_t *snapshot)
+static void zone_inputs_task(void *arg)
+{
+    zone_inputs_snapshot_t snapshot;
+
+    while (true) {
+        esp_err_t err = zone_inputs_do_sample(&snapshot);
+        if (err == ESP_OK) {
+            if (s_snapshot_mutex) {
+                xSemaphoreTake(s_snapshot_mutex, portMAX_DELAY);
+            }
+            s_last_snapshot = snapshot;
+            s_snapshot_valid = true;
+            if (s_snapshot_mutex) {
+                xSemaphoreGive(s_snapshot_mutex);
+            }
+        } else {
+            ESP_LOGW(TAG, "zone_inputs_task: sampling failed: %s", esp_err_to_name(err));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(ZONE_INPUTS_TASK_PERIOD_MS));
+    }
+}
+
+static esp_err_t zone_inputs_do_sample(zone_inputs_snapshot_t *snapshot)
 {
     if (!snapshot) {
         return ESP_ERR_INVALID_ARG;
@@ -237,9 +328,9 @@ esp_err_t zone_inputs_sample(zone_inputs_snapshot_t *snapshot)
             snapshot->tamper_mask |= zone_mask_bit(i);
             break;
         case ZONE_CLASS_FAULT:
-            if (s_eol_mode == ZONE_EOL_MODE_1) {
-                snapshot->global_tamper = true;
-            } else {
+            // In 1EOL il fault NON deve generare tamper globale.
+            // In 2EOL/3EOL lo assimiliamo a tamper di zona (anomalia sulla linea).
+            if (s_eol_mode != ZONE_EOL_MODE_1) {
                 snapshot->tamper_mask |= zone_mask_bit(i);
             }
             break;
@@ -253,16 +344,43 @@ esp_err_t zone_inputs_sample(zone_inputs_snapshot_t *snapshot)
     //     int raw = 0;
     //     if (sample_raw(&s_supply_entry, &raw) == ESP_OK) {
     //         snapshot->supply_raw = (uint32_t)raw;
-    //         float ratio = compute_ratio(snapshot->supply_raw);
+    //         float ratio = compute_ratio(s_supply_entry.unit, snapshot->supply_raw);
     //         float vout = ratio * 3.3f;
     //         float scale = (ZONE_SUPPLY_DIVIDER_R1_OHMS + ZONE_SUPPLY_DIVIDER_R2_OHMS) / ZONE_SUPPLY_DIVIDER_R2_OHMS;
     //         snapshot->supply_voltage = vout * scale;
     //     }
     // }
 
-    snapshot->global_tamper = snapshot->global_tamper || read_global_tamper();
+    // Il tamper globale H24 è SOLO la catena tamper cablata su PB5 del MCP23017
+    snapshot->global_tamper = read_global_tamper();
     if (s_eol_mode == ZONE_EOL_MODE_1) {
         snapshot->tamper_mask = 0; // 1EOL non gestisce tamper per-zona
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t zone_inputs_sample(zone_inputs_snapshot_t *snapshot)
+{
+    if (!snapshot) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!s_snapshot_valid) {
+        // Nessun campione ancora disponibile (task non ha finito la prima lettura)
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (s_snapshot_mutex) {
+        if (xSemaphoreTake(s_snapshot_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+
+    memcpy(snapshot, &s_last_snapshot, sizeof(*snapshot));
+
+    if (s_snapshot_mutex) {
+        xSemaphoreGive(s_snapshot_mutex);
     }
 
     return ESP_OK;

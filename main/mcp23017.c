@@ -102,7 +102,7 @@ esp_err_t mcp23017_init(void)
     ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUA,  0x00), TAG, "GPPUA");
     ESP_RETURN_ON_ERROR(mcp_wr(MCP_GPPUB,  portb_input_mask), TAG, "GPPUB");
 
-    ESP_RETURN_ON_ERROR(mcp_wr(MCP_OLATB, 0x00), TAG, "OLATA");
+    ESP_RETURN_ON_ERROR(mcp_wr(MCP_OLATA, 0x00), TAG, "OLATA");
     ESP_RETURN_ON_ERROR(mcp_wr(MCP_OLATB, 0x00), TAG, "OLATB");
 
     // Lettura di prova + dump

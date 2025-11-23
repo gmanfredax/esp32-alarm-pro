@@ -21,6 +21,7 @@ const state = {
   status: null,
   alarmZoneIds: [],
   tamperAlarm: false,
+  tamperZoneIds: [],
   zones: [],
   boards: [],
   scenes: null,
@@ -653,6 +654,14 @@ async function refreshStatus(){
     const isPendingState = stateName === 'PRE_ARM' || stateName === 'PRE_DISARM';
     const tamperAlarmActive = Boolean(data?.tamper_alarm && isAlarmState);
 
+    // Calcolo elenco zone in tamper
+    const zonesTamperFlags = Array.isArray(data?.zones_tamper) ? data.zones_tamper : [];
+    const tamperZoneIds = [];
+    zonesTamperFlags.forEach((flag, idx) => {
+      if (flag) tamperZoneIds.push(idx + 1);
+    });
+    state.tamperZoneIds = tamperZoneIds;
+
     if (isAlarmState) {
       if (!state.sceneMaskSyncedForAlarm) {
         try {
@@ -694,6 +703,12 @@ async function refreshStatus(){
       kpiCard({ title: 'Tamper', valueHTML: tamper }),
       kpiCard({ title: 'Zone aperte', valueHTML: `${zonesActive} / ${zonesCount}` })
     ];
+    if (state.tamperZoneIds.length) {
+      const label = state.tamperZoneIds.map((id) => `Z${id}`).join(', ');
+      cards.push(
+        kpiCard({ title: 'Zone in tamper', valueHTML: `<span class="alarm-zone-value">${label}</span>` })
+      );
+    }
     if (isAlarmState && (!Array.isArray(state.zones) || !state.zones.length) && state.activeTab !== 'zones') {
       refreshZones();
     }
@@ -726,6 +741,9 @@ async function refreshStatus(){
 
 function buildZoneBadge(zone){
   const badges = [];
+  if (zone?.tamper) {
+    badges.push('<span class="badge" title="Tamper">T</span>');
+  }
   if (zone?.auto_exclude) badges.push('<span class="badge" title="Autoesclusione">AE</span>');
   if (zone?.zone_delay) badges.push('<span class="badge" title="Ritardo">R</span>');
   const time = Number(zone?.zone_time);
