@@ -202,10 +202,10 @@
                 <label class="field"><span>1EOL — Allarme min</span><input id="thr_1_alarm" type="number" min="0" max="1" step="0.01" placeholder="0.80"></label>
                 <label class="field"><span>2EOL — Tamper basso max</span><input id="thr_2_tamper" type="number" min="0" max="1" step="0.01" placeholder="0.10"></label>
                 <label class="field"><span>2EOL — Riposo max</span><input id="thr_2_normal" type="number" min="0" max="1" step="0.01" placeholder="0.50"></label>
-                <label class="field"><span>2EOL — Allarme max</span><input id="thr_2_alarm" type="number" min="0" max="1" step="0.01" placeholder="0.80"></label>
+                <label class="field"><span>2EOL — Allarme max / Tamper alto</span><input id="thr_2_alarm" type="number" min="0" max="1" step="0.01" placeholder="0.80"></label>
                 <label class="field"><span>3EOL — Tamper basso max</span><input id="thr_3_tamper" type="number" min="0" max="1" step="0.01" placeholder="0.07"></label>
                 <label class="field"><span>3EOL — Riposo max</span><input id="thr_3_normal" type="number" min="0" max="1" step="0.01" placeholder="0.38"></label>
-                <label class="field"><span>3EOL — Allarme max</span><input id="thr_3_alarm" type="number" min="0" max="1" step="0.01" placeholder="0.72"></label>
+                <label class="field"><span>3EOL — Allarme max / Masking</span><input id="thr_3_alarm" type="number" min="0" max="1" step="0.01" placeholder="0.72"></label>
               </div>
               <div class="row" style="justify-content:flex-end;gap:.5rem;flex-wrap:wrap">
                 <button class="btn" id="btnZoneThresholdsSave" type="button">Salva soglie</button>
@@ -290,7 +290,7 @@
               <div class="table-wrap" style="margin-top:1rem;">
                 <table class="table">
                   <thead>
-                    <tr><th>Zona</th><th>Stato</th><th>mV</th><th>Step</th><th>Rapporto</th><th>Linea</th><th>Scheda</th></tr>
+                    <tr><th>Zona</th><th>Stato</th><th>mV</th><th>Step</th><th>Rapporto</th><th>Segnale</th><th>Scheda</th></tr>
                   </thead>
                   <tbody id="diagZonesBody"><tr><td colspan="7" class="muted">Premi Aggiorna per leggere i dati.</td></tr></tbody>
                 </table>

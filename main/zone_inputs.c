@@ -4,6 +4,7 @@
 #include "esp_check.h"
 #include "esp_timer.h"
 #include <string.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -81,6 +82,11 @@ static float clamp_ratio(float value)
     if (value < 0.0f) return 0.0f;
     if (value > 1.0f) return 1.0f;
     return value;
+}
+
+static bool ratio_invalid(float value)
+{
+    return !isfinite(value) || value < 0.0f || value > 1.0f;
 }
 
 static void sanitize_thresholds(zone_eol_thresholds_t *thr)
@@ -200,6 +206,9 @@ static float compute_ratio(uint32_t mv)
 
 static zone_input_state_t classify_ratio(zone_eol_mode_t mode, float ratio)
 {
+    if (ratio_invalid(ratio)) {
+        return ZONE_INPUT_STATE_FAULT;
+    }
     const zone_eol_thresholds_t *thr = &s_eol_thresholds;
     switch (mode) {
     case ZONE_EOL_MODE_1:
@@ -214,25 +223,31 @@ static zone_input_state_t classify_ratio(zone_eol_mode_t mode, float ratio)
         if (ratio < thr->eol2_tamper_low_max) {
             return ZONE_INPUT_STATE_TAMPER;
         }
-        if (ratio < thr->eol2_normal_max) {
+        if (ratio <= thr->eol2_normal_max) {
             return ZONE_INPUT_STATE_NORMAL;
         }
-        if (ratio < thr->eol2_alarm_max) {
+        if (ratio <= thr->eol2_alarm_max) {
             return ZONE_INPUT_STATE_ALARM;
         }
-        return ZONE_INPUT_STATE_TAMPER;
+        if (ratio <= 1.0f) {
+            return ZONE_INPUT_STATE_TAMPER;
+        }
+        return ZONE_INPUT_STATE_FAULT;
     case ZONE_EOL_MODE_3:
     default:
         if (ratio < thr->eol3_tamper_low_max) {
             return ZONE_INPUT_STATE_TAMPER;
         }
-        if (ratio < thr->eol3_normal_max) {
+        if (ratio <= thr->eol3_normal_max) {
             return ZONE_INPUT_STATE_NORMAL;
         }
-        if (ratio < thr->eol3_alarm_max) {
+        if (ratio <= thr->eol3_alarm_max) {
             return ZONE_INPUT_STATE_ALARM;
         }
-        return ZONE_INPUT_STATE_TAMPER;
+        if (ratio <= 1.0f) {
+            return ZONE_INPUT_STATE_MASKING;
+        }
+        return ZONE_INPUT_STATE_FAULT;
     }
 }
 
@@ -365,19 +380,27 @@ static esp_err_t zone_inputs_do_sample(zone_inputs_snapshot_t *snapshot)
 
         snapshot->zones[i].raw = (uint32_t)raw;
         snapshot->zones[i].ratio = ratio;
+        snapshot->zones[i].state = cls;
+
+        const uint32_t bit = zone_mask_bit(i);
 
         switch (cls) {
         case ZONE_INPUT_STATE_ALARM:
-            snapshot->alarm_mask |= zone_mask_bit(i);
+            snapshot->alarm_mask |= bit;
             break;
         case ZONE_INPUT_STATE_TAMPER:
-            snapshot->tamper_mask |= zone_mask_bit(i);
+            snapshot->tamper_mask |= bit;
+            break;
+        case ZONE_INPUT_STATE_MASKING:
+            snapshot->masking_mask |= bit;
+            snapshot->tamper_mask |= bit;
             break;
         case ZONE_INPUT_STATE_FAULT:
+            snapshot->fault_mask |= bit;
             // In 1EOL il fault NON deve generare tamper globale.
             // In 2EOL/3EOL lo assimiliamo a tamper di zona (anomalia sulla linea).
             if (s_eol_mode != ZONE_EOL_MODE_1) {
-                snapshot->tamper_mask |= zone_mask_bit(i);
+                snapshot->tamper_mask |= bit;
             }
             break;
         case ZONE_INPUT_STATE_NORMAL:
@@ -521,6 +544,7 @@ const char *zone_inputs_state_label(zone_input_state_t state)
     switch (state) {
     case ZONE_INPUT_STATE_ALARM:  return "ALARM";
     case ZONE_INPUT_STATE_TAMPER: return "TAMPER";
+    case ZONE_INPUT_STATE_MASKING: return "MASKING";
     case ZONE_INPUT_STATE_FAULT:  return "FAULT";
     case ZONE_INPUT_STATE_NORMAL:
     default: return "NORMAL";

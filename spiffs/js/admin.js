@@ -310,6 +310,10 @@
   function applyThresholdsToForm(thr){
     if (!thr) return;
     thresholdsState.values = { ...thr };
+    const e2TamperHigh = Number.isFinite(Number(thr.e2_tamper_high_min)) ? Number(thr.e2_tamper_high_min) : Number(thr.e2_alarm_max);
+    const e3MaskingMin = Number.isFinite(Number(thr.e3_masking_min)) ? Number(thr.e3_masking_min) : Number(thr.e3_alarm_max);
+    if (Number.isFinite(e2TamperHigh)) thresholdsState.values.e2_tamper_high_min = e2TamperHigh;
+    if (Number.isFinite(e3MaskingMin)) thresholdsState.values.e3_masking_min = e3MaskingMin;
     thresholdsState.loaded = true;
     const map = [
       ["thr_1_fault", thr.e1_fault_max],
@@ -347,6 +351,8 @@
       e3_normal_max: read("thr_3_normal"),
       e3_alarm_max: read("thr_3_alarm"),
     };
+    payload.e2_tamper_high_min = payload.e2_alarm_max;
+    payload.e3_masking_min = payload.e3_alarm_max;
     return payload;
   }
 
@@ -360,15 +366,17 @@
       if (!Number.isFinite(num)) return "—";
       return `${(num * 100).toFixed(1)}% · ${(num * ref).toFixed(0)} mV`;
     };
+    const e2TamperHigh = Number.isFinite(t.e2_tamper_high_min) ? t.e2_tamper_high_min : t.e2_alarm_max;
+    const e3MaskingMin = Number.isFinite(t.e3_masking_min) ? t.e3_masking_min : t.e3_alarm_max;
     box.innerHTML = `
       <div class="diag-th-row"><span>1EOL — Fault</span><strong>${fmt(t.e1_fault_max)}</strong></div>
       <div class="diag-th-row"><span>1EOL — Allarme</span><strong>${fmt(t.e1_alarm_min)}</strong></div>
       <div class="diag-th-row"><span>2EOL — Tamper basso</span><strong>${fmt(t.e2_tamper_low_max)}</strong></div>
       <div class="diag-th-row"><span>2EOL — Riposo max</span><strong>${fmt(t.e2_normal_max)}</strong></div>
-      <div class="diag-th-row"><span>2EOL — Allarme</span><strong>${fmt(t.e2_alarm_max)}</strong></div>
+      <div class="diag-th-row"><span>2EOL — Allarme max / Tamper alto</span><strong>${fmt(e2TamperHigh)}</strong></div>
       <div class="diag-th-row"><span>3EOL — Tamper basso</span><strong>${fmt(t.e3_tamper_low_max)}</strong></div>
       <div class="diag-th-row"><span>3EOL — Riposo max</span><strong>${fmt(t.e3_normal_max)}</strong></div>
-      <div class="diag-th-row"><span>3EOL — Allarme</span><strong>${fmt(t.e3_alarm_max)}</strong></div>
+      <div class="diag-th-row"><span>3EOL — Allarme max / Masking</span><strong>${fmt(e3MaskingMin)}</strong></div>
     `;
   }
 
@@ -1286,13 +1294,23 @@
     };
     zones.forEach((z) => {
       const tr = document.createElement("tr");
+      const stateRaw = (z?.state || "").toString().toUpperCase();
+      const lineState = (() => {
+        switch (stateRaw) {
+          case "ALARM": return "ALLARME";
+          case "TAMPER": return "TAMPER";
+          case "MASKING": return "MASKING";
+          case "FAULT": return "FAULT";
+          default: return "OK";
+        }
+      })();
       const cells = [
         z?.id,
-        z?.state,
+        stateRaw || "—",
         fmtMv(z?.raw_mv),
         fmtSteps(z?.adc_steps),
         fmtRatio(z?.ratio),
-        z?.tamper ? "TAMPER" : (z?.alarm ? "ALLARME" : "OK"),
+        lineState,
         z?.board_label || (z?.board ? `Nodo ${z.board}` : "Centrale"),
       ];
       cells.forEach((value) => {

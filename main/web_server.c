@@ -1899,23 +1899,27 @@ static cJSON *json_build_eol_thresholds(float ref_mv)
     cJSON_AddNumberToObject(root, "e2_tamper_low_max", thr.eol2_tamper_low_max);
     cJSON_AddNumberToObject(root, "e2_normal_max", thr.eol2_normal_max);
     cJSON_AddNumberToObject(root, "e2_alarm_max", thr.eol2_alarm_max);
+    cJSON_AddNumberToObject(root, "e2_tamper_high_min", thr.eol2_alarm_max);
 
     cJSON *e2_mv = cJSON_AddObjectToObject(root, "e2_mv");
     if (e2_mv) {
         cJSON_AddNumberToObject(e2_mv, "tamper_low_max", thr.eol2_tamper_low_max * ref_mv);
         cJSON_AddNumberToObject(e2_mv, "normal_max", thr.eol2_normal_max * ref_mv);
         cJSON_AddNumberToObject(e2_mv, "alarm_max", thr.eol2_alarm_max * ref_mv);
+        cJSON_AddNumberToObject(e2_mv, "tamper_high_min", thr.eol2_alarm_max * ref_mv);
     }
 
     cJSON_AddNumberToObject(root, "e3_tamper_low_max", thr.eol3_tamper_low_max);
     cJSON_AddNumberToObject(root, "e3_normal_max", thr.eol3_normal_max);
     cJSON_AddNumberToObject(root, "e3_alarm_max", thr.eol3_alarm_max);
+    cJSON_AddNumberToObject(root, "e3_masking_min", thr.eol3_alarm_max);
 
     cJSON *e3_mv = cJSON_AddObjectToObject(root, "e3_mv");
     if (e3_mv) {
         cJSON_AddNumberToObject(e3_mv, "tamper_low_max", thr.eol3_tamper_low_max * ref_mv);
         cJSON_AddNumberToObject(e3_mv, "normal_max", thr.eol3_normal_max * ref_mv);
         cJSON_AddNumberToObject(e3_mv, "alarm_max", thr.eol3_alarm_max * ref_mv);
+        cJSON_AddNumberToObject(e3_mv, "masking_min", thr.eol3_alarm_max * ref_mv);
     }
     return root;
 }
@@ -1940,12 +1944,16 @@ static bool json_parse_eol_thresholds(const cJSON *obj, zone_eol_thresholds_t *o
     if (cJSON_IsNumber(v)) tmp.eol2_normal_max = (float)v->valuedouble;
     v = cJSON_GetObjectItemCaseSensitive(obj, "e2_alarm_max");
     if (cJSON_IsNumber(v)) tmp.eol2_alarm_max = (float)v->valuedouble;
+    v = cJSON_GetObjectItemCaseSensitive(obj, "e2_tamper_high_min");
+    if (cJSON_IsNumber(v)) tmp.eol2_alarm_max = (float)v->valuedouble;
 
     v = cJSON_GetObjectItemCaseSensitive(obj, "e3_tamper_low_max");
     if (cJSON_IsNumber(v)) tmp.eol3_tamper_low_max = (float)v->valuedouble;
     v = cJSON_GetObjectItemCaseSensitive(obj, "e3_normal_max");
     if (cJSON_IsNumber(v)) tmp.eol3_normal_max = (float)v->valuedouble;
     v = cJSON_GetObjectItemCaseSensitive(obj, "e3_alarm_max");
+    if (cJSON_IsNumber(v)) tmp.eol3_alarm_max = (float)v->valuedouble;
+    v = cJSON_GetObjectItemCaseSensitive(obj, "e3_masking_min");
     if (cJSON_IsNumber(v)) tmp.eol3_alarm_max = (float)v->valuedouble;
 
     *out = tmp;
@@ -3528,6 +3536,9 @@ typedef struct {
     bool known;
     bool active;
     bool tamper;
+    bool masking;
+    bool fault;
+    zone_input_state_t state;
     float analog_ratio;
     uint32_t raw_value;
     uint8_t board;
@@ -3546,6 +3557,11 @@ typedef struct {
 
 static zone_cfg_t s_zone_cfg[ZONE_CONFIG_CAPACITY];
 static uint8_t    s_zone_board_map[ZONE_CONFIG_CAPACITY];
+
+static zones_snapshot_t *zones_snapshot_alloc(void)
+{
+    return (zones_snapshot_t *)malloc(sizeof(zones_snapshot_t));
+}
 
 static void zone_board_label_copy(uint8_t board_id, char *out, size_t cap)
 {
@@ -3606,8 +3622,12 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
         bool within = analog_ok && (i < analog.zone_count);
         entry->board_online = analog_ok;
         entry->known = within;
-        entry->active = within && zone_inputs_zone_alarm(&analog, (uint8_t)i);
-        entry->tamper = within && zone_inputs_zone_tamper(&analog, (uint8_t)i);
+        const zone_input_state_t state = within ? analog.zones[i].state : ZONE_INPUT_STATE_NORMAL;
+        entry->state = state;
+        entry->active = within && state == ZONE_INPUT_STATE_ALARM;
+        entry->masking = within && state == ZONE_INPUT_STATE_MASKING;
+        entry->fault = within && state == ZONE_INPUT_STATE_FAULT;
+        entry->tamper = within && (state == ZONE_INPUT_STATE_TAMPER || state == ZONE_INPUT_STATE_MASKING || state == ZONE_INPUT_STATE_FAULT);
         entry->analog_ratio = within ? analog.zones[i].ratio : 0.0f;
         entry->raw_value = within ? analog.zones[i].raw : 0u;
         s_zone_board_map[i] = 0;
@@ -3630,8 +3650,12 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
             entry->board_input = bit;
             entry->board_online = (node->state == ROSTER_NODE_STATE_OPERATIONAL);
             entry->known = entry->board_online && node->inputs_valid;
-            entry->active = entry->known ? ((node->inputs_bitmap & (1u << bit)) != 0u) : false;
+            const bool active = entry->known ? ((node->inputs_bitmap & (1u << bit)) != 0u) : false;
+            entry->state = active ? ZONE_INPUT_STATE_ALARM : ZONE_INPUT_STATE_NORMAL;
+            entry->active = active;
             entry->tamper = false;
+            entry->masking = false;
+            entry->fault = false;
             entry->analog_ratio = 0.0f;
             entry->raw_value = 0u;
             s_zone_board_map[snap->total] = entry->board;
@@ -3647,6 +3671,9 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
         snap->entries[i].known = false;
         snap->entries[i].active = false;
         snap->entries[i].tamper = false;
+        snap->entries[i].masking = false;
+        snap->entries[i].fault = false;
+        snap->entries[i].state = ZONE_INPUT_STATE_NORMAL;
         snap->entries[i].analog_ratio = 0.0f;
         snap->entries[i].raw_value = 0u;
         snap->entries[i].board = 0;
@@ -4698,19 +4725,24 @@ static esp_err_t status_get(httpd_req_t* req){
     uint16_t outmask = 0;
     outputs_get_mask(&outmask);
 
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    const int zones_total = zones_snapshot_total(&snapshot);
+    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    if (!snapshot) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    const int zones_total = zones_snapshot_total(snapshot);
     bool tamper_alarm = (alarm_last_alarm_was_tamper() && _st == ALARM_ALARM);
-    bool tamper_any = snapshot.tamper_global;
+    bool tamper_any = snapshot->tamper_global;
     for (int idx = 0; idx < zones_total; ++idx) {
-        if (snapshot.entries[idx].tamper) {
+        if (snapshot->entries[idx].tamper) {
             tamper_any = true;
             break;
         }
     }
     cJSON *root = cJSON_CreateObject();
     if (!root) {
+        free(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
@@ -4722,39 +4754,58 @@ static esp_err_t status_get(httpd_req_t* req){
 
     cJSON_AddStringToObject(root, "state", state);
     cJSON_AddNumberToObject(root, "zones_count", zones_total);
-    cJSON_AddBoolToObject(root, "tamper_global", snapshot.tamper_global);
+    cJSON_AddBoolToObject(root, "tamper_global", snapshot->tamper_global);
     cJSON_AddBoolToObject(root, "tamper_alarm", tamper_alarm);
     cJSON_AddBoolToObject(root, "tamper_any", tamper_any);
-    cJSON_AddNumberToObject(root, "supply_voltage", snapshot.supply_voltage);
-    cJSON_AddStringToObject(root, "eol_mode", zone_inputs_eol_mode_name(snapshot.eol_mode));
+    cJSON_AddNumberToObject(root, "supply_voltage", snapshot->supply_voltage);
+    cJSON_AddStringToObject(root, "eol_mode", zone_inputs_eol_mode_name(snapshot->eol_mode));
 
     cJSON *zones = cJSON_CreateArray();
     cJSON *zones_known = cJSON_CreateArray();
     cJSON *zones_tamper = cJSON_CreateArray();
+    cJSON *zones_masking = cJSON_CreateArray();
+    cJSON *zones_fault = cJSON_CreateArray();
+    cJSON *zones_state = cJSON_CreateArray();
     cJSON *zones_ratio = cJSON_CreateArray();
     cJSON *zones_raw = cJSON_CreateArray();
-    if (zones && zones_known && zones_tamper && zones_ratio && zones_raw) {
+    if (zones && zones_known && zones_tamper && zones_ratio && zones_raw && zones_state && zones_masking && zones_fault) {
         for (int idx = 0; idx < zones_total; ++idx) {
-            const zone_state_entry_t *entry = &snapshot.entries[idx];
+            const zone_state_entry_t *entry = &snapshot->entries[idx];
+            const zone_input_state_t state = entry->known ? entry->state : ZONE_INPUT_STATE_NORMAL;
             cJSON_AddItemToArray(zones, cJSON_CreateBool(entry->active));
             cJSON_AddItemToArray(zones_known, cJSON_CreateBool(entry->known));
             cJSON_AddItemToArray(zones_tamper, cJSON_CreateBool(entry->tamper));
+            cJSON_AddItemToArray(zones_masking, cJSON_CreateBool(entry->masking));
+            cJSON_AddItemToArray(zones_fault, cJSON_CreateBool(entry->fault));
+            cJSON_AddItemToArray(zones_state, cJSON_CreateString(zone_inputs_state_label(state)));
             cJSON_AddItemToArray(zones_ratio, cJSON_CreateNumber(entry->analog_ratio));
             cJSON_AddItemToArray(zones_raw, cJSON_CreateNumber(entry->raw_value));
         }
         cJSON_AddItemToObject(root, "zones_active", zones);
         cJSON_AddItemToObject(root, "zones_known", zones_known);
         cJSON_AddItemToObject(root, "zones_tamper", zones_tamper);
+        cJSON_AddItemToObject(root, "zones_masking", zones_masking);
+        cJSON_AddItemToObject(root, "zones_fault", zones_fault);
+        cJSON_AddItemToObject(root, "zones_state", zones_state);
         cJSON_AddItemToObject(root, "zones_ratio", zones_ratio);
         cJSON_AddItemToObject(root, "zones_raw", zones_raw);
     } else {
         if (zones) cJSON_Delete(zones);
         if (zones_known) cJSON_Delete(zones_known);
         if (zones_tamper) cJSON_Delete(zones_tamper);
+        if (zones_masking) cJSON_Delete(zones_masking);
+        if (zones_fault) cJSON_Delete(zones_fault);
+        if (zones_state) cJSON_Delete(zones_state);
         if (zones_ratio) cJSON_Delete(zones_ratio);
         if (zones_raw) cJSON_Delete(zones_raw);
         cJSON_AddNullToObject(root, "zones_active");
         cJSON_AddNullToObject(root, "zones_known");
+        cJSON_AddNullToObject(root, "zones_tamper");
+        cJSON_AddNullToObject(root, "zones_masking");
+        cJSON_AddNullToObject(root, "zones_fault");
+        cJSON_AddNullToObject(root, "zones_state");
+        cJSON_AddNullToObject(root, "zones_ratio");
+        cJSON_AddNullToObject(root, "zones_raw");
     }
 
     cJSON_AddBoolToObject(root, "tamper", tamper_any);
@@ -4774,6 +4825,7 @@ static esp_err_t status_get(httpd_req_t* req){
     char *out = cJSON_PrintUnformatted(root);
     if (!out) {
         cJSON_Delete(root);
+        free(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
@@ -4781,17 +4833,12 @@ static esp_err_t status_get(httpd_req_t* req){
     esp_err_t err = json_reply(req, out);
     cJSON_free(out);
     cJSON_Delete(root);
+    free(snapshot);
     return err;
 }
 
 static esp_err_t zones_diag_get(httpd_req_t* req){
     if(!check_bearer(req) || !is_admin_user(req)) { httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden"); return ESP_FAIL; }
-
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    const int total = zones_snapshot_total(&snapshot);
-    const float ref_mv = zone_inputs_reference_mv();
-    const int64_t uptime_ms = esp_timer_get_time() / 1000;
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
@@ -4799,13 +4846,24 @@ static esp_err_t zones_diag_get(httpd_req_t* req){
         return ESP_ERR_NO_MEM;
     }
 
+    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    if (!snapshot) {
+        cJSON_Delete(root);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    const int total = zones_snapshot_total(snapshot);
+    const float ref_mv = zone_inputs_reference_mv();
+    const int64_t uptime_ms = esp_timer_get_time() / 1000;
+
     cJSON_AddNumberToObject(root, "uptime_ms", (double)uptime_ms);
-    cJSON_AddStringToObject(root, "eol_mode", zone_inputs_eol_mode_name(snapshot.eol_mode));
+    cJSON_AddStringToObject(root, "eol_mode", zone_inputs_eol_mode_name(snapshot->eol_mode));
     cJSON_AddNumberToObject(root, "adc_reference_mv", ref_mv);
     cJSON_AddNumberToObject(root, "adc_max_steps", (double)ZONE_INPUTS_ADC_MAX_STEPS);
     cJSON_AddNumberToObject(root, "adc_samples", (double)ZONE_INPUTS_SAMPLES);
-    cJSON_AddNumberToObject(root, "supply_voltage", snapshot.supply_voltage);
-    cJSON_AddBoolToObject(root, "tamper_global", snapshot.tamper_global);
+    cJSON_AddNumberToObject(root, "supply_voltage", snapshot->supply_voltage);
+    cJSON_AddBoolToObject(root, "tamper_global", snapshot->tamper_global);
 
     cJSON *thr = json_build_eol_thresholds(ref_mv);
     if (thr) cJSON_AddItemToObject(root, "eol_thresholds", thr);
@@ -4824,18 +4882,18 @@ static esp_err_t zones_diag_get(httpd_req_t* req){
     if (hw) {
         cJSON_AddNumberToObject(hw, "supply_divider_r1_ohm", ZONE_SUPPLY_DIVIDER_R1_OHMS);
         cJSON_AddNumberToObject(hw, "supply_divider_r2_ohm", ZONE_SUPPLY_DIVIDER_R2_OHMS);
-        cJSON_AddNumberToObject(hw, "zones_local", snapshot.master_total);
+        cJSON_AddNumberToObject(hw, "zones_local", snapshot->master_total);
     }
 
     cJSON *zones = cJSON_AddArrayToObject(root, "zones");
     if (zones) {
         for (int idx = 0; idx < total; ++idx) {
-            const zone_state_entry_t *entry = &snapshot.entries[idx];
+            const zone_state_entry_t *entry = &snapshot->entries[idx];
             cJSON *it = cJSON_CreateObject();
             if (!it) continue;
 
             const float ratio = entry->analog_ratio;
-            const zone_input_state_t state = zone_inputs_classify_ratio(snapshot.eol_mode, ratio);
+            const zone_input_state_t state = entry->known ? entry->state : ZONE_INPUT_STATE_NORMAL;
             char board_label[sizeof(((roster_node_t *)0)->label)];
             zone_board_label_copy(entry->board, board_label, sizeof(board_label));
 
@@ -4846,6 +4904,8 @@ static esp_err_t zones_diag_get(httpd_req_t* req){
             cJSON_AddStringToObject(it, "state", zone_inputs_state_label(state));
             cJSON_AddBoolToObject(it, "known", entry->known);
             cJSON_AddBoolToObject(it, "tamper", entry->tamper);
+            cJSON_AddBoolToObject(it, "masking", entry->masking);
+            cJSON_AddBoolToObject(it, "fault", entry->fault);
             cJSON_AddBoolToObject(it, "alarm", entry->active);
             cJSON_AddNumberToObject(it, "board", (double)entry->board);
             cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
@@ -4858,23 +4918,31 @@ static esp_err_t zones_diag_get(httpd_req_t* req){
     esp_err_t res = json_reply(req, out);
     cJSON_free(out);
     cJSON_Delete(root);
+    free(snapshot);
     return res;
 }
 
 static esp_err_t zones_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    const int total = zones_snapshot_total(&snapshot);
+    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    if (!snapshot) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    const int total = zones_snapshot_total(snapshot);
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
+        free(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
 
     cJSON *arr  = cJSON_CreateArray();
-    if (!root) {
+    if (!arr) {
+        cJSON_Delete(root);
+        free(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
@@ -4884,7 +4952,7 @@ static esp_err_t zones_get(httpd_req_t* req){
 
     for(int idx = 0; idx < total; ++idx){
         const int zone_id = idx + 1;
-        const zone_state_entry_t *entry = &snapshot.entries[idx];
+        const zone_state_entry_t *entry = &snapshot->entries[idx];
         cJSON *it = cJSON_CreateObject();
         if (!it) {
             continue;
@@ -4906,6 +4974,10 @@ static esp_err_t zones_get(httpd_req_t* req){
         cJSON_AddBoolToObject(it, "known", entry->known);
         cJSON_AddBoolToObject(it, "active", entry->known ? entry->active : false);
         cJSON_AddBoolToObject(it, "board_online", entry->board_online);
+        cJSON_AddBoolToObject(it, "tamper", entry->tamper);
+        cJSON_AddBoolToObject(it, "masking", entry->masking);
+        cJSON_AddBoolToObject(it, "fault", entry->fault);
+        cJSON_AddStringToObject(it, "state", zone_inputs_state_label(entry->state));
         cJSON_AddNumberToObject(it, "board", (double)entry->board);
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
         char board_label[sizeof(((roster_node_t *)0)->label)];
@@ -4926,6 +4998,7 @@ static esp_err_t zones_get(httpd_req_t* req){
     esp_err_t e = json_reply(req, out);
     cJSON_free(out);
     cJSON_Delete(root);
+    free(snapshot);
     return e;
 }
 
@@ -5091,12 +5164,17 @@ static esp_err_t scenes_post(httpd_req_t* req){
 static esp_err_t zones_config_get(httpd_req_t* req){
     if(!check_bearer(req)) return httpd_resp_send_err(req,401,"token"), ESP_FAIL;
 
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    const int total = zones_snapshot_total(&snapshot);
+    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    if (!snapshot) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    const int total = zones_snapshot_total(snapshot);
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
+        free(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
@@ -5104,6 +5182,7 @@ static esp_err_t zones_config_get(httpd_req_t* req){
     cJSON *items = cJSON_CreateArray();
     if (!items) {
         cJSON_Delete(root);
+        free(snapshot);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
         return ESP_ERR_NO_MEM;
     }
@@ -5112,7 +5191,7 @@ static esp_err_t zones_config_get(httpd_req_t* req){
     for (int idx = 0; idx < total; ++idx) {
         const int zone_id = idx + 1;
         zone_cfg_t *cfg = &s_zone_cfg[idx];
-        const zone_state_entry_t *entry = &snapshot.entries[idx];
+        const zone_state_entry_t *entry = &snapshot->entries[idx];
         cJSON *it = cJSON_CreateObject();
         if (!it) {
             continue;
@@ -5137,6 +5216,7 @@ static esp_err_t zones_config_get(httpd_req_t* req){
     esp_err_t res = json_reply(req, out);
     cJSON_free(out);
     cJSON_Delete(root);
+    free(snapshot);
     return res;
 }
 
@@ -5605,9 +5685,13 @@ static esp_err_t arm_post(httpd_req_t* req)
     zone_mask_and(&eff_mask, &eff_mask, &scene_mask);
 
     // 3) Costruisci elenco zone aperte e bypass automatico (auto_exclude)
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    int snapshot_total = zones_snapshot_total(&snapshot);
+    zones_snapshot_t *snapshot = zones_snapshot_alloc();
+    if (!snapshot) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    zones_snapshot_build(snapshot);
+    int snapshot_total = zones_snapshot_total(snapshot);
     if (snapshot_total > zones_total) {
         snapshot_total = zones_total;
     }
@@ -5615,7 +5699,7 @@ static esp_err_t arm_post(httpd_req_t* req)
     zone_mask_t open_mask;
     zone_mask_clear(&open_mask);
     for (int idx = 0; idx < snapshot_total; ++idx){
-        const zone_state_entry_t *entry = &snapshot.entries[idx];
+        const zone_state_entry_t *entry = &snapshot->entries[idx];
         if (entry->known && entry->active) zone_mask_set(&open_mask, (uint16_t)idx);
     }
     zone_mask_limit(&open_mask, (uint16_t)zones_total);
@@ -5653,6 +5737,7 @@ static esp_err_t arm_post(httpd_req_t* req)
         httpd_resp_set_status(req, "409 Conflict");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+        free(snapshot);
         return ESP_OK;
     }
 
@@ -5714,6 +5799,7 @@ static esp_err_t arm_post(httpd_req_t* req)
     snprintf(note, sizeof(note), "mode=%.*s scene=%.*s", (int)mode_len, mode, (int)scene_len, scene_desc);
     audit_append("alarm_arm", user, 1, note);
 
+    free(snapshot);
     return json_reply(req, "{\"ok\":true}");
 }
 

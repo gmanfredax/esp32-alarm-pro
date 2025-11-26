@@ -22,6 +22,9 @@ const state = {
   alarmZoneIds: [],
   tamperAlarm: false,
   tamperZoneIds: [],
+  maskingZoneIds: [],
+  faultZoneIds: [],
+  zoneStates: [],
   zones: [],
   boards: [],
   scenes: null,
@@ -660,7 +663,18 @@ async function refreshStatus(){
     zonesTamperFlags.forEach((flag, idx) => {
       if (flag) tamperZoneIds.push(idx + 1);
     });
+    const zonesState = Array.isArray(data?.zones_state) ? data.zones_state : [];
+    const maskingZoneIds = [];
+    const faultZoneIds = [];
+    zonesState.forEach((raw, idx) => {
+      const label = (raw || '').toString().toUpperCase();
+      if (label === 'MASKING') maskingZoneIds.push(idx + 1);
+      else if (label === 'FAULT') faultZoneIds.push(idx + 1);
+    });
     state.tamperZoneIds = tamperZoneIds;
+    state.maskingZoneIds = maskingZoneIds;
+    state.faultZoneIds = faultZoneIds;
+    state.zoneStates = zonesState;
 
     if (isAlarmState) {
       if (!state.sceneMaskSyncedForAlarm) {
@@ -709,6 +723,18 @@ async function refreshStatus(){
         kpiCard({ title: 'Zone in tamper', valueHTML: `<span class="alarm-zone-value">${label}</span>` })
       );
     }
+    if (state.maskingZoneIds.length) {
+      const label = state.maskingZoneIds.map((id) => `Z${id}`).join(', ');
+      cards.push(
+        kpiCard({ title: 'Zone in masking', valueHTML: `<span class="alarm-zone-value">${label}</span>` })
+      );
+    }
+    if (state.faultZoneIds.length) {
+      const label = state.faultZoneIds.map((id) => `Z${id}`).join(', ');
+      cards.push(
+        kpiCard({ title: 'Zone in fault', valueHTML: `<span class="alarm-zone-value">${label}</span>` })
+      );
+    }
     if (isAlarmState && (!Array.isArray(state.zones) || !state.zones.length) && state.activeTab !== 'zones') {
       refreshZones();
     }
@@ -741,8 +767,15 @@ async function refreshStatus(){
 
 function buildZoneBadge(zone){
   const badges = [];
-  if (zone?.tamper) {
+  const state = (zone?.state || '').toString().toUpperCase();
+  if (zone?.tamper || state === 'TAMPER') {
     badges.push('<span class="badge" title="Tamper">T</span>');
+  }
+  if (zone?.masking || state === 'MASKING') {
+    badges.push('<span class="badge" title="Masking">M</span>');
+  }
+  if (zone?.fault || state === 'FAULT') {
+    badges.push('<span class="badge" title="Guasto/Fault">F</span>');
   }
   if (zone?.auto_exclude) badges.push('<span class="badge" title="Autoesclusione">AE</span>');
   if (zone?.zone_delay) badges.push('<span class="badge" title="Ritardo">R</span>');
