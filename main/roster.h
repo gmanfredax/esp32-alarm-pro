@@ -29,6 +29,7 @@ typedef struct {
     uint8_t inputs_count;
     uint8_t outputs_count;
     uint32_t inputs_bitmap;
+    uint32_t tamper_bitmap;
     uint32_t outputs_bitmap;
     uint8_t change_counter;
     uint8_t node_state_flags;
@@ -40,6 +41,7 @@ typedef struct {
     bool identify_active;
     bool info_valid;
     bool inputs_valid;
+    bool tamper_valid;
     bool outputs_valid;
 } roster_node_t;
 
@@ -60,6 +62,8 @@ typedef struct {
     roster_node_state_t state;
     bool inputs_valid;
     uint32_t inputs_bitmap;
+    bool tamper_valid;
+    uint32_t tamper_bitmap;
     uint8_t change_counter;
     uint8_t node_state_flags;
     bool outputs_valid;
@@ -74,6 +78,8 @@ typedef struct {
     uint8_t outputs_count;
     bool inputs_valid;
     uint32_t inputs_bitmap;
+    bool tamper_valid;
+    uint32_t tamper_bitmap;
     roster_node_state_t state;
 } roster_node_inputs_t;
 
@@ -94,6 +100,9 @@ esp_err_t roster_note_inputs(uint8_t node_id,
                              uint32_t inputs_bitmap,
                              uint8_t change_counter,
                              uint8_t node_state_flags);
+esp_err_t roster_note_ext_inputs(uint8_t node_id,
+                                 uint32_t alarm_bitmap,
+                                 uint32_t tamper_bitmap);
 esp_err_t roster_note_outputs(uint8_t node_id,
                               uint32_t outputs_bitmap,
                               uint8_t flags,
