@@ -1012,6 +1012,13 @@ static void logic_task(void *arg)
             for (int i = 0; i < EXP_NODE_ZONE_COUNT; ++i) {
                 uint8_t bits = compute_zone_state_bits(i, &s_zone_samples[i]);
                 if (bits != s_zone_last_state_bits[i]) {
+                    ESP_LOGI(TAG,
+                             "Zona %d variazione: mv=%" PRIu32 " ratio=%.3f bits=0x%02x->0x%02x",
+                             i,
+                             s_zone_samples[i].raw_mv,
+                             s_zone_samples[i].ratio,
+                             s_zone_last_state_bits[i],
+                             bits);
                     s_zone_last_state_bits[i] = bits;
                     s_zone_seq[i]++;
                     s_change_counter++;
