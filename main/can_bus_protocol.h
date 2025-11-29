@@ -21,6 +21,7 @@ extern "C" {
 #define CAN_PROTO_PROTOCOL_VERSION 0x01u
 
 #define CAN_PROTO_MODEL_IO8R8_V1   0x0101u
+#define CAN_PROTO_MODEL_IO10R2_V1  0x0102u
 #define CAN_PROTO_MAX_NODE_ID      0x7Fu
 
 // ------------------------
@@ -32,11 +33,15 @@ extern "C" {
 #define CAN_PROTO_ID_COMMAND_BASE  0x380u
 #define CAN_PROTO_ID_DIAG_BASE     0x480u
 
+#define CAN_PROTO_ID_EXT_HEARTBEAT_BASE 0x100u
+#define CAN_PROTO_ID_EXT_ZONE_BASE      0x120u
+
 #define CAN_PROTO_ID_STATUS(node_id)  (CAN_PROTO_ID_STATUS_BASE + (node_id))
 #define CAN_PROTO_ID_INFO(node_id)    (CAN_PROTO_ID_INFO_BASE + (node_id))
 #define CAN_PROTO_ID_COMMAND(node_id) (CAN_PROTO_ID_COMMAND_BASE + (node_id))
 #define CAN_PROTO_ID_DIAG(node_id)    (CAN_PROTO_ID_DIAG_BASE + (node_id))
-#define CAN_PROTO_ID_EXT_ZONE_EVENT(node_id) CAN_PROTO_ID_DIAG(node_id)
+#define CAN_PROTO_ID_EXT_HEARTBEAT(node_id) (CAN_PROTO_ID_EXT_HEARTBEAT_BASE + (node_id))
+#define CAN_PROTO_ID_EXT_ZONE_EVENT(node_id) (CAN_PROTO_ID_EXT_ZONE_BASE + (node_id))
 
 #define CAN_PROTO_ID_BROADCAST_SCAN        0x070u
 #define CAN_PROTO_ID_BROADCAST_TEST        0x071u
@@ -57,6 +62,8 @@ typedef enum {
     CAN_PROTO_MSG_SCAN_RESPONSE  = 0x32u,
     CAN_PROTO_MSG_ACK            = 0x7Fu,
 } can_proto_msg_type_t;
+
+#define CAN_PROTO_NODE_STATE_WARNING_VBIAS 0x01u
 
 typedef enum {
     CAN_ZONE_MEASURE_MODE_EOL   = 0,
@@ -132,25 +139,31 @@ typedef struct __attribute__((packed)) {
 } can_proto_addr_assign_t;
 
 typedef struct __attribute__((packed)) {
-    uint8_t  zone_mode;        /**< Packed zone index and measure mode */
-    uint8_t  state_bits;       /**< CAN_PROTO_ZONE_STATE_* flags */
-    uint16_t sample_mv;        /**< Last ADC sample in mV */
-    uint16_t rloop_ohm_div100; /**< Loop resistance in ohm/100 */
-    uint8_t  supply_100mv;     /**< Bias supply in 100 mV units */
-    uint8_t  seq;              /**< Monotonic sequence number */
+    uint8_t alarm_bitmap;
+    uint8_t short_bitmap;
+    uint8_t open_bitmap;
+    uint8_t tamper_bitmap;
+    uint8_t vdda_100mv;
+    uint8_t vbias_10mv;
+    uint8_t temperature_c_plus40;
+    uint8_t fw_nibbles;
+} can_proto_ext_heartbeat_t;
+
+typedef struct __attribute__((packed)) {
+    uint8_t zone_id;
+    uint8_t state_bits; /**< CAN_PROTO_ZONE_EVENT_STATE_* flags */
+    uint16_t raw_adc;
+    uint16_t rloop_ohm_div100;
+    uint8_t vbias_10mv;
+    uint8_t seq;
 } can_proto_zone_event_t;
 
-#define CAN_PROTO_ZONE_EVENT_PACK(zone_idx, measure_mode) \
-    (((uint8_t)(zone_idx) & 0x0Fu) | (((uint8_t)(measure_mode) & 0x03u) << 4))
-#define CAN_PROTO_ZONE_EVENT_ZONE(zone_mode)   ((uint8_t)((zone_mode) & 0x0Fu))
-#define CAN_PROTO_ZONE_EVENT_MODE(zone_mode)   ((can_zone_measure_mode_t)(((zone_mode) >> 4) & 0x03u))
-
-#define CAN_PROTO_ZONE_STATE_PRESENT   (1u << 0)
-#define CAN_PROTO_ZONE_STATE_CONTACT_NO (1u << 1)
-#define CAN_PROTO_ZONE_STATE_ALARM     (1u << 2)
-#define CAN_PROTO_ZONE_STATE_TAMPER    (1u << 3)
-#define CAN_PROTO_ZONE_STATE_SHORT     (1u << 4)
-#define CAN_PROTO_ZONE_STATE_OPEN      (1u << 5)
+#define CAN_PROTO_ZONE_EVENT_STATE_ALARM      (1u << 0)
+#define CAN_PROTO_ZONE_EVENT_STATE_SHORT      (1u << 1)
+#define CAN_PROTO_ZONE_EVENT_STATE_OPEN       (1u << 2)
+#define CAN_PROTO_ZONE_EVENT_STATE_TAMPER     (1u << 3)
+#define CAN_PROTO_ZONE_EVENT_STATE_PRESENT    (1u << 4)
+#define CAN_PROTO_ZONE_EVENT_STATE_CONTACT_NO (1u << 5)
 
 /**
  * Lightweight representation of a CAN frame, independent from ESP-IDF or
@@ -174,7 +187,8 @@ typedef enum {
     CAN_PROTO_FRAME_OUTPUT_COMMAND,
     CAN_PROTO_FRAME_IDENTIFY_CMD,
     CAN_PROTO_FRAME_ZONE_CONFIG,
-    CAN_PROTO_FRAME_ZONE_EVENT,
+    CAN_PROTO_FRAME_EXT_HEARTBEAT,
+    CAN_PROTO_FRAME_EXT_ZONE_EVENT,
     CAN_PROTO_FRAME_TEST_TOGGLE,
     CAN_PROTO_FRAME_SCAN_REQUEST,
     CAN_PROTO_FRAME_SCAN_RESPONSE,
@@ -192,6 +206,7 @@ typedef struct {
         can_proto_output_cmd_t  output_cmd;
         can_proto_identify_cmd_t identify;
         can_proto_zone_config_t zone_config;
+        can_proto_ext_heartbeat_t ext_heartbeat;
         can_proto_zone_event_t  zone_event;
         can_proto_scan_t        scan;
         can_proto_test_toggle_t test_toggle;

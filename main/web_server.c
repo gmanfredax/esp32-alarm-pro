@@ -19,6 +19,7 @@
 #include "esp_app_desc.h"
 #include "esp_ota_ops.h"
 #include "esp_netif.h"
+#include "lwip/sockets.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -233,6 +234,10 @@ static SemaphoreHandle_t s_ws_lock = NULL;
 // ─────────────────────────────────────────────────────────────────────────────
 //static httpd_handle_t s_server = NULL;
 static httpd_handle_t s_http_server = NULL;
+
+// close personalizzato per httpd, per chiudere i socket in modo aggressivo
+static void web_httpd_close_fn(httpd_handle_t hd, int sockfd);
+
 static bool s_spiffs_mounted __attribute__((unused)) = false;
 
 static void set_http_security_headers(httpd_req_t* req){
@@ -5543,6 +5548,15 @@ static esp_err_t start_web(void){
     cfg.server_port = 80;
     cfg.uri_match_fn = web_uri_match; //httpd_uri_match_wildcard;
 
+    // Limitiamo esplicitamente i socket aperti dal solo httpd
+    // (il totale LWIP viene aumentato in sdkconfig).
+    // 7 connessioni contemporanee al web server sono più che sufficienti.
+    cfg.max_open_sockets = 7;
+
+    // Usiamo una close_fn custom per rilasciare subito le risorse del socket
+    // e ridurre il rischio che restino "appesi" a lungo.
+    cfg.close_fn = web_httpd_close_fn;
+
     httpd_handle_t srv = NULL;
     esp_err_t tls_err = web_tls_prepare_material();
     if (tls_err != ESP_OK && tls_err != ESP_ERR_NOT_FOUND){
@@ -5605,6 +5619,24 @@ esp_err_t web_server_stop(void){
         }
     }
     return first_err;
+}
+
+static void web_httpd_close_fn(httpd_handle_t hd, int sockfd)
+{
+    if (sockfd < 0) {
+        return;
+    }
+
+    struct linger ling = {
+        .l_onoff = 1,
+        .l_linger = 0
+    };
+
+    // Se fallisce non è grave, logghiamo solo.
+    if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling)) < 0) {
+        ESP_LOGW(TAG, "setsockopt(SO_LINGER) failed on fd=%d, errno=%d", sockfd, errno);
+    }
+    close(sockfd);
 }
 
 static void web_restart_task(void* arg){

@@ -195,12 +195,20 @@ static bool can_proto_parse_from_cob(uint32_t cob_id, const uint8_t *data, uint8
             out->kind = CAN_PROTO_FRAME_ADDR_ASSIGN;
             return true;
         }
-    } else if (cob_id >= CAN_PROTO_ID_DIAG_BASE &&
-               cob_id <= CAN_PROTO_ID_DIAG(CAN_PROTO_MAX_NODE_ID)) {
-        out->node_id = (uint8_t)(cob_id - CAN_PROTO_ID_DIAG_BASE);
+    } else if (cob_id >= CAN_PROTO_ID_EXT_HEARTBEAT_BASE &&
+               cob_id <= CAN_PROTO_ID_EXT_HEARTBEAT(CAN_PROTO_MAX_NODE_ID)) {
+        out->node_id = (uint8_t)(cob_id - CAN_PROTO_ID_EXT_HEARTBEAT_BASE);
+        if (dlc == sizeof(can_proto_ext_heartbeat_t)) {
+            memcpy(&out->payload.ext_heartbeat, data, sizeof(can_proto_ext_heartbeat_t));
+            out->kind = CAN_PROTO_FRAME_EXT_HEARTBEAT;
+            return true;
+        }
+    } else if (cob_id >= CAN_PROTO_ID_EXT_ZONE_BASE &&
+               cob_id <= CAN_PROTO_ID_EXT_ZONE_EVENT(CAN_PROTO_MAX_NODE_ID)) {
+        out->node_id = (uint8_t)(cob_id - CAN_PROTO_ID_EXT_ZONE_BASE);
         if (dlc == sizeof(can_proto_zone_event_t)) {
             memcpy(&out->payload.zone_event, data, sizeof(can_proto_zone_event_t));
-            out->kind = CAN_PROTO_FRAME_ZONE_EVENT;
+            out->kind = CAN_PROTO_FRAME_EXT_ZONE_EVENT;
             return true;
         }
     }

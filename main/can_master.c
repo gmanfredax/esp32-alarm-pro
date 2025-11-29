@@ -105,6 +105,8 @@ static bool can_master_convert_to_frame(const twai_message_t *msg, can_proto_fra
 static bool can_master_convert_to_twai(const can_proto_frame_t *frame, twai_message_t *msg);
 static esp_err_t can_master_get_bus_telemetry_locked(can_master_bus_telemetry_t *out);
 static esp_err_t can_master_get_node_telemetry_locked(uint8_t node_id, can_master_node_telemetry_t *out);
+static void can_master_handle_ext_heartbeat(uint8_t node_id, const can_proto_ext_heartbeat_t *payload);
+static void can_master_handle_zone_event(uint8_t node_id, const can_proto_zone_event_t *payload);
 
 static inline uint64_t now_ms(void)
 {
@@ -582,6 +584,96 @@ static void can_master_handle_addr_request(const can_proto_addr_request_t *req)
     }
 }
 
+static void can_master_handle_ext_heartbeat(uint8_t node_id, const can_proto_ext_heartbeat_t *payload)
+{
+    if (!payload || node_id == 0 || node_id > CAN_MAX_NODE_ID) {
+        return;
+    }
+
+    uint64_t now = now_ms();
+    bool was_online = false;
+    SemaphoreHandle_t lock = state_lock_get();
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        can_master_node_t *node = &s_nodes[node_id];
+        was_online = node->online;
+        node->used = true;
+        node->online = true;
+        node->last_seen_ms = now;
+        node->last_online_ms = now;
+        xSemaphoreGive(lock);
+    }
+
+    bool roster_new = false;
+    if (roster_mark_online(node_id, now, &roster_new) == ESP_OK) {
+        if (!was_online || roster_new) {
+            can_master_notify_online(node_id, roster_new, now);
+        }
+    }
+
+    cJSON *evt = cJSON_CreateObject();
+    if (!evt) {
+        return;
+    }
+    cJSON_AddNumberToObject(evt, "node_id", node_id);
+    cJSON_AddNumberToObject(evt, "alarm_bitmap", payload->alarm_bitmap);
+    cJSON_AddNumberToObject(evt, "short_bitmap", payload->short_bitmap);
+    cJSON_AddNumberToObject(evt, "open_bitmap", payload->open_bitmap);
+    cJSON_AddNumberToObject(evt, "tamper_bitmap", payload->tamper_bitmap);
+    cJSON_AddNumberToObject(evt, "vdda_100mv", payload->vdda_100mv);
+    cJSON_AddNumberToObject(evt, "vbias_10mv", payload->vbias_10mv);
+    cJSON_AddNumberToObject(evt, "temperature_c_plus40", payload->temperature_c_plus40);
+    cJSON_AddNumberToObject(evt, "fw_nibbles", payload->fw_nibbles);
+    web_server_ws_broadcast_event("node_ext_heartbeat", evt);
+}
+
+static void can_master_handle_zone_event(uint8_t node_id, const can_proto_zone_event_t *payload)
+{
+    if (!payload || node_id == 0 || node_id > CAN_MAX_NODE_ID) {
+        return;
+    }
+
+    uint64_t now = now_ms();
+    bool was_online = false;
+    SemaphoreHandle_t lock = state_lock_get();
+    if (lock) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        can_master_node_t *node = &s_nodes[node_id];
+        was_online = node->online;
+        node->used = true;
+        node->online = true;
+        node->last_seen_ms = now;
+        node->last_online_ms = now;
+        xSemaphoreGive(lock);
+    }
+
+    bool roster_new = false;
+    if (roster_mark_online(node_id, now, &roster_new) == ESP_OK) {
+        if (!was_online || roster_new) {
+            can_master_notify_online(node_id, roster_new, now);
+        }
+    }
+
+    cJSON *evt = cJSON_CreateObject();
+    if (!evt) {
+        return;
+    }
+    cJSON_AddNumberToObject(evt, "node_id", node_id);
+    cJSON_AddNumberToObject(evt, "zone_id", payload->zone_id);
+    cJSON_AddNumberToObject(evt, "seq", payload->seq);
+    cJSON_AddNumberToObject(evt, "state_bits", payload->state_bits);
+    cJSON_AddBoolToObject(evt, "present", (payload->state_bits & CAN_PROTO_ZONE_EVENT_STATE_PRESENT) != 0);
+    cJSON_AddBoolToObject(evt, "contact_no", (payload->state_bits & CAN_PROTO_ZONE_EVENT_STATE_CONTACT_NO) != 0);
+    cJSON_AddBoolToObject(evt, "alarm", (payload->state_bits & CAN_PROTO_ZONE_EVENT_STATE_ALARM) != 0);
+    cJSON_AddBoolToObject(evt, "short", (payload->state_bits & CAN_PROTO_ZONE_EVENT_STATE_SHORT) != 0);
+    cJSON_AddBoolToObject(evt, "open", (payload->state_bits & CAN_PROTO_ZONE_EVENT_STATE_OPEN) != 0);
+    cJSON_AddBoolToObject(evt, "tamper", (payload->state_bits & CAN_PROTO_ZONE_EVENT_STATE_TAMPER) != 0);
+    cJSON_AddNumberToObject(evt, "raw_adc", payload->raw_adc);
+    cJSON_AddNumberToObject(evt, "rloop_ohm_div100", payload->rloop_ohm_div100);
+    cJSON_AddNumberToObject(evt, "vbias_10mv", payload->vbias_10mv);
+    web_server_ws_broadcast_event("node_zone_event", evt);
+}
+
 static void can_master_handle_parsed(const can_proto_parsed_frame_t *parsed)
 {
     if (!parsed) {
@@ -595,6 +687,12 @@ static void can_master_handle_parsed(const can_proto_parsed_frame_t *parsed)
         break;
     case CAN_PROTO_FRAME_INFO:
         can_master_handle_info(parsed->node_id, &parsed->payload.info);
+        break;
+    case CAN_PROTO_FRAME_EXT_HEARTBEAT:
+        can_master_handle_ext_heartbeat(parsed->node_id, &parsed->payload.ext_heartbeat);
+        break;
+    case CAN_PROTO_FRAME_EXT_ZONE_EVENT:
+        can_master_handle_zone_event(parsed->node_id, &parsed->payload.zone_event);
         break;
     case CAN_PROTO_FRAME_SCAN_RESPONSE:
         can_master_handle_scan_response(&parsed->payload.scan);

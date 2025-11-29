@@ -353,6 +353,7 @@ static void system_main_task(void *arg)
     esp_log_level_set("esp-tls-mbedtls", ESP_LOG_WARN);
     esp_log_level_set("esp_http_server", ESP_LOG_WARN);
     esp_log_level_set("httpd",           ESP_LOG_WARN);
+    esp_log_level_set("lwip",           ESP_LOG_DEBUG);
     // opzionale:
     // esp_log_level_set("esp-tls",      ESP_LOG_WARN);
 
