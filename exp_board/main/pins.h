@@ -1,16 +1,16 @@
 #pragma once
 
 #include "driver/gpio.h"
+#include "sdkconfig.h"
 
-// =============================== CAN / TWAI ===============================
-
-// Pin CAN: da adattare al tuo transceiver (SN65HVD230, TJA1050, ecc.)
-#ifndef CAN_TX_GPIO
-#  define CAN_TX_GPIO  GPIO_NUM_17
-#endif
-
-#ifndef CAN_RX_GPIO
-#  define CAN_RX_GPIO  GPIO_NUM_16
+// =============================== CAN / TWAI ==================================
+#if defined(CONFIG_APP_CAN_ENABLED)
+  #ifndef CAN_TX_GPIO
+    #define CAN_TX_GPIO ((gpio_num_t)CONFIG_APP_CAN_TX_GPIO)
+  #endif
+  #ifndef CAN_RX_GPIO
+    #define CAN_RX_GPIO ((gpio_num_t)CONFIG_APP_CAN_RX_GPIO)
+  #endif
 #endif
 
 // =============================== ZONE ANALOGICHE ==========================
