@@ -220,6 +220,10 @@ static void compose_zone_masks(const zone_inputs_snapshot_t *snapshot,
             if (active) {
                 zone_mask_set(out_alarm, offset);
             }
+            bool tamper = node->tamper_valid && ((node->tamper_bitmap & (1u << bit)) != 0u);
+            if (tamper) {
+                zone_mask_set(out_tamper, offset);
+            }
         }
     }
 
