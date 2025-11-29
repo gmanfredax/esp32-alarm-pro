@@ -755,8 +755,10 @@ static void node_init_defaults(roster_node_t *node, uint8_t node_id)
     node->state = ROSTER_NODE_STATE_OFFLINE;
     node->identify_active = false;
     node->inputs_valid = false;
+    node->tamper_valid = false;
     node->outputs_valid = false;
     node->inputs_bitmap = 0;
+    node->tamper_bitmap = 0;
     node->outputs_bitmap = 0;
     node->change_counter = 0;
     node->node_state_flags = 0;
@@ -1247,6 +1249,10 @@ static void add_common_fields(cJSON *obj, const roster_node_t *node)
     if (node->inputs_valid) {
         cJSON_AddNumberToObject(obj, "inputs_bitmap", (double)node->inputs_bitmap);
     }
+    cJSON_AddBoolToObject(obj, "tamper_known", node->tamper_valid);
+    if (node->tamper_valid) {
+        cJSON_AddNumberToObject(obj, "tamper_bitmap", (double)node->tamper_bitmap);
+    }
     cJSON_AddNumberToObject(obj, "change_counter", node->change_counter);
     cJSON_AddNumberToObject(obj, "node_state_flags", node->node_state_flags);
     cJSON_AddBoolToObject(obj, "outputs_known", node->outputs_valid);
@@ -1412,6 +1418,34 @@ esp_err_t roster_note_inputs(uint8_t node_id,
     return ESP_OK;
 }
 
+esp_err_t roster_note_ext_inputs(uint8_t node_id,
+                                 uint32_t alarm_bitmap,
+                                 uint32_t tamper_bitmap)
+{
+    if (node_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    if (!node) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!node->used) {
+        node_init_defaults(node, node_id);
+    }
+
+    node->inputs_valid = true;
+    node->inputs_bitmap = alarm_bitmap;
+    node->tamper_valid = true;
+    node->tamper_bitmap = tamper_bitmap;
+
+    xSemaphoreGive(s_roster_lock);
+    return ESP_OK;
+}
+
 esp_err_t roster_note_outputs(uint8_t node_id,
                               uint32_t outputs_bitmap,
                               uint8_t flags,
@@ -1457,6 +1491,8 @@ bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state)
         out_state->state = node->state;
         out_state->inputs_valid = node->inputs_valid;
         out_state->inputs_bitmap = node->inputs_bitmap;
+        out_state->tamper_valid = node->tamper_valid;
+        out_state->tamper_bitmap = node->tamper_bitmap;
         out_state->change_counter = node->change_counter;
         out_state->node_state_flags = node->node_state_flags;
         out_state->outputs_valid = node->outputs_valid;
@@ -1494,6 +1530,8 @@ size_t roster_collect_nodes(roster_node_inputs_t *out_nodes, size_t max_nodes)
         dst->outputs_count = node->outputs_count;
         dst->inputs_valid = node->inputs_valid;
         dst->inputs_bitmap = node->inputs_bitmap;
+        dst->tamper_valid = node->tamper_valid;
+        dst->tamper_bitmap = node->tamper_bitmap;
         dst->state = node->state;
     }
 
