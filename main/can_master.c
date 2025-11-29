@@ -108,6 +108,7 @@ static esp_err_t can_master_get_bus_telemetry_locked(can_master_bus_telemetry_t 
 static esp_err_t can_master_get_node_telemetry_locked(uint8_t node_id, can_master_node_telemetry_t *out);
 static void can_master_handle_ext_heartbeat(uint8_t node_id, const can_proto_ext_heartbeat_t *payload);
 static void can_master_handle_zone_event(uint8_t node_id, const can_proto_zone_event_t *payload);
+static esp_err_t can_master_start_scan_internal(bool *started);
 
 static inline uint64_t now_ms(void)
 {
@@ -210,6 +211,7 @@ static esp_err_t can_master_driver_start_internal(void)
 esp_err_t can_master_init(void)
 {
     static bool s_initialized = false;
+    static bool s_boot_scan_triggered = false;
 
     if (!s_initialized) {
         if (!state_lock_get() || !scan_lock_get()) {
@@ -224,6 +226,15 @@ esp_err_t can_master_init(void)
         esp_err_t err = can_master_driver_start_internal();
         if (err != ESP_OK) {
             return err;
+        }
+    }
+
+    if (s_driver_started && !s_boot_scan_triggered) {
+        esp_err_t scan_err = can_master_start_scan_internal(NULL);
+        if (scan_err != ESP_OK && scan_err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "Unable to start CAN scan after init: %s", esp_err_to_name(scan_err));
+        } else if (scan_err == ESP_OK) {
+            s_boot_scan_triggered = true;
         }
     }
 
@@ -628,6 +639,15 @@ static void can_master_handle_ext_heartbeat(uint8_t node_id, const can_proto_ext
         }
     }
 
+    esp_err_t roster_err = roster_note_ext_inputs(node_id,
+                                                 payload->alarm_bitmap,
+                                                 payload->tamper_bitmap);
+    if (roster_err != ESP_OK) {
+        ESP_LOGW(TAG, "Unable to store ext inputs for node %u (err=%s)",
+                 (unsigned)node_id,
+                 esp_err_to_name(roster_err));
+    }
+
     cJSON *evt = cJSON_CreateObject();
     if (!evt) {
         return;
@@ -1020,16 +1040,8 @@ esp_err_t can_master_set_node_outputs(uint8_t node_id,
     return ESP_OK;
 }
 
-esp_err_t can_master_request_scan(bool *started)
+static esp_err_t can_master_start_scan_internal(bool *started)
 {
-    esp_err_t err = can_master_init();
-    if (err != ESP_OK) {
-        if (started) {
-            *started = false;
-        }
-        return err;
-    }
-
     SemaphoreHandle_t lock = scan_lock_get();
     if (!lock) {
         if (started) {
@@ -1051,7 +1063,7 @@ esp_err_t can_master_request_scan(bool *started)
     s_scan_new_nodes = 0;
     xSemaphoreGive(lock);
 
-    err = ensure_scan_timer();
+    esp_err_t err = ensure_scan_timer();
     if (err != ESP_OK) {
         xSemaphoreTake(lock, portMAX_DELAY);
         s_scan_in_progress = false;
@@ -1110,6 +1122,19 @@ esp_err_t can_master_request_scan(bool *started)
         *started = true;
     }
     return ESP_OK;
+}
+
+esp_err_t can_master_request_scan(bool *started)
+{
+    esp_err_t err = can_master_init();
+    if (err != ESP_OK) {
+        if (started) {
+            *started = false;
+        }
+        return err;
+    }
+
+    return can_master_start_scan_internal(started);
 }
 
 static esp_err_t can_master_get_bus_telemetry_locked(can_master_bus_telemetry_t *out)
