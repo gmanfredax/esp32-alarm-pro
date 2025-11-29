@@ -5308,6 +5308,59 @@ static esp_err_t zones_config_post(httpd_req_t* req){
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GESTIONE SERVIZI LOG
+// ─────────────────────────────────────────────────────────────────────────────
+
+static esp_err_t api_log_level_handler(httpd_req_t *req)
+{
+    char query[128];
+    char tag[32] = {0};
+    char level_str[16] = {0};
+
+    size_t qlen = httpd_req_get_url_query_len(req) + 1;
+    if (qlen > sizeof(query)) {
+        qlen = sizeof(query);
+    }
+
+    if (httpd_req_get_url_query_str(req, query, qlen) == ESP_OK) {
+        httpd_query_key_value(query, "tag", tag, sizeof(tag));
+        httpd_query_key_value(query, "level", level_str, sizeof(level_str));
+    }
+
+    // default: se non passi niente, agiamo su lwip e lo mettiamo in DEBUG
+    if (tag[0] == '\0') {
+        strcpy(tag, "lwip");
+    }
+    if (level_str[0] == '\0') {
+        strcpy(level_str, "DEBUG");
+    }
+
+    esp_log_level_t level = ESP_LOG_INFO;
+    if      (!strcasecmp(level_str, "NONE"))    level = ESP_LOG_NONE;
+    else if (!strcasecmp(level_str, "ERROR"))   level = ESP_LOG_ERROR;
+    else if (!strcasecmp(level_str, "WARN"))    level = ESP_LOG_WARN;
+    else if (!strcasecmp(level_str, "INFO"))    level = ESP_LOG_INFO;
+    else if (!strcasecmp(level_str, "DEBUG"))   level = ESP_LOG_DEBUG;
+    else if (!strcasecmp(level_str, "VERBOSE")) level = ESP_LOG_VERBOSE;
+
+    // Se vuoi agire su tutti i tag: usa "ALL" come tag e fai "*"
+    if (!strcasecmp(tag, "ALL")) {
+        esp_log_level_set("*", level);
+    } else {
+        esp_log_level_set(tag, level);
+    }
+
+    char resp[128];
+    int len = snprintf(resp, sizeof(resp),
+                       "{\"tag\":\"%s\",\"level\":\"%s\"}", tag, level_str);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, resp, len);
+
+    return ESP_OK;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GESTIONE SERVIZI SERVER HTTP
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -5524,6 +5577,7 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/sys/cloudflare",     .method = HTTP_POST, .handler = sys_cloudflare_post },
     { .uri = "/api/sys/websec",         .method = HTTP_GET,  .handler = sys_websec_get },
     { .uri = "/api/sys/websec",         .method = HTTP_POST, .handler = sys_websec_post },
+    { .uri = "/api/loglevel",           .method = HTTP_GET,  .handler = api_log_level_handler, .user_ctx = NULL },
     { .uri = "/ws",                     .method = HTTP_GET,  .handler = ws_handler, .is_websocket = true },
 };
 

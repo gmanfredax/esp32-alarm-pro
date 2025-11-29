@@ -10,6 +10,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "freertos/timers.h"
 #include "esp_timer.h"
 #include "driver/twai.h"
 #include "esp_err.h"
@@ -73,7 +74,7 @@ static can_master_bus_stats_t s_bus_stats = {0};
 static SemaphoreHandle_t s_scan_lock = NULL;
 static bool s_scan_in_progress = false;
 static size_t s_scan_new_nodes = 0;
-static esp_timer_handle_t s_scan_timer = NULL;
+static TimerHandle_t s_scan_timer = NULL;
 
 static SemaphoreHandle_t state_lock_get(void);
 static SemaphoreHandle_t scan_lock_get(void);
@@ -97,7 +98,7 @@ static void can_master_notify_io_state(uint8_t node_id,
                                        uint64_t timestamp_ms);
 static void can_scan_note_new_node(void);
 static esp_err_t can_master_driver_start_internal(void);
-static void scan_timer_cb(void *arg);
+static void scan_timer_cb(TimerHandle_t timer);
 static twai_timing_config_t can_timing_config(void);
 static void can_master_handle_addr_request(const can_proto_addr_request_t *req);
 static void can_master_handle_parsed(const can_proto_parsed_frame_t *parsed);
@@ -242,9 +243,9 @@ static void can_scan_note_new_node(void)
     xSemaphoreGive(lock);
 }
 
-static void scan_timer_cb(void *arg)
+static void scan_timer_cb(TimerHandle_t timer)
 {
-    (void)arg;
+    (void)timer;
     size_t discovered = 0;
     SemaphoreHandle_t lock = scan_lock_get();
     if (lock) {
@@ -262,6 +263,22 @@ static void scan_timer_cb(void *arg)
         cJSON_AddNumberToObject(evt, "new_nodes", (double)discovered);
         web_server_ws_broadcast_event("scan_completed", evt);
     }
+}
+
+static esp_err_t ensure_scan_timer(void)
+{
+    if (s_scan_timer) {
+        return ESP_OK;
+    }
+
+    const TickType_t timer_period = pdMS_TO_TICKS(CAN_SCAN_WINDOW_US / 1000ULL);
+    s_scan_timer = xTimerCreate("can_scan", timer_period, pdFALSE, NULL, scan_timer_cb);
+    if (!s_scan_timer) {
+        ESP_LOGE(TAG, "xTimerCreate(can_scan) failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
 }
 
 static void can_master_notify_online(uint8_t node_id, bool is_new, uint64_t now_ms)
@@ -1034,24 +1051,15 @@ esp_err_t can_master_request_scan(bool *started)
     s_scan_new_nodes = 0;
     xSemaphoreGive(lock);
 
-    if (!s_scan_timer) {
-        const esp_timer_create_args_t args = {
-            .callback = scan_timer_cb,
-            .arg = NULL,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "can_scan",
-        };
-        err = esp_timer_create(&args, &s_scan_timer);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_timer_create failed: %s", esp_err_to_name(err));
-            xSemaphoreTake(lock, portMAX_DELAY);
-            s_scan_in_progress = false;
-            xSemaphoreGive(lock);
-            if (started) {
-                *started = false;
-            }
-            return err;
+    err = ensure_scan_timer();
+    if (err != ESP_OK) {
+        xSemaphoreTake(lock, portMAX_DELAY);
+        s_scan_in_progress = false;
+        xSemaphoreGive(lock);
+        if (started) {
+            *started = false;
         }
+        return err;
     }
 
     can_proto_frame_t frame = {0};
@@ -1083,16 +1091,19 @@ esp_err_t can_master_request_scan(bool *started)
         web_server_ws_broadcast_event("scan_started", evt);
     }
 
-    err = esp_timer_start_once(s_scan_timer, CAN_SCAN_WINDOW_US);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "esp_timer_start_once failed: %s", esp_err_to_name(err));
+    if (xTimerStop(s_scan_timer, portMAX_DELAY) != pdPASS) {
+        ESP_LOGW(TAG, "xTimerStop(can_scan) failed");
+    }
+
+    if (xTimerStart(s_scan_timer, portMAX_DELAY) != pdPASS) {
+        ESP_LOGW(TAG, "xTimerStart(can_scan) failed");
         xSemaphoreTake(lock, portMAX_DELAY);
         s_scan_in_progress = false;
         xSemaphoreGive(lock);
         if (started) {
             *started = false;
         }
-        return err;
+        return ESP_FAIL;
     }
 
     if (started) {
