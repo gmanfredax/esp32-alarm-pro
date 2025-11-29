@@ -49,6 +49,11 @@
 #define EXP_HEARTBEAT_PERIOD_MS  1000ULL  // ext heartbeat ogni 1s
 #define EXP_SAMPLE_PERIOD_MS      100ULL  // campionamento zone ogni 100ms
 
+#define EXP_TASK_STACK_RX     (4096)
+#define EXP_TASK_STACK_LOGIC  (4096)
+#define EXP_TASK_PRIO_RX      (tskIDLE_PRIORITY + 4)
+#define EXP_TASK_PRIO_LOGIC   (tskIDLE_PRIORITY + 3)
+
 // ADC
 #define EXP_ADC_MAX_UNITS      2
 #define ADC_MAX_RAW            4095.0f
@@ -152,6 +157,8 @@ static zone_eol_mode_t s_global_eol_mode = ZONE_EOL_MODE_2;
 static uint64_t s_last_addr_req_ms  = 0;
 static uint64_t s_last_hb_ms        = 0;
 static uint64_t s_last_sample_ms    = 0;
+static uint8_t  s_change_counter    = 0;
+static uint32_t s_outputs_bitmap    = 0;
 
 // -----------------------------------------------------------------------------
 // Helper tempo
@@ -573,7 +580,7 @@ static esp_err_t can_start(void)
     g_config.tx_queue_len   = 32;
 
     // bitrate 125k di default (puoi cambiare in TWAI_TIMING_CONFIG_250KBITS)
-    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_125KBITS();
+    twai_timing_config_t t_config = TWAI_TIMING_CONFIG_250KBITS();
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
     ESP_RETURN_ON_ERROR(twai_driver_install(&g_config, &t_config, &f_config),
@@ -650,4 +657,460 @@ static void send_addr_request(void)
 
 static void send_info(void)
 {
+    if (!s_node_id_valid || s_node_id == 0) {
+        return;
+    }
+
+    can_proto_info_t info = {
+        .msg_type      = CAN_PROTO_MSG_INFO,
+        .protocol      = CAN_PROTO_PROTOCOL_VERSION,
+        .model         = EXP_NODE_MODEL_ID,
+        .firmware      = EXP_NODE_FW_VERSION,
+        .inputs_count  = EXP_NODE_ZONE_COUNT,
+        .outputs_count = EXP_NODE_OUTPUT_COUNT,
+    };
+
+    can_proto_frame_t frame = {0};
+    if (!can_proto_build_info(s_node_id, &info, &frame)) {
+        ESP_LOGW(TAG, "can_proto_build_info fallita");
+        return;
+    }
+    (void)can_send_frame(&frame);
+}
+
+static void send_scan_response(void)
+{
+    if (!s_node_id_valid || s_node_id == 0) {
+        return;
+    }
+
+    can_proto_frame_t frame = {0};
+    if (!can_proto_build_scan_response(s_node_id, &frame)) {
+        ESP_LOGW(TAG, "can_proto_build_scan_response fallita");
+        return;
+    }
+    (void)can_send_frame(&frame);
+}
+
+static void send_heartbeat(void)
+{
+    if (!s_node_id_valid || s_node_id == 0) {
+        return;
+    }
+
+    can_proto_heartbeat_t hb = {
+        .msg_type      = CAN_PROTO_MSG_HEARTBEAT,
+        .node_state    = 0,
+        .change_counter = s_change_counter,
+        .reserved      = 0,
+        .inputs_bitmap = 0,
+    };
+
+    can_proto_frame_t frame = {0};
+    if (!can_proto_build_heartbeat(s_node_id, &hb, &frame)) {
+        ESP_LOGW(TAG, "can_proto_build_heartbeat fallita");
+        return;
+    }
+    (void)can_send_frame(&frame);
+}
+
+static uint8_t compute_zone_state_bits(int zone_idx, const zone_sample_t *smp)
+{
+    if (!smp || zone_idx < 0 || zone_idx >= EXP_NODE_ZONE_COUNT) {
+        return 0;
+    }
+
+    const zone_config_t *cfg = &s_zone_cfg[zone_idx];
+    const zone_eol_thresholds_t *thr = &s_eol_thresholds;
+
+    uint8_t bits = 0;
+    if (cfg->enabled) {
+        bits |= CAN_PROTO_ZONE_EVENT_STATE_PRESENT;
+    }
+    if (cfg->contact_is_no) {
+        bits |= CAN_PROTO_ZONE_EVENT_STATE_CONTACT_NO;
+    }
+
+    switch (smp->state) {
+    case ZONE_INPUT_STATE_ALARM:
+        bits |= CAN_PROTO_ZONE_EVENT_STATE_ALARM;
+        break;
+    case ZONE_INPUT_STATE_TAMPER:
+    case ZONE_INPUT_STATE_MASKING:
+        bits |= CAN_PROTO_ZONE_EVENT_STATE_TAMPER;
+        break;
+    case ZONE_INPUT_STATE_FAULT:
+    case ZONE_INPUT_STATE_NORMAL:
+    default:
+        break;
+    }
+
+    // Heuristica short/open basata sul rapporto EOL
+    float r = smp->ratio;
+    switch (cfg->eol_mode) {
+    case ZONE_EOL_MODE_1:
+        if (r < thr->eol1_fault_max) {
+            bits |= CAN_PROTO_ZONE_EVENT_STATE_OPEN;
+        }
+        break;
+    case ZONE_EOL_MODE_2:
+        if (r < thr->eol2_tamper_low_max) {
+            bits |= CAN_PROTO_ZONE_EVENT_STATE_SHORT;
+        } else if (r > thr->eol2_alarm_max) {
+            bits |= CAN_PROTO_ZONE_EVENT_STATE_OPEN;
+        }
+        break;
+    case ZONE_EOL_MODE_3:
+    default:
+        if (r < thr->eol3_tamper_low_max) {
+            bits |= CAN_PROTO_ZONE_EVENT_STATE_SHORT;
+        } else if (r > thr->eol3_alarm_max) {
+            bits |= CAN_PROTO_ZONE_EVENT_STATE_OPEN;
+        }
+        break;
+    }
+
+    return bits;
+}
+
+static uint16_t estimate_rloop_ohm_div100(int zone_idx, float ratio)
+{
+    if (ratio <= 0.0f) {
+        return 0;
+    }
+
+    const zone_config_t *cfg = &s_zone_cfg[zone_idx];
+    float base = (float)cfg->r_normal_ohm;
+    float add  = (float)cfg->r_alarm_ohm;
+    float est  = base + add * ratio;
+    if (est < 0.0f) {
+        est = 0.0f;
+    }
+    if (est > 65535.0f * 100.0f) {
+        est = 65535.0f * 100.0f;
+    }
+    return (uint16_t)(est / 100.0f);
+}
+
+static void send_zone_event(int zone_idx)
+{
+    if (!s_node_id_valid || s_node_id == 0) {
+        return;
+    }
+    if (zone_idx < 0 || zone_idx >= EXP_NODE_ZONE_COUNT) {
+        return;
+    }
+
+    const zone_sample_t *smp = &s_zone_samples[zone_idx];
+    uint8_t state_bits       = compute_zone_state_bits(zone_idx, smp);
+
+    uint16_t raw_adc = (uint16_t)(clamp_ratio(smp->ratio) * ADC_MAX_RAW);
+    uint16_t rloop   = estimate_rloop_ohm_div100(zone_idx, smp->ratio);
+
+    can_proto_zone_event_t evt = {
+        .zone_id         = (uint8_t)zone_idx,
+        .state_bits      = state_bits,
+        .raw_adc         = raw_adc,
+        .rloop_ohm_div100 = rloop,
+        .vbias_10mv      = 330 / 10,
+        .seq             = s_zone_seq[zone_idx],
+    };
+
+    can_proto_frame_t frame = {
+        .cob_id = CAN_PROTO_ID_EXT_ZONE_EVENT(s_node_id),
+        .dlc    = sizeof(evt),
+    };
+    memcpy(frame.data, &evt, sizeof(evt));
+    (void)can_send_frame(&frame);
+}
+
+static void send_ext_heartbeat(void)
+{
+    if (!s_node_id_valid || s_node_id == 0) {
+        return;
+    }
+
+    uint8_t alarm_bm  = 0;
+    uint8_t short_bm  = 0;
+    uint8_t open_bm   = 0;
+    uint8_t tamper_bm = 0;
+
+    for (int i = 0; i < EXP_NODE_ZONE_COUNT && i < 8; ++i) {
+        const zone_sample_t *smp = &s_zone_samples[i];
+        uint8_t bits = compute_zone_state_bits(i, smp);
+        if (bits & CAN_PROTO_ZONE_EVENT_STATE_ALARM) {
+            alarm_bm |= (1u << i);
+        }
+        if (bits & CAN_PROTO_ZONE_EVENT_STATE_SHORT) {
+            short_bm |= (1u << i);
+        }
+        if (bits & CAN_PROTO_ZONE_EVENT_STATE_OPEN) {
+            open_bm |= (1u << i);
+        }
+        if (bits & CAN_PROTO_ZONE_EVENT_STATE_TAMPER) {
+            tamper_bm |= (1u << i);
+        }
+    }
+
+    can_proto_ext_heartbeat_t hb = {
+        .alarm_bitmap       = alarm_bm,
+        .short_bitmap       = short_bm,
+        .open_bitmap        = open_bm,
+        .tamper_bitmap      = tamper_bm,
+        .vdda_100mv         = 33,
+        .vbias_10mv         = 33,
+        .temperature_c_plus40 = 40,
+        .fw_nibbles         = (uint8_t)(EXP_NODE_FW_VERSION & 0xFFu),
+    };
+
+    can_proto_frame_t frame = {
+        .cob_id = CAN_PROTO_ID_EXT_HEARTBEAT(s_node_id),
+        .dlc    = sizeof(hb),
+    };
+    memcpy(frame.data, &hb, sizeof(hb));
+    (void)can_send_frame(&frame);
+}
+
+// -----------------------------------------------------------------------------
+// Gestione comandi CAN
+// -----------------------------------------------------------------------------
+
+static void handle_output_cmd(const can_proto_output_cmd_t *cmd)
+{
+    if (!cmd) {
+        return;
+    }
+    s_outputs_bitmap = cmd->outputs_bitmap;
+    hw_set_outputs(s_outputs_bitmap);
+}
+
+static void handle_identify_cmd(const can_proto_identify_cmd_t *cmd)
+{
+    if (!cmd) {
+        return;
+    }
+    s_identify_enabled = (cmd->enable != 0);
+}
+
+static void handle_zone_config(const can_proto_zone_config_t *cfg)
+{
+    if (!cfg || cfg->zone_index >= EXP_NODE_ZONE_COUNT) {
+        return;
+    }
+
+    if (!CAN_ZONE_MEASURE_MODE_IS_VALID(cfg->measure_mode)) {
+        return;
+    }
+
+    zone_config_t *dst = &s_zone_cfg[cfg->zone_index];
+    dst->enabled      = true;
+    dst->eol_mode     = (zone_eol_mode_t)cfg->measure_mode;
+    dst->contact_is_no = (cfg->contact_flags & CAN_ZONE_CONTACT_FLAG_IS_NO) != 0;
+    dst->r_normal_ohm = cfg->r_normal_ohm;
+    dst->r_alarm_ohm  = cfg->r_alarm_ohm;
+
+    s_global_eol_mode = dst->eol_mode;
+}
+
+static void handle_addr_assign(const can_proto_addr_assign_t *assign)
+{
+    if (!assign) {
+        return;
+    }
+
+    if (memcmp(assign->uid, s_uid, sizeof(s_uid)) != 0) {
+        ESP_LOGD(TAG, "Addr assign non per noi");
+        return;
+    }
+
+    if (assign->node_id == 0 || assign->node_id > CAN_PROTO_MAX_NODE_ID) {
+        ESP_LOGW(TAG, "Addr assign invalido: %u", (unsigned)assign->node_id);
+        return;
+    }
+
+    s_node_id       = assign->node_id;
+    s_node_id_valid = true;
+    (void)nvs_save_node_id(s_node_id);
+    ESP_LOGI(TAG, "Node ID assegnato: %u", (unsigned)s_node_id);
+    send_info();
+}
+
+static void handle_parsed_frame(const can_proto_parsed_frame_t *parsed)
+{
+    if (!parsed) {
+        return;
+    }
+
+    switch (parsed->kind) {
+    case CAN_PROTO_FRAME_OUTPUT_COMMAND:
+        handle_output_cmd(&parsed->payload.output_cmd);
+        break;
+    case CAN_PROTO_FRAME_IDENTIFY_CMD:
+        handle_identify_cmd(&parsed->payload.identify);
+        break;
+    case CAN_PROTO_FRAME_ZONE_CONFIG:
+        handle_zone_config(&parsed->payload.zone_config);
+        break;
+    case CAN_PROTO_FRAME_SCAN_REQUEST:
+        send_scan_response();
+        break;
+    case CAN_PROTO_FRAME_ADDR_ASSIGN:
+        handle_addr_assign(&parsed->payload.addr_assign);
+        break;
+    case CAN_PROTO_FRAME_TEST_TOGGLE:
+        // per ora nessuna azione specifica
+        break;
+    default:
+        break;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Task FreeRTOS
+// -----------------------------------------------------------------------------
+
+static void can_rx_task(void *arg)
+{
+    (void)arg;
+    twai_message_t msg;
+    can_proto_frame_t frame;
+    can_proto_parsed_frame_t parsed;
+
+    while (1) {
+        esp_err_t err = twai_receive(&msg, portMAX_DELAY);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "twai_receive: %s", esp_err_to_name(err));
+            continue;
+        }
+
+        if (!twai_to_proto(&msg, &frame)) {
+            continue;
+        }
+        if (!can_proto_parse(&frame, &parsed)) {
+            continue;
+        }
+        handle_parsed_frame(&parsed);
+    }
+}
+
+static void logic_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        const uint64_t now = now_ms();
+
+        // Se non abbiamo node_id valido, continuiamo a fare address request
+        if (!s_node_id_valid && (now - s_last_addr_req_ms) >= EXP_ADDR_REQ_PERIOD_MS) {
+            send_addr_request();
+            s_last_addr_req_ms = now;
+        }
+
+        // Campiona le zone
+        if ((now - s_last_sample_ms) >= EXP_SAMPLE_PERIOD_MS) {
+            zones_sample_all();
+            for (int i = 0; i < EXP_NODE_ZONE_COUNT; ++i) {
+                uint8_t bits = compute_zone_state_bits(i, &s_zone_samples[i]);
+                if (bits != s_zone_last_state_bits[i]) {
+                    s_zone_last_state_bits[i] = bits;
+                    s_zone_seq[i]++;
+                    s_change_counter++;
+                    send_zone_event(i);
+                }
+            }
+            s_last_sample_ms = now;
+        }
+
+        // Heartbeat esteso + standard
+        if (s_node_id_valid && (now - s_last_hb_ms) >= EXP_HEARTBEAT_PERIOD_MS) {
+            send_ext_heartbeat();
+            send_heartbeat();
+            s_last_hb_ms = now;
+        }
+
+        // Aggiorna LED e uscite identify
+        hw_update_leds(now);
+
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
+// -----------------------------------------------------------------------------
+// API pubblica
+// -----------------------------------------------------------------------------
+
+static void apply_default_zone_config(void)
+{
+    for (int i = 0; i < EXP_NODE_ZONE_COUNT; ++i) {
+        s_zone_cfg[i].enabled       = true;
+        s_zone_cfg[i].eol_mode      = s_global_eol_mode;
+        s_zone_cfg[i].contact_is_no = false;
+        s_zone_cfg[i].r_normal_ohm  = 5600;
+        s_zone_cfg[i].r_alarm_ohm   = 2200;
+
+        s_zone_samples[i].raw_mv = 0;
+        s_zone_samples[i].ratio  = 0.0f;
+        s_zone_samples[i].state  = ZONE_INPUT_STATE_FAULT;
+        s_zone_seq[i]            = 0;
+        s_zone_last_state_bits[i] = 0;
+    }
+}
+
+esp_err_t expansion_node_init(void)
+{
+    memset(s_zone_entries, 0, sizeof(s_zone_entries));
+    memset(s_zone_cfg, 0, sizeof(s_zone_cfg));
+    memset(s_zone_samples, 0, sizeof(s_zone_samples));
+
+    fill_uid_from_mac(s_uid);
+
+    s_state_mutex = xSemaphoreCreateMutex();
+    if (!s_state_mutex) {
+        ESP_LOGE(TAG, "Impossibile creare mutex stato");
+        return ESP_ERR_NO_MEM;
+    }
+
+    apply_default_zone_config();
+    hw_init_outputs_and_leds();
+    hw_set_outputs(0);
+
+    ESP_RETURN_ON_ERROR(zones_adc_init(), TAG, "zones_adc_init");
+
+    uint8_t stored_id = 0;
+    if (nvs_load_node_id(&stored_id) == ESP_OK) {
+        s_node_id       = stored_id;
+        s_node_id_valid = true;
+        ESP_LOGI(TAG, "Node ID caricato da NVS: %u", (unsigned)stored_id);
+    }
+
+    ESP_RETURN_ON_ERROR(can_start(), TAG, "can_start");
+
+    if (s_node_id_valid) {
+        send_info();
+    }
+
+    return ESP_OK;
+}
+
+esp_err_t expansion_node_start_tasks(void)
+{
+    BaseType_t ok;
+
+    if (!s_can_started) {
+        ESP_RETURN_ON_ERROR(can_start(), TAG, "can_start");
+    }
+
+    ok = xTaskCreate(can_rx_task, "exp_can_rx", EXP_TASK_STACK_RX, NULL, EXP_TASK_PRIO_RX, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Impossibile creare can_rx_task (%ld)", (long)ok);
+        return ESP_ERR_NO_MEM;
+    }
+
+    ok = xTaskCreate(logic_task, "exp_logic", EXP_TASK_STACK_LOGIC, NULL, EXP_TASK_PRIO_LOGIC, NULL);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Impossibile creare logic_task (%ld)", (long)ok);
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
 }
