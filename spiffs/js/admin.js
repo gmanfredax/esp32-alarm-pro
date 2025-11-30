@@ -129,6 +129,7 @@
     error: "",
     lastScan: null,
   };
+  const pendingState = { items: [] };
   const CAN_MAX_NODE_ID = 127;
   const CAN_NODE_LABEL_MAX = 31;
 
@@ -530,6 +531,32 @@
     return cleaned.replace(/(.{2})/g, "$1 ").trim();
   }
 
+  function renderPendingBanner(list){
+    const banner = $("#pendingNodeBanner");
+    const textEl = banner?.querySelector(".pending-text");
+    const btn = $("#pendingNodeAction");
+    const items = Array.isArray(list) ? list : [];
+    if (!banner || !btn || !isAdmin || items.length === 0) {
+      if (banner) banner.classList.add("hidden");
+      return;
+    }
+
+    const count = items.length;
+    const label = count === 1
+      ? "Nuovo nodo CAN rilevato: completa l'associazione."
+      : `${count} nodi CAN rilevati: completa le associazioni.`;
+    if (textEl) textEl.textContent = label;
+    btn.textContent = count === 1 ? "Associa ora" : "Gestisci nodi";
+    btn.onclick = () => {
+      if (items.length === 1) {
+        showPendingAssociationModal(items[0]);
+      } else {
+        showPendingListModal(items);
+      }
+    };
+    banner.classList.remove("hidden");
+  }
+
   const WALL_TIME_MIN_MS = Date.UTC(2000, 0, 1);
 
   function coerceTimestampMs(value){
@@ -636,6 +663,8 @@
     if (scanBtn) scanBtn.disabled = disableActions;
     const refreshBtn = $("#adminExpansionRefreshBtn");
     if (refreshBtn) refreshBtn.disabled = disableActions;
+    const resetBtn = $("#adminRosterResetBtn");
+    if (resetBtn) resetBtn.disabled = disableActions;
   }
 
   function setTelemetryValue(key, value, { warn = false } = {}){
@@ -962,6 +991,28 @@
     }
   }
 
+  async function loadPendingNodesBanner({ silent = false } = {}){
+    if (!isAdmin) {
+      pendingState.items = [];
+      renderPendingBanner([]);
+      return [];
+    }
+    try {
+      const pending = await apiGet("/api/can/pending");
+      const list = Array.isArray(pending) ? pending : [];
+      pendingState.items = list;
+      renderPendingBanner(list);
+      return list;
+    } catch (err) {
+      pendingState.items = [];
+      renderPendingBanner([]);
+      if (!silent) {
+        toast(err?.message || "Impossibile recuperare i nodi in attesa", false);
+      }
+      return [];
+    }
+  }
+
   async function scanExpansionBus(){
     if (expansionsState.loading) return;
     expansionsState.loading = true;
@@ -978,6 +1029,42 @@
       return;
     }
     await loadExpansionNodes();
+  }
+
+    async function resetExpansionRoster(){
+      if (expansionsState.loading) return;
+      expansionsState.loading = true;
+      expansionsState.error = "";
+      renderExpansionsSection();
+      try {
+        const resp = await apiPost("/api/can/roster/reset", {});
+        const scanAutoStarted = resp && resp.scan_started === true;
+        toast("Roster CAN reimpostato");
+        closeModal();
+
+        try {
+          // Dopo il reset forziamo una scansione solo per aggiornare la vista:
+          // la logica di gestione zone/uscite lato firmware resta attiva
+          // anche senza questo passaggio.
+          const scanResp = await apiPost("/api/can/scan", {});
+          const started = typeof scanResp?.started === "boolean" ? scanResp.started : true;
+          if (!scanAutoStarted && started) {
+            toast("Scansione CAN avviata");
+          }
+      } catch (scanErr){
+        const scanMsg = scanErr?.message || "Impossibile avviare la scansione del bus CAN.";
+        expansionsState.error = scanMsg;
+        toast(`Nodo CAN: ${scanMsg}`, false);
+      }
+
+      await loadExpansionNodes();
+    } catch(err){
+      expansionsState.loading = false;
+      const message = err?.message || "Impossibile reimpostare il roster CAN.";
+      expansionsState.error = message;
+      renderExpansionsSection();
+      toast(`Nodo CAN: ${message}`, false);
+    }
   }
 
     async function updateExpansionLabel(nodeId, nextLabel, options = {}){
@@ -1172,6 +1259,122 @@
     }
   }
 
+  function showPendingListModal(list){
+    if (!Array.isArray(list) || list.length === 0) return;
+    const rows = list.map((item) => {
+      const uidDisplay = formatUid(item.uid);
+      const suggested = Number(item?.suggested_id);
+      const lastSeen = item?.last_seen_ms ? formatDateTime(item.last_seen_ms) : "—";
+      const uidKey = escapeHtml((item?.uid || "").toString());
+      const suggestedLabel = Number.isFinite(suggested) && suggested > 0 ? suggested : "—";
+      return `<tr data-uid="${uidKey}"><td>${escapeHtml(uidDisplay)}</td><td>${suggestedLabel}</td><td>${escapeHtml(lastSeen)}</td><td><button class="btn small primary" type="button" data-act="associate" data-uid="${uidKey}">Associa</button></td></tr>`;
+    }).join("");
+
+    modal(`
+      <div class="card-head" style="display:flex;align-items:center;justify-content:space-between;gap:.5rem">
+        <h3>Nodi CAN in attesa</h3>
+        <button class="btn" type="button" data-act="close">Chiudi</button>
+      </div>
+      <div class="table-wrap" style="margin-top:.5rem">
+        <table class="table">
+          <thead><tr><th>UID</th><th>ID suggerito</th><th>Ultima richiesta</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    `);
+
+    const btns = document.querySelectorAll('[data-act="associate"]');
+    btns.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const uidKey = btn.getAttribute('data-uid');
+        const match = list.find((item) => (item?.uid || '').toString().toUpperCase() === uidKey.toUpperCase());
+        if (match) {
+          closeModal();
+          showPendingAssociationModal(match);
+        }
+      });
+    });
+    document.querySelector('[data-act="close"]')?.addEventListener('click', () => closeModal());
+  }
+
+  function showPendingAssociationModal(pending){
+    if (!pending) return;
+    const uidDisplay = formatUid(pending.uid);
+    const suggested = Number(pending?.suggested_id);
+    const defaultId = Number.isFinite(suggested) && suggested > 0 ? suggested : '';
+    const lastSeen = pending?.last_seen_ms ? formatDateTime(pending.last_seen_ms) : '';
+
+    modal(`
+      <div class="card-head row" style="justify-content:space-between;align-items:center;gap:.5rem">
+        <h3>Associa nodo CAN</h3>
+        <button class="btn" id="mClose">Chiudi</button>
+      </div>
+      <div class="form" style="padding-bottom:.5rem">
+        <p class="muted">UID: <strong>${escapeHtml(uidDisplay)}</strong>${lastSeen ? ` — Ultima richiesta: ${escapeHtml(lastSeen)}` : ''}</p>
+        <form id="pendingAssignForm" class="form" style="margin:1rem 0;">
+          <label class="field" style="width:100%;max-width:220px;">
+            <span>ID da assegnare</span>
+            <input id="pendingAssignId" type="number" min="1" max="${CAN_MAX_NODE_ID}" required value="${defaultId}">
+          </label>
+          <p class="muted small" style="margin-top:.4rem">Suggerito: primo ID libero.</p>
+          <div id="pendingAssignMsg" class="muted hidden" style="margin-top:.4rem"></div>
+        </form>
+        <div class="row" style="gap:.5rem;flex-wrap:wrap;justify-content:flex-end">
+          <button class="btn secondary" type="button" data-act="skip">Più tardi</button>
+          <button class="btn primary" type="submit" form="pendingAssignForm" data-act="submit">Associa nodo</button>
+        </div>
+      </div>
+    `);
+
+    const form = $("#pendingAssignForm");
+    const input = $("#pendingAssignId");
+    const msg = $("#pendingAssignMsg");
+    const skipBtn = document.querySelector('[data-act="skip"]');
+    const submitBtn = document.querySelector('[data-act="submit"]');
+    $("#mClose")?.addEventListener("click", () => closeModal());
+
+    const setMessage = (text, tone = 'muted') => {
+      if (!msg) return;
+      if (!text) {
+        msg.classList.add('hidden');
+        msg.textContent = '';
+        msg.style.color = '';
+        return;
+      }
+      msg.textContent = text;
+      msg.classList.remove('hidden');
+      msg.style.color = tone === 'error' ? '#f87171' : '';
+    };
+
+    form?.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const chosen = Number.parseInt(input?.value ?? '', 10);
+      if (!Number.isFinite(chosen) || chosen < 1 || chosen > CAN_MAX_NODE_ID) {
+        setMessage(`Inserisci un ID tra 1 e ${CAN_MAX_NODE_ID}.`, 'error');
+        return;
+      }
+      submitBtn?.setAttribute('disabled', 'disabled');
+      skipBtn?.setAttribute('disabled', 'disabled');
+      setMessage('Associazione in corso…', 'muted');
+      try {
+        const payload = { uid: pending.uid, node_id: chosen };
+        const resp = await apiPost('/api/can/pending/assign', payload);
+        const finalId = Number.isFinite(Number(resp?.node_id)) ? Number(resp.node_id) : chosen;
+        toast(`Nodo CAN associato all'ID ${finalId}`);
+        closeModal();
+        await Promise.all([loadPendingNodesBanner({ silent: true }), loadExpansionNodes()]);
+      } catch (err) {
+        const text = err?.message || 'Impossibile associare il nodo CAN.';
+        setMessage(text, 'error');
+      } finally {
+        submitBtn?.removeAttribute('disabled');
+        skipBtn?.removeAttribute('disabled');
+      }
+    });
+
+    skipBtn?.addEventListener('click', () => closeModal());
+  }
+
   async function assignExpansionNode(nodeId, newId){
     if (!Number.isFinite(nodeId) || nodeId <= 0){
       toast("Operazione non valida", false);
@@ -1209,6 +1412,34 @@
     }
   }
 
+  function openRosterResetModal(){
+    modal(`
+      <div class="card-head row" style="justify-content:space-between;align-items:center">
+        <h3>Reimposta roster CAN</h3>
+        <button class="btn" id="mClose">Chiudi</button>
+      </div>
+      <div class="form" style="padding-bottom:.5rem">
+        <p class="muted">Cancella tutte le associazioni UID↔ID e i nomi delle schede salvati in memoria. I nodi torneranno con etichette predefinite dopo la prossima scansione.</p>
+        <div class="row" style="gap:.5rem;flex-wrap:wrap;margin-top:.75rem;justify-content:flex-end">
+          <button class="btn outline" type="button" id="rosterResetCancel">Annulla</button>
+          <button class="btn btn-danger" type="button" id="rosterResetConfirm">Sì, reimposta</button>
+        </div>
+      </div>
+    `);
+    const closeBtn = $("#mClose");
+    if (closeBtn){
+      closeBtn.addEventListener("click", closeModal);
+    }
+    const cancelBtn = $("#rosterResetCancel");
+    if (cancelBtn){
+      cancelBtn.addEventListener("click", closeModal);
+    }
+    const confirmBtn = $("#rosterResetConfirm");
+    if (confirmBtn){
+      confirmBtn.addEventListener("click", () => { resetExpansionRoster(); });
+    }
+  }
+
   async function setupExpansionsSection(){
     const scanBtn = $("#adminExpansionScanBtn");
     if (scanBtn){
@@ -1217,6 +1448,10 @@
     const refreshBtn = $("#adminExpansionRefreshBtn");
     if (refreshBtn){
       refreshBtn.addEventListener("click", () => { loadExpansionNodes(); });
+    }
+    const resetBtn = $("#adminRosterResetBtn");
+    if (resetBtn){
+      resetBtn.addEventListener("click", openRosterResetModal);
     }
     const list = $("#adminExpansionList");
     if (list){
@@ -2149,6 +2384,7 @@
       location.href = "/index.html";
     });
     if (!(await ensureAdmin())) return;     // ora è un no-op che sblocca la UI
+    loadPendingNodesBanner({ silent: true });
     attachNewUser();
 //    await Promise.all([loadUsers(), loadNetwork(), loadMqtt()]);
     await Promise.all([loadUsers(), ...setupPromises]);

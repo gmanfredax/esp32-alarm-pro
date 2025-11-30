@@ -29,6 +29,7 @@ typedef struct {
     uint8_t inputs_count;
     uint8_t outputs_count;
     uint32_t inputs_bitmap;
+    uint32_t tamper_bitmap;
     uint32_t outputs_bitmap;
     uint8_t change_counter;
     uint8_t node_state_flags;
@@ -40,6 +41,7 @@ typedef struct {
     bool identify_active;
     bool info_valid;
     bool inputs_valid;
+    bool tamper_valid;
     bool outputs_valid;
 } roster_node_t;
 
@@ -60,6 +62,8 @@ typedef struct {
     roster_node_state_t state;
     bool inputs_valid;
     uint32_t inputs_bitmap;
+    bool tamper_valid;
+    uint32_t tamper_bitmap;
     uint8_t change_counter;
     uint8_t node_state_flags;
     bool outputs_valid;
@@ -74,11 +78,16 @@ typedef struct {
     uint8_t outputs_count;
     bool inputs_valid;
     uint32_t inputs_bitmap;
+    bool tamper_valid;
+    uint32_t tamper_bitmap;
     roster_node_state_t state;
 } roster_node_inputs_t;
 
+typedef bool (*roster_uid_iter_cb)(uint8_t node_id, const uint8_t uid[8], uint64_t associated_at_ms, void *ctx);
+
 void roster_init(uint8_t master_inputs, uint8_t master_outputs, uint16_t master_caps);
 esp_err_t roster_reset(void);
+bool roster_uid_map_foreach(roster_uid_iter_cb cb, void *ctx);
 
 esp_err_t roster_update_node(uint8_t node_id, const roster_node_info_t *info, bool *out_is_new);
 esp_err_t roster_mark_online(uint8_t node_id, uint64_t now_ms, bool *out_is_new);
@@ -87,13 +96,21 @@ esp_err_t roster_forget_node(uint8_t node_id);
 esp_err_t roster_set_identify(uint8_t node_id, bool active, bool *out_changed);
 bool roster_get_identify(uint8_t node_id, bool *out_active);
 bool roster_node_exists(uint8_t node_id);
+bool roster_node_known_or_mapped(uint8_t node_id);
 const roster_node_t *roster_get_node(uint8_t node_id);
 bool roster_get_node_snapshot(uint8_t node_id, roster_node_t *out_snapshot);
+esp_err_t roster_resolve_node_id_from_uid(const uint8_t *uid,
+                                          size_t uid_len,
+                                          uint8_t *out_node_id,
+                                          bool *out_is_new);
 esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uint8_t *out_node_id, bool *out_is_new);
 esp_err_t roster_note_inputs(uint8_t node_id,
                              uint32_t inputs_bitmap,
                              uint8_t change_counter,
                              uint8_t node_state_flags);
+esp_err_t roster_note_ext_inputs(uint8_t node_id,
+                                 uint32_t alarm_bitmap,
+                                 uint32_t tamper_bitmap);
 esp_err_t roster_note_outputs(uint8_t node_id,
                               uint32_t outputs_bitmap,
                               uint8_t flags,
@@ -102,6 +119,14 @@ esp_err_t roster_note_outputs(uint8_t node_id,
 bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state);
 esp_err_t roster_reassign_node_id(uint8_t current_id, uint8_t new_id);
 esp_err_t roster_set_node_label(uint8_t node_id, const char *label);
+esp_err_t roster_note_pending_uid(const uint8_t *uid, size_t uid_len, uint64_t seen_ms);
+size_t roster_pending_to_json(cJSON *out_array);
+bool roster_first_available_node_id(uint8_t *out_node_id);
+esp_err_t roster_associate_pending_uid(const uint8_t *uid,
+                                       size_t uid_len,
+                                       uint8_t node_id,
+                                       uint64_t associated_at_ms,
+                                       bool *out_created);
 
 size_t roster_collect_nodes(roster_node_inputs_t *out_nodes, size_t max_nodes);
 uint16_t roster_total_inputs(void);

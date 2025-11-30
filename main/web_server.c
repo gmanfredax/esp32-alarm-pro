@@ -96,9 +96,11 @@ static bool parse_can_node_id(const char *uri, uint8_t *out_node);
 static bool parse_can_node_outputs_uri(const char *uri, uint8_t *out_node);
 static bool parse_can_node_assign_uri(const char *uri, uint8_t *out_node);
 static bool parse_can_node_label_uri(const char *uri, uint8_t *out_node);
+static bool parse_hex_uid(const char *hex, uint8_t *out_uid, size_t out_len);
 static bool web_uri_match(const char *reference_uri,
                           const char *uri_to_match,
                           size_t match_upto);
+static esp_err_t json_bool(httpd_req_t* req, bool v);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONFIG
@@ -125,11 +127,8 @@ typedef enum {
     WEB_TLS_SRC_CUSTOM
 } web_tls_source_t;
 
-static const char builtin_cert_pem[] =
-"";
-
-static const char builtin_key_pem[] =
-"";
+static const char builtin_cert_pem[] = "";
+static const char builtin_key_pem[] = "";
 
 typedef struct {
     uint8_t *dyn_cert;
@@ -690,6 +689,44 @@ static bool parse_can_node_label_uri(const char *uri, uint8_t *out_node)
     return true;
 }
 
+static bool parse_hex_uid(const char *hex, uint8_t *out_uid, size_t out_len)
+{
+    if (!hex || !out_uid || out_len == 0) {
+        return false;
+    }
+
+    size_t written = 0;
+    int high_nibble = -1;
+    for (const char *p = hex; *p; ++p) {
+        char c = *p;
+        if (c == ' ' || c == ':' || c == '-' || c == '\t' || c == '\n' || c == '\r') {
+            continue;
+        }
+        int value = -1;
+        if (c >= '0' && c <= '9') {
+            value = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            value = 10 + (c - 'a');
+        } else if (c >= 'A' && c <= 'F') {
+            value = 10 + (c - 'A');
+        }
+        if (value < 0) {
+            return false;
+        }
+        if (high_nibble < 0) {
+            high_nibble = value;
+            continue;
+        }
+        if (written >= out_len) {
+            return false;
+        }
+        out_uid[written++] = (uint8_t)((high_nibble << 4) | value);
+        high_nibble = -1;
+    }
+
+    return high_nibble < 0 && written == out_len;
+}
+
 static bool parse_can_nodes_uri(const char *uri, uint8_t *out_node)
 {
     const char *prefix = "/api/can/nodes/";
@@ -830,6 +867,28 @@ static esp_err_t api_can_scan_options(httpd_req_t *req)
     return cors_handle_options(req);
 }
 
+static esp_err_t api_can_pending_get(httpd_req_t *req)
+{
+    if (s_provisioned && !check_bearer(req)) {
+        httpd_resp_send_err(req, 401, "token");
+        return ESP_FAIL;
+    }
+    cors_apply(req);
+
+    cJSON *array = cJSON_CreateArray();
+    if (!array) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+        return ESP_FAIL;
+    }
+    roster_pending_to_json(array);
+    return json_reply_cjson(req, array);
+}
+
+static esp_err_t api_can_pending_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+
 static bool can_test_require_admin(httpd_req_t *req)
 {
     if (!check_bearer(req) || !is_admin_user(req)) {
@@ -918,6 +977,68 @@ static esp_err_t api_can_test_toggle_post(httpd_req_t *req)
 }
 
 static esp_err_t api_can_test_toggle_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+
+typedef struct {
+    esp_err_t err;
+    size_t cleared;
+} roster_reset_ctx_t;
+
+static bool roster_reset_unassign_cb(uint8_t node_id, const uint8_t uid[8], uint64_t associated_at_ms, void *ctx)
+{
+    (void)node_id;
+    (void)associated_at_ms;
+    roster_reset_ctx_t *state = (roster_reset_ctx_t *)ctx;
+    if (!state) {
+        return false;
+    }
+
+    esp_err_t can_err = can_master_assign_address(0, uid);
+    if (can_err == ESP_OK) {
+        ++state->cleared;
+        return true;
+    }
+
+    state->err = can_err;
+    return false;
+}
+
+static esp_err_t api_can_roster_reset_post(httpd_req_t *req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    cors_apply(req);
+
+    roster_reset_ctx_t ctx = {.err = ESP_OK, .cleared = 0};
+    bool walked = roster_uid_map_foreach(roster_reset_unassign_cb, &ctx);
+    if (!walked || ctx.err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "can");
+        return ESP_FAIL;
+    }
+
+    esp_err_t reset_err = roster_reset();
+    if (reset_err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "roster");
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+        return ESP_FAIL;
+    }
+
+    cJSON_AddStringToObject(resp, "result", "reset");
+    cJSON_AddNumberToObject(resp, "nodes_cleared", (double)ctx.cleared);
+    return json_reply_cjson(req, resp);
+}
+
+static esp_err_t api_can_roster_reset_options(httpd_req_t *req)
 {
     return cors_handle_options(req);
 }
@@ -1267,6 +1388,110 @@ static esp_err_t api_can_node_assign_post(httpd_req_t *req)
 }
 
 static esp_err_t api_can_node_assign_options(httpd_req_t *req)
+{
+    return cors_handle_options(req);
+}
+
+static esp_err_t api_can_pending_assign_post(httpd_req_t *req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+
+    cors_apply(req);
+
+    char body[192];
+    size_t body_len = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &body_len) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body");
+        return ESP_FAIL;
+    }
+
+    cJSON *json = cJSON_ParseWithLength(body, body_len);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json");
+        return ESP_FAIL;
+    }
+
+    int new_id = -1;
+    cJSON *jid = cJSON_GetObjectItemCaseSensitive(json, "node_id");
+    if (cJSON_IsNumber(jid)) {
+        new_id = (int)jid->valuedouble;
+    } else if (cJSON_IsString(jid) && jid->valuestring) {
+        char *end = NULL;
+        long parsed = strtol(jid->valuestring, &end, 10);
+        if (end && *end == '\0') {
+            new_id = (int)parsed;
+        }
+    }
+
+    cJSON *juid = cJSON_GetObjectItemCaseSensitive(json, "uid");
+    const char *uid_str = cJSON_IsString(juid) ? juid->valuestring : NULL;
+    uint8_t uid[CAN_PROTO_UID_LENGTH];
+    if (!uid_str || !parse_hex_uid(uid_str, uid, sizeof(uid))) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "uid");
+        return ESP_FAIL;
+    }
+
+    if (new_id < 1 || new_id > CAN_MAX_NODE_ID) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "node_id");
+        return ESP_FAIL;
+    }
+
+    if (roster_node_exists((uint8_t)new_id)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, 409, "busy");
+        return ESP_FAIL;
+    }
+
+    uint64_t now_ms = utils_wall_time_ms();
+    if (now_ms == 0) {
+        now_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
+    }
+    bool created = false;
+    esp_err_t assoc_err = roster_associate_pending_uid(uid, sizeof(uid), (uint8_t)new_id, now_ms, &created);
+    if (assoc_err == ESP_ERR_INVALID_STATE) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, 409, "busy");
+        return ESP_FAIL;
+    }
+    if (assoc_err != ESP_OK) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "roster");
+        return ESP_FAIL;
+    }
+
+    esp_err_t can_err = can_master_assign_address((uint8_t)new_id, uid);
+    if (can_err != ESP_OK) {
+        if (created) {
+            (void)roster_forget_node((uint8_t)new_id);
+        }
+        (void)roster_note_pending_uid(uid, sizeof(uid), now_ms);
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "can");
+        return ESP_FAIL;
+    }
+
+    cJSON *resp = roster_node_to_json((uint8_t)new_id);
+    if (!resp) {
+        resp = cJSON_CreateObject();
+        if (resp) {
+            cJSON_AddNumberToObject(resp, "node_id", new_id);
+        }
+    }
+    cJSON_Delete(json);
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json");
+        return ESP_FAIL;
+    }
+
+    return json_reply_cjson(req, resp);
+}
+
+static esp_err_t api_can_pending_assign_options(httpd_req_t *req)
 {
     return cors_handle_options(req);
 }
@@ -3654,11 +3879,12 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
             entry->board = node->node_id;
             entry->board_input = bit;
             entry->board_online = (node->state == ROSTER_NODE_STATE_OPERATIONAL);
-            entry->known = entry->board_online && node->inputs_valid;
-            const bool active = entry->known ? ((node->inputs_bitmap & (1u << bit)) != 0u) : false;
-            entry->state = active ? ZONE_INPUT_STATE_ALARM : ZONE_INPUT_STATE_NORMAL;
+            entry->known = entry->board_online && (node->inputs_valid || node->tamper_valid);
+            const bool active = entry->known && node->inputs_valid && ((node->inputs_bitmap & (1u << bit)) != 0u);
+            const bool tamper = entry->known && node->tamper_valid && ((node->tamper_bitmap & (1u << bit)) != 0u);
+            entry->state = tamper ? ZONE_INPUT_STATE_TAMPER : (active ? ZONE_INPUT_STATE_ALARM : ZONE_INPUT_STATE_NORMAL);
             entry->active = active;
-            entry->tamper = false;
+            entry->tamper = tamper;
             entry->masking = false;
             entry->fault = false;
             entry->analog_ratio = 0.0f;
@@ -5524,6 +5750,12 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/can/nodes",           .method = HTTP_OPTIONS, .handler = api_can_nodes_options },
     { .uri = "/api/can/nodes/*",         .method = HTTP_DELETE,  .handler = api_can_node_delete },
     { .uri = "/api/can/nodes/*",         .method = HTTP_OPTIONS, .handler = api_can_node_delete_options },
+    { .uri = "/api/can/pending",         .method = HTTP_GET,     .handler = api_can_pending_get },
+    { .uri = "/api/can/pending",         .method = HTTP_OPTIONS, .handler = api_can_pending_options },
+    { .uri = "/api/can/pending/assign",  .method = HTTP_POST,    .handler = api_can_pending_assign_post },
+    { .uri = "/api/can/pending/assign",  .method = HTTP_OPTIONS, .handler = api_can_pending_assign_options },
+    { .uri = "/api/can/roster/reset",    .method = HTTP_POST,    .handler = api_can_roster_reset_post },
+    { .uri = "/api/can/roster/reset",    .method = HTTP_OPTIONS, .handler = api_can_roster_reset_options },
     { .uri = "/api/can/scan",            .method = HTTP_POST,    .handler = api_can_scan_post },
     { .uri = "/api/can/scan",            .method = HTTP_OPTIONS, .handler = api_can_scan_options },
     { .uri = "/api/can/test-toggle",           .method = HTTP_POST,    .handler = api_can_test_toggle_post },

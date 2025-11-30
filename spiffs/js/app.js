@@ -27,6 +27,7 @@ const state = {
   zoneStates: [],
   zones: [],
   boards: [],
+  pendingNodes: [],
   scenes: null,
   logs: [],
   logsFrom: null,
@@ -41,6 +42,7 @@ const state = {
 const STATUS_POLL_INTERVAL = 2000;
 const ZONESS_POLL_INTERVAL = 2000;
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const CAN_MAX_NODE_ID = 127;
 let statusPollTimer = null;
 let zonesPollTimer = null;
 let idleTimer = null;
@@ -200,6 +202,8 @@ const scenesCache = {
   pending: null
 };
 
+const pendingNotifiedUids = new Set();
+
 function normalizeBoard(node){
   if (!node) return null;
   const rawId = Number(node?.node_id);
@@ -319,6 +323,13 @@ function formatZoneCount(value){
   return count === 1 ? '1 zona' : `${count} zone`;
 }
 
+function formatUid(value){
+  if (value == null) return '—';
+  const cleaned = String(value).replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+  if (!cleaned) return '—';
+  return cleaned.replace(/(.{2})/g, '$1 ').trim();
+}
+
 function sortBoardIds(a, b){
   if (a === b) return 0;
   if (a === 0) return -1;
@@ -383,6 +394,7 @@ function setActiveTab(name){
   }
   switch (name) {
     case 'status':
+      checkPendingNodes({ prompt: true }).catch((err) => console.warn('pending nodes', err));
       refreshStatus();
       startStatusUpdates();
       break;
@@ -422,6 +434,120 @@ function showNotice(text, type = 'info'){
   el.textContent = text;
   el.classList.remove('hidden');
   el.style.color = type === 'error' ? '#f87171' : '#a5f3fc';
+}
+
+async function loadPendingCanNodes({ silent = false } = {}){
+  if (!state.isAdmin) {
+    state.pendingNodes = [];
+    renderPendingBanner([]);
+    return [];
+  }
+  try {
+    const pending = await apiGet('/api/can/pending');
+    const list = Array.isArray(pending) ? pending : [];
+    state.pendingNodes = list;
+    renderPendingBanner(list);
+    return list;
+  } catch (err) {
+    if (!silent) {
+      console.warn('pending nodes', err);
+      showNotice('Impossibile recuperare i nodi CAN in attesa.', 'error');
+    }
+    renderPendingBanner([]);
+    return [];
+  }
+}
+
+function renderPendingBanner(list){
+  const banner = $('#pendingNodeBanner');
+  const textEl = banner?.querySelector('.pending-text');
+  const btn = $('#pendingNodeAction');
+  const items = Array.isArray(list) ? list : [];
+  if (!banner || !btn || !state.isAdmin || items.length === 0) {
+    if (banner) banner.classList.add('hidden');
+    return;
+  }
+
+  const count = items.length;
+  const label = count === 1
+    ? 'Nuovo nodo CAN rilevato: completa l\'associazione.'
+    : `${count} nodi CAN rilevati: completa le associazioni.`;
+  if (textEl) textEl.textContent = label;
+  btn.textContent = count === 1 ? 'Associa ora' : 'Gestisci nodi';
+  btn.onclick = () => {
+    if (items.length === 1) {
+      showPendingAssociationModal(items[0]);
+    } else {
+      showPendingListModal(items);
+    }
+  };
+  banner.classList.remove('hidden');
+}
+
+async function checkPendingNodes({ prompt = false } = {}){
+  if (!state.isAdmin) {
+    state.pendingNodes = [];
+    renderPendingBanner([]);
+    return;
+  }
+  const list = await loadPendingCanNodes({ silent: !prompt });
+  if (!prompt || !Array.isArray(list) || list.length === 0) {
+    renderPendingBanner(list);
+    return;
+  }
+  const candidate = list.find((item) => {
+    const uidKey = (item?.uid || '').toUpperCase();
+    return uidKey && !pendingNotifiedUids.has(uidKey);
+  }) || list[0];
+  if (!candidate) return;
+  const uidKey = (candidate.uid || '').toUpperCase();
+  if (uidKey) {
+    pendingNotifiedUids.add(uidKey);
+  }
+  showPendingAssociationModal(candidate);
+}
+
+function showPendingListModal(list){
+  if (!Array.isArray(list) || list.length === 0) return;
+  const rows = list.map((item) => {
+    const uidDisplay = formatUid(item.uid);
+    const suggested = Number(item?.suggested_id);
+    const lastSeen = item?.last_seen_ms ? formatDateTime(item.last_seen_ms) : '—';
+    const uidKey = escapeHtml((item?.uid || '').toString());
+    const suggestedLabel = Number.isFinite(suggested) && suggested > 0 ? suggested : '—';
+    return `<tr data-uid="${uidKey}"><td>${escapeHtml(uidDisplay)}</td><td>${suggestedLabel}</td><td>${escapeHtml(lastSeen)}</td><td><button class="btn small primary" type="button" data-act="associate" data-uid="${uidKey}">Associa</button></td></tr>`;
+  }).join('');
+
+  const modal = showModal(`
+    <div class="modal-head">
+      <h3>Nodi CAN in attesa</h3>
+    </div>
+    <div class="modal-body">
+      <p>Seleziona un nodo per aprire il form di associazione.</p>
+      <div class="table-wrap">
+        <table class="table">
+          <thead><tr><th>UID</th><th>ID suggerito</th><th>Ultima richiesta</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn secondary" data-act="close" type="button">Chiudi</button>
+    </div>
+  `, { modalClass: 'zones-config-modal' });
+  if (!modal) return;
+  const btns = modal.querySelectorAll('[data-act="associate"]');
+  btns.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const uidKey = btn.getAttribute('data-uid');
+      const match = list.find((item) => (item?.uid || '').toString().toUpperCase() === uidKey.toUpperCase());
+      if (match) {
+        clearModals();
+        showPendingAssociationModal(match);
+      }
+    });
+  });
+  modal.querySelector('[data-act="close"]')?.addEventListener('click', () => clearModals());
 }
 
 function escapeHtml(str = ''){
@@ -1666,6 +1792,97 @@ function showConfirm({
     window.requestAnimationFrame(() => {
       (confirmBtn || modal).focus({ preventScroll: true });
     });
+  });
+}
+
+function showPendingAssociationModal(pending){
+  if (!pending) return;
+  const uidDisplay = formatUid(pending.uid);
+  const suggested = Number(pending?.suggested_id);
+  const defaultId = Number.isFinite(suggested) && suggested > 0 ? suggested : '';
+  const lastSeen = pending?.last_seen_ms ? formatDateTime(pending.last_seen_ms) : '';
+  const modal = showModal(`
+    <div class="modal-head">
+      <h3>Nuovo nodo CAN rilevato</h3>
+    </div>
+    <div class="modal-body">
+      <p>È stato rilevato un nodo sul bus CAN senza un ID assegnato.</p>
+      <ul class="muted" style="margin:0 0 .6rem 1rem;">
+        <li>UID: <strong>${escapeHtml(uidDisplay)}</strong></li>
+        ${lastSeen ? `<li>Ultima richiesta: <strong>${escapeHtml(lastSeen)}</strong></li>` : ''}
+      </ul>
+      <form class="form" id="pendingAssignForm">
+        <label class="field">
+          <span>ID da assegnare</span>
+          <input id="pendingAssignId" type="number" min="1" max="${CAN_MAX_NODE_ID}" required value="${defaultId}">
+        </label>
+        <small class="muted">Il sistema propone il primo ID libero, puoi cambiarlo se preferisci.</small>
+        <div id="pendingAssignMsg" class="muted hidden" style="margin-top:.4rem"></div>
+      </form>
+    </div>
+    <div class="modal-actions">
+      <button type="button" class="btn secondary" data-act="skip">Più tardi</button>
+      <button type="submit" class="btn primary" form="pendingAssignForm" data-act="submit">Associa nodo</button>
+    </div>
+  `);
+  if (!modal) return;
+
+  const form = modal.querySelector('#pendingAssignForm');
+  const input = modal.querySelector('#pendingAssignId');
+  const msg = modal.querySelector('#pendingAssignMsg');
+  const skipBtn = modal.querySelector('[data-act="skip"]');
+  const submitBtn = modal.querySelector('[data-act="submit"]');
+
+  const setMessage = (text, tone = 'muted') => {
+    if (!msg) return;
+    if (!text) {
+      msg.classList.add('hidden');
+      msg.textContent = '';
+      msg.style.color = '';
+      return;
+    }
+    msg.textContent = text;
+    msg.classList.remove('hidden');
+    msg.style.color = tone === 'error' ? '#f87171' : '#a5f3fc';
+  };
+
+  if (input && defaultId) {
+    input.value = defaultId;
+  }
+
+  skipBtn?.addEventListener('click', () => {
+    clearModals();
+  });
+
+  form?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const chosen = Number.parseInt(input?.value ?? '', 10);
+    if (!Number.isFinite(chosen) || chosen < 1 || chosen > CAN_MAX_NODE_ID) {
+      setMessage(`Inserisci un ID tra 1 e ${CAN_MAX_NODE_ID}.`, 'error');
+      return;
+    }
+    submitBtn?.setAttribute('disabled', 'disabled');
+    skipBtn?.setAttribute('disabled', 'disabled');
+    setMessage('Associazione in corso…', 'muted');
+    try {
+      const payload = { uid: pending.uid, node_id: chosen };
+      const resp = await apiPost('/api/can/pending/assign', payload);
+      const finalId = Number.isFinite(Number(resp?.node_id)) ? Number(resp.node_id) : chosen;
+      showNotice(`Nodo CAN associato all'ID ${finalId}.`, 'info');
+      clearModals();
+      boardsCache.list = [];
+      boardsCache.map = new Map();
+      boardsCache.pending = null;
+      await loadPendingCanNodes({ silent: true });
+      ensureBoardsLoaded(true).catch((err) => console.warn('boards metadata', err));
+      checkPendingNodes({ prompt: true });
+    } catch (err) {
+      const text = err?.message || 'Impossibile associare il nodo CAN.';
+      setMessage(text, 'error');
+    } finally {
+      submitBtn?.removeAttribute('disabled');
+      skipBtn?.removeAttribute('disabled');
+    }
   });
 }
 

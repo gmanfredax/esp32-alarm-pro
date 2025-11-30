@@ -81,6 +81,15 @@
       </div>
     </header>
 
+    <div id="pendingNodeBanner" class="pending-banner hidden">
+      <div class="container pending-inner">
+        <div class="pending-text"></div>
+        <div class="pending-actions">
+          <button type="button" class="btn primary" id="pendingNodeAction"></button>
+        </div>
+      </div>
+    </div>
+
     <main class="container main">
       <div class="tabs">
         <button class="tab-btn" data-tab="home">HOME</button>
@@ -246,6 +255,7 @@
                 <div class="row" style="gap:.4rem;flex-wrap:wrap">
                   <button class="btn outline" id="adminExpansionRefreshBtn" type="button">Aggiorna elenco</button>
                   <button class="btn" id="adminExpansionScanBtn" type="button">+ Scansiona nuove schede</button>
+                  <button class="btn btn-danger outline" id="adminRosterResetBtn" type="button">Reimposta roster</button>
                 </div>
               </div>
               <div style="margin-top:.75rem;">

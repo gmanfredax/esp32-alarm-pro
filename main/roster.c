@@ -1,6 +1,7 @@
 #include "roster.h"
 #include "alarm_core.h"
 #include "device_identity.h"
+#include "can_bus_protocol.h"
 #include "utils.h"
 
 #include <string.h>
@@ -68,6 +69,16 @@ typedef struct {
 static roster_label_entry_t s_label_map[ROSTER_MAX_NODES];
 static SemaphoreHandle_t s_roster_lock = NULL;
 
+#define ROSTER_MAX_PENDING 8u
+typedef struct {
+    bool used;
+    uint8_t uid[ROSTER_UID_LEN];
+    uint64_t last_seen_ms;
+} roster_pending_entry_t;
+
+static roster_pending_entry_t s_pending[ROSTER_MAX_PENDING];
+
+static bool uid_equals(const uint8_t *a, const uint8_t *b);
 static bool uid_map_set_internal(uint8_t node_id, const uint8_t *uid, uint64_t associated_at_ms);
 
 typedef struct __attribute__((packed)) {
@@ -586,6 +597,77 @@ static SemaphoreHandle_t ensure_lock(void)
     return s_roster_lock;
 }
 
+static roster_pending_entry_t *pending_find(const uint8_t *uid)
+{
+    if (!uid) {
+        return NULL;
+    }
+    for (size_t i = 0; i < ROSTER_MAX_PENDING; ++i) {
+        roster_pending_entry_t *entry = &s_pending[i];
+        if (entry->used && uid_equals(entry->uid, uid)) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static bool pending_clear_uid_locked(const uint8_t *uid)
+{
+    roster_pending_entry_t *entry = pending_find(uid);
+    if (!entry) {
+        return false;
+    }
+    memset(entry, 0, sizeof(*entry));
+    return true;
+}
+
+static roster_pending_entry_t *pending_oldest_or_free(void)
+{
+    roster_pending_entry_t *free_entry = NULL;
+    roster_pending_entry_t *oldest_entry = NULL;
+    for (size_t i = 0; i < ROSTER_MAX_PENDING; ++i) {
+        roster_pending_entry_t *entry = &s_pending[i];
+        if (!entry->used) {
+            free_entry = entry;
+            break;
+        }
+        if (!oldest_entry || entry->last_seen_ms < oldest_entry->last_seen_ms) {
+            oldest_entry = entry;
+        }
+    }
+    return free_entry ? free_entry : oldest_entry;
+}
+
+static uint8_t first_available_node_id_locked(void)
+{
+    for (uint32_t i = 1; i < ROSTER_MAX_NODES; ++i) {
+        roster_node_t *node = &s_nodes[i];
+        if (!node->used) {
+            return (uint8_t)i;
+        }
+    }
+    return 0;
+}
+
+static void uid_to_hex_string(const uint8_t *uid, char *out, size_t uid_len)
+{
+    if (!out) {
+        return;
+    }
+    if (!uid) {
+        out[0] = '\0';
+        return;
+    }
+    size_t max_bytes = uid_len;
+    if (max_bytes == 0 || max_bytes > sizeof(((roster_node_t *)0)->uid)) {
+        max_bytes = sizeof(((roster_node_t *)0)->uid);
+    }
+    for (size_t i = 0; i < max_bytes; ++i) {
+        snprintf(out + (i * 2), 3, "%02X", uid[i]);
+    }
+    out[max_bytes * 2] = '\0';
+}
+
 static void uid_normalize(uint8_t *dst, size_t dst_len, const uint8_t *src, size_t src_len)
 {
     if (!dst || dst_len == 0) {
@@ -732,6 +814,17 @@ static roster_node_t *node_slot(uint8_t node_id)
     return &s_nodes[node_id];
 }
 
+static bool node_known_or_mapped(const roster_node_t *node, uint8_t node_id)
+{
+    if (!node) {
+        return false;
+    }
+    if (node->used) {
+        return true;
+    }
+    return uid_map_find_entry(node_id) != NULL;
+}
+
 static void node_apply_uid(roster_node_t *node)
 {
     if (!node) {
@@ -755,8 +848,10 @@ static void node_init_defaults(roster_node_t *node, uint8_t node_id)
     node->state = ROSTER_NODE_STATE_OFFLINE;
     node->identify_active = false;
     node->inputs_valid = false;
+    node->tamper_valid = false;
     node->outputs_valid = false;
     node->inputs_bitmap = 0;
+    node->tamper_bitmap = 0;
     node->outputs_bitmap = 0;
     node->change_counter = 0;
     node->node_state_flags = 0;
@@ -776,6 +871,7 @@ void roster_init(uint8_t master_inputs, uint8_t master_outputs, uint16_t master_
     memset(s_uid_map, 0, sizeof(s_uid_map));
     uid_map_load_locked();
     memset(s_label_map, 0, sizeof(s_label_map));
+    memset(s_pending, 0, sizeof(s_pending));
     label_map_load_locked();
     strncpy(s_master.label, "Centrale", sizeof(s_master.label) - 1);
     strncpy(s_master.kind, "master", sizeof(s_master.kind) - 1);
@@ -797,6 +893,7 @@ esp_err_t roster_reset(void)
     uid_map_save_locked();
     memset(s_label_map, 0, sizeof(s_label_map));
     label_map_save_locked();
+    memset(s_pending, 0, sizeof(s_pending));
     s_master.registered_at_ms = 0;
     s_master.device_id[0] = '\0';
     xSemaphoreGive(s_roster_lock);
@@ -818,6 +915,38 @@ esp_err_t roster_reset(void)
     return ESP_OK;
 }
 
+bool roster_uid_map_foreach(roster_uid_iter_cb cb, void *ctx)
+{
+    if (!cb) {
+        return false;
+    }
+
+    ensure_lock();
+    roster_uid_entry_t entries[ROSTER_MAX_NODES];
+    size_t count = 0;
+
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    for (size_t i = 0; i < ROSTER_MAX_NODES; ++i) {
+        const roster_uid_entry_t *entry = &s_uid_map[i];
+        if (!entry->used) {
+            continue;
+        }
+        if (count < ROSTER_MAX_NODES) {
+            entries[count++] = *entry;
+        }
+    }
+    xSemaphoreGive(s_roster_lock);
+
+    for (size_t i = 0; i < count; ++i) {
+        const roster_uid_entry_t *entry = &entries[i];
+        if (!cb(entry->node_id, entry->uid, entry->associated_at_ms, ctx)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 esp_err_t roster_update_node(uint8_t node_id, const roster_node_info_t *info, bool *out_is_new)
 {
     if (node_id == 0 || !info) {
@@ -826,9 +955,9 @@ esp_err_t roster_update_node(uint8_t node_id, const roster_node_info_t *info, bo
     ensure_lock();
     xSemaphoreTake(s_roster_lock, portMAX_DELAY);
     roster_node_t *node = node_slot(node_id);
-    if (!node) {
+    if (!node || !node_known_or_mapped(node, node_id)) {
         xSemaphoreGive(s_roster_lock);
-        return ESP_ERR_INVALID_ARG;
+        return ESP_ERR_NOT_FOUND;
     }
     bool was_used = node->used;
     if (!was_used) {
@@ -881,9 +1010,9 @@ esp_err_t roster_mark_online(uint8_t node_id, uint64_t now_ms, bool *out_is_new)
     ensure_lock();
     xSemaphoreTake(s_roster_lock, portMAX_DELAY);
     roster_node_t *node = node_slot(node_id);
-    if (!node) {
+    if (!node || !node_known_or_mapped(node, node_id)) {
         xSemaphoreGive(s_roster_lock);
-        return ESP_ERR_INVALID_ARG;
+        return ESP_ERR_NOT_FOUND;
     }
     bool was_used = node->used;
     if (!was_used) {
@@ -999,6 +1128,20 @@ bool roster_node_exists(uint8_t node_id)
     return exists;
 }
 
+bool roster_node_known_or_mapped(uint8_t node_id)
+{
+    if (node_id == 0) {
+        return false;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    bool ok = node_known_or_mapped(node, node_id);
+    xSemaphoreGive(s_roster_lock);
+    return ok;
+}
+
 const roster_node_t *roster_get_node(uint8_t node_id)
 {
     if (node_id >= ROSTER_MAX_NODES) {
@@ -1022,6 +1165,70 @@ bool roster_get_node_snapshot(uint8_t node_id, roster_node_t *out_snapshot)
     }
     xSemaphoreGive(s_roster_lock);
     return ok;
+}
+
+esp_err_t roster_resolve_node_id_from_uid(const uint8_t *uid,
+                                          size_t uid_len,
+                                          uint8_t *out_node_id,
+                                          bool *out_is_new)
+{
+    if (!uid || uid_len == 0 || uid_len > sizeof(((roster_node_t *)0)->uid) || !out_node_id) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+
+    uint8_t normalized_uid[sizeof(((roster_node_t *)0)->uid)];
+    uid_normalize(normalized_uid, sizeof(normalized_uid), uid, uid_len);
+    uint64_t now_ms = roster_current_wall_time_ms();
+
+    for (uint32_t i = 1; i < ROSTER_MAX_NODES; ++i) {
+        roster_node_t *node = &s_nodes[i];
+        if (!node->used || !node->info_valid) {
+            continue;
+        }
+        if (uid_equals(node->uid, normalized_uid)) {
+            *out_node_id = (uint8_t)i;
+            if (out_is_new) {
+                *out_is_new = false;
+            }
+            if (!roster_timestamp_is_valid(node->associated_at_ms)) {
+                node->associated_at_ms = now_ms;
+            }
+            uid_map_set_internal(*out_node_id, normalized_uid, node->associated_at_ms);
+            pending_clear_uid_locked(normalized_uid);
+            xSemaphoreGive(s_roster_lock);
+            return ESP_OK;
+        }
+    }
+
+    uint8_t mapped_id = 0;
+    if (uid_map_lookup(normalized_uid, &mapped_id) && mapped_id > 0 && mapped_id < ROSTER_MAX_NODES) {
+        roster_node_t *node = &s_nodes[mapped_id];
+        bool created = false;
+        if (!node->used) {
+            node_init_defaults(node, mapped_id);
+            created = true;
+        }
+        memcpy(node->uid, normalized_uid, sizeof(node->uid));
+        node->info_valid = true;
+        node->state = ROSTER_NODE_STATE_PREOP;
+        if (!roster_timestamp_is_valid(node->associated_at_ms)) {
+            node->associated_at_ms = now_ms;
+        }
+        uid_map_set_internal(mapped_id, normalized_uid, node->associated_at_ms);
+        *out_node_id = mapped_id;
+        if (out_is_new) {
+            *out_is_new = created;
+        }
+        pending_clear_uid_locked(normalized_uid);
+        xSemaphoreGive(s_roster_lock);
+        return ESP_OK;
+    }
+
+    xSemaphoreGive(s_roster_lock);
+    return ESP_ERR_NOT_FOUND;
 }
 
 esp_err_t roster_reassign_node_id(uint8_t current_id, uint8_t new_id)
@@ -1127,6 +1334,138 @@ esp_err_t roster_set_node_label(uint8_t node_id, const char *label)
     return ESP_OK;
 }
 
+esp_err_t roster_note_pending_uid(const uint8_t *uid, size_t uid_len, uint64_t seen_ms)
+{
+    if (!uid || uid_len == 0 || uid_len > sizeof(((roster_node_t *)0)->uid)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+
+    uint8_t normalized_uid[sizeof(((roster_node_t *)0)->uid)];
+    uid_normalize(normalized_uid, sizeof(normalized_uid), uid, uid_len);
+
+    for (uint32_t i = 1; i < ROSTER_MAX_NODES; ++i) {
+        roster_node_t *node = &s_nodes[i];
+        if (!node->used || !node->info_valid) {
+            continue;
+        }
+        if (uid_equals(node->uid, normalized_uid)) {
+            pending_clear_uid_locked(normalized_uid);
+            xSemaphoreGive(s_roster_lock);
+            return ESP_OK;
+        }
+    }
+
+    uint8_t mapped_id = 0;
+    if (uid_map_lookup(normalized_uid, &mapped_id) && mapped_id > 0 && mapped_id < ROSTER_MAX_NODES) {
+        pending_clear_uid_locked(normalized_uid);
+        xSemaphoreGive(s_roster_lock);
+        return ESP_OK;
+    }
+
+    roster_pending_entry_t *entry = pending_find(normalized_uid);
+    if (!entry) {
+        entry = pending_oldest_or_free();
+    }
+    if (!entry) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_NO_MEM;
+    }
+    entry->used = true;
+    memcpy(entry->uid, normalized_uid, sizeof(entry->uid));
+    entry->last_seen_ms = roster_sanitize_wall_time(seen_ms);
+
+    xSemaphoreGive(s_roster_lock);
+    return ESP_OK;
+}
+
+size_t roster_pending_to_json(cJSON *out_array)
+{
+    if (!out_array) {
+        return 0;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+
+    uint8_t suggested = first_available_node_id_locked();
+    size_t count = 0;
+    for (size_t i = 0; i < ROSTER_MAX_PENDING; ++i) {
+        const roster_pending_entry_t *entry = &s_pending[i];
+        if (!entry->used) {
+            continue;
+        }
+        cJSON *obj = cJSON_CreateObject();
+        if (!obj) {
+            continue;
+        }
+        char uid_str[(CAN_PROTO_UID_LENGTH * 2) + 1];
+        uid_to_hex_string(entry->uid, uid_str, CAN_PROTO_UID_LENGTH);
+        cJSON_AddStringToObject(obj, "uid", uid_str);
+        cJSON_AddNumberToObject(obj, "last_seen_ms", (double)entry->last_seen_ms);
+        if (suggested > 0) {
+            cJSON_AddNumberToObject(obj, "suggested_id", suggested);
+        }
+        cJSON_AddItemToArray(out_array, obj);
+        ++count;
+    }
+
+    xSemaphoreGive(s_roster_lock);
+    return count;
+}
+
+bool roster_first_available_node_id(uint8_t *out_node_id)
+{
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    uint8_t id = first_available_node_id_locked();
+    xSemaphoreGive(s_roster_lock);
+    if (out_node_id) {
+        *out_node_id = id;
+    }
+    return id != 0;
+}
+
+esp_err_t roster_associate_pending_uid(const uint8_t *uid,
+                                       size_t uid_len,
+                                       uint8_t node_id,
+                                       uint64_t associated_at_ms,
+                                       bool *out_created)
+{
+    if (!uid || uid_len == 0 || uid_len > sizeof(((roster_node_t *)0)->uid) || node_id == 0 ||
+        node_id >= ROSTER_MAX_NODES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+
+    roster_node_t *node = node_slot(node_id);
+    if (!node || node->used) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t normalized_uid[sizeof(((roster_node_t *)0)->uid)];
+    uid_normalize(normalized_uid, sizeof(normalized_uid), uid, uid_len);
+
+    node_init_defaults(node, node_id);
+    memcpy(node->uid, normalized_uid, sizeof(node->uid));
+    node->info_valid = true;
+    node->state = ROSTER_NODE_STATE_PREOP;
+    node->associated_at_ms = roster_sanitize_wall_time(associated_at_ms);
+    uid_map_set(node_id, normalized_uid, node->associated_at_ms);
+    pending_clear_uid_locked(normalized_uid);
+
+    xSemaphoreGive(s_roster_lock);
+    if (out_created) {
+        *out_created = true;
+    }
+    return ESP_OK;
+}
+
 esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uint8_t *out_node_id, bool *out_is_new)
 {
     if (!uid || uid_len == 0 || uid_len > sizeof(((roster_node_t *)0)->uid) || !out_node_id) {
@@ -1155,6 +1494,7 @@ esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uin
                 node->associated_at_ms = now_ms;
             }
             uid_map_set(*out_node_id, normalized_uid, node->associated_at_ms);
+            pending_clear_uid_locked(normalized_uid);
             xSemaphoreGive(s_roster_lock);
             return ESP_OK;
         }
@@ -1178,6 +1518,7 @@ esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uin
             *out_is_new = false;
         }
         uid_map_set(mapped_id, normalized_uid, node->associated_at_ms);
+        pending_clear_uid_locked(normalized_uid);
         xSemaphoreGive(s_roster_lock);
         return ESP_OK;
     }
@@ -1198,6 +1539,7 @@ esp_err_t roster_assign_node_id_from_uid(const uint8_t *uid, size_t uid_len, uin
             *out_is_new = true;
         }
         uid_map_set(*out_node_id, normalized_uid, node->associated_at_ms);
+        pending_clear_uid_locked(normalized_uid);
         xSemaphoreGive(s_roster_lock);
         return ESP_OK;
     }
@@ -1246,6 +1588,10 @@ static void add_common_fields(cJSON *obj, const roster_node_t *node)
     cJSON_AddBoolToObject(obj, "inputs_known", node->inputs_valid);
     if (node->inputs_valid) {
         cJSON_AddNumberToObject(obj, "inputs_bitmap", (double)node->inputs_bitmap);
+    }
+    cJSON_AddBoolToObject(obj, "tamper_known", node->tamper_valid);
+    if (node->tamper_valid) {
+        cJSON_AddNumberToObject(obj, "tamper_bitmap", (double)node->tamper_bitmap);
     }
     cJSON_AddNumberToObject(obj, "change_counter", node->change_counter);
     cJSON_AddNumberToObject(obj, "node_state_flags", node->node_state_flags);
@@ -1397,9 +1743,9 @@ esp_err_t roster_note_inputs(uint8_t node_id,
     ensure_lock();
     xSemaphoreTake(s_roster_lock, portMAX_DELAY);
     roster_node_t *node = node_slot(node_id);
-    if (!node) {
+    if (!node || !node_known_or_mapped(node, node_id)) {
         xSemaphoreGive(s_roster_lock);
-        return ESP_ERR_INVALID_ARG;
+        return ESP_ERR_NOT_FOUND;
     }
     if (!node->used) {
         node_init_defaults(node, node_id);
@@ -1408,6 +1754,34 @@ esp_err_t roster_note_inputs(uint8_t node_id,
     node->inputs_bitmap = inputs_bitmap;
     node->change_counter = change_counter;
     node->node_state_flags = node_state_flags;
+    xSemaphoreGive(s_roster_lock);
+    return ESP_OK;
+}
+
+esp_err_t roster_note_ext_inputs(uint8_t node_id,
+                                 uint32_t alarm_bitmap,
+                                 uint32_t tamper_bitmap)
+{
+    if (node_id == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ensure_lock();
+    xSemaphoreTake(s_roster_lock, portMAX_DELAY);
+    roster_node_t *node = node_slot(node_id);
+    if (!node || !node_known_or_mapped(node, node_id)) {
+        xSemaphoreGive(s_roster_lock);
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (!node->used) {
+        node_init_defaults(node, node_id);
+    }
+
+    node->inputs_valid = true;
+    node->inputs_bitmap = alarm_bitmap;
+    node->tamper_valid = true;
+    node->tamper_bitmap = tamper_bitmap;
+
     xSemaphoreGive(s_roster_lock);
     return ESP_OK;
 }
@@ -1457,6 +1831,8 @@ bool roster_get_io_state(uint8_t node_id, roster_io_state_t *out_state)
         out_state->state = node->state;
         out_state->inputs_valid = node->inputs_valid;
         out_state->inputs_bitmap = node->inputs_bitmap;
+        out_state->tamper_valid = node->tamper_valid;
+        out_state->tamper_bitmap = node->tamper_bitmap;
         out_state->change_counter = node->change_counter;
         out_state->node_state_flags = node->node_state_flags;
         out_state->outputs_valid = node->outputs_valid;
@@ -1494,6 +1870,8 @@ size_t roster_collect_nodes(roster_node_inputs_t *out_nodes, size_t max_nodes)
         dst->outputs_count = node->outputs_count;
         dst->inputs_valid = node->inputs_valid;
         dst->inputs_bitmap = node->inputs_bitmap;
+        dst->tamper_valid = node->tamper_valid;
+        dst->tamper_bitmap = node->tamper_bitmap;
         dst->state = node->state;
     }
 

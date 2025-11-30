@@ -127,6 +127,24 @@ body.modal-open{overflow:hidden;}
   border-bottom:1px solid var(--border);
   backdrop-filter:saturate(140%) blur(6px);
 }
+.pending-banner{
+  position:sticky;
+  top:0;
+  z-index:19;
+  background:linear-gradient(90deg, rgba(34,211,238,.15), rgba(16,185,129,.18));
+  border-bottom:1px solid rgba(34,211,238,.25);
+  box-shadow:0 6px 18px rgba(0,0,0,.25);
+}
+.pending-inner{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:1rem;
+  padding:.6rem 0;
+}
+.pending-text{font-weight:600;letter-spacing:.15px;}
+.pending-actions{display:flex;gap:.5rem;align-items:center;}
+.pending-banner .btn{box-shadow:0 4px 14px rgba(14,165,183,.35);}
 .head-inner{display:flex;align-items:center;justify-content:space-between;padding:14px 0}
 .brand{display:flex;align-items:center;gap:10px;font-weight:600}
 .brand-name{letter-spacing:.2px}
