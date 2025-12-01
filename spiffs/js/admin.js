@@ -478,6 +478,17 @@
     });
   }
 
+  function getAssignedNodeIds(){
+    const items = Array.isArray(expansionsState.items) ? expansionsState.items : [];
+    return items.reduce((set, item) => {
+      const id = Number(item?.node_id);
+      if (Number.isFinite(id) && id > 0) {
+        set.add(id);
+      }
+      return set;
+    }, new Set());
+  }
+
     function upsertExpansionNode(updated){
     if (!updated || typeof updated !== "object") return;
     const nodeId = Number(updated?.node_id ?? updated?.nodeId);
@@ -1301,28 +1312,43 @@
     if (!pending) return;
     const uidDisplay = formatUid(pending.uid);
     const suggested = Number(pending?.suggested_id);
-    const defaultId = Number.isFinite(suggested) && suggested > 0 ? suggested : '';
+    const assignedIds = getAssignedNodeIds();
+    const availableIds = [];
+    for (let id = 1; id <= CAN_MAX_NODE_ID; id += 1) {
+      if (!assignedIds.has(id)) {
+        availableIds.push(id);
+      }
+    }
+    const defaultId = Number.isFinite(suggested) && suggested > 0 && availableIds.includes(suggested)
+      ? suggested
+      : (availableIds[0] ?? '');
     const lastSeen = pending?.last_seen_ms ? formatDateTime(pending.last_seen_ms) : '';
 
     modal(`
-      <div class="card-head row" style="justify-content:space-between;align-items:center;gap:.5rem">
-        <h3>Associa nodo CAN</h3>
-        <button class="btn" id="mClose">Chiudi</button>
+      <div class="modal-head">
+        <h3>Nuovo nodo CAN rilevato</h3>
       </div>
-      <div class="form" style="padding-bottom:.5rem">
-        <p class="muted">UID: <strong>${escapeHtml(uidDisplay)}</strong>${lastSeen ? ` — Ultima richiesta: ${escapeHtml(lastSeen)}` : ''}</p>
+      <div class="modal-body">
+        <p>È stato rilevato un nodo sul bus CAN senza un ID assegnato.</p>
+        <ul class="muted" style="margin:0 0 .6rem 1rem;">
+          <li>UID: <strong>${escapeHtml(uidDisplay)}</strong></li>
+          ${lastSeen ? `<li>Ultima richiesta: <strong>${escapeHtml(lastSeen)}</strong></li>` : ''}
+        </ul>
         <form id="pendingAssignForm" class="form" style="margin:1rem 0;">
           <label class="field" style="width:100%;max-width:220px;">
             <span>ID da assegnare</span>
-            <input id="pendingAssignId" type="number" min="1" max="${CAN_MAX_NODE_ID}" required value="${defaultId}">
+            <input id="pendingAssignId" type="number" min="1" max="${CAN_MAX_NODE_ID}" required value="${defaultId}" list="pendingAssignOptions">
           </label>
-          <p class="muted small" style="margin-top:.4rem">Suggerito: primo ID libero.</p>
+          <datalist id="pendingAssignOptions">
+            ${availableIds.map((id) => `<option value="${id}">ID ${id}</option>`).join('')}
+          </datalist>
+          <small class="muted">Il sistema propone il primo ID libero, puoi cambiarlo se preferisci.</small>
           <div id="pendingAssignMsg" class="muted hidden" style="margin-top:.4rem"></div>
         </form>
-        <div class="row" style="gap:.5rem;flex-wrap:wrap;justify-content:flex-end">
-          <button class="btn secondary" type="button" data-act="skip">Più tardi</button>
-          <button class="btn primary" type="submit" form="pendingAssignForm" data-act="submit">Associa nodo</button>
-        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn secondary" type="button" data-act="skip">Più tardi</button>
+        <button class="btn primary" type="submit" form="pendingAssignForm" data-act="submit">Associa nodo</button>
       </div>
     `);
 
@@ -1331,7 +1357,6 @@
     const msg = $("#pendingAssignMsg");
     const skipBtn = document.querySelector('[data-act="skip"]');
     const submitBtn = document.querySelector('[data-act="submit"]');
-    $("#mClose")?.addEventListener("click", () => closeModal());
 
     const setMessage = (text, tone = 'muted') => {
       if (!msg) return;
@@ -1343,14 +1368,22 @@
       }
       msg.textContent = text;
       msg.classList.remove('hidden');
-      msg.style.color = tone === 'error' ? '#f87171' : '';
+      msg.style.color = tone === 'error' ? '#f87171' : '#a5f3fc';
     };
+
+    if (input && defaultId) {
+      input.value = defaultId;
+    }
 
     form?.addEventListener('submit', async (event) => {
       event.preventDefault();
       const chosen = Number.parseInt(input?.value ?? '', 10);
       if (!Number.isFinite(chosen) || chosen < 1 || chosen > CAN_MAX_NODE_ID) {
         setMessage(`Inserisci un ID tra 1 e ${CAN_MAX_NODE_ID}.`, 'error');
+        return;
+      }
+      if (assignedIds.has(chosen)) {
+        setMessage('ID già assegnato ad un altro nodo. Scegli un ID libero.', 'error');
         return;
       }
       submitBtn?.setAttribute('disabled', 'disabled');

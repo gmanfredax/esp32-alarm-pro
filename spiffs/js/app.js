@@ -52,6 +52,18 @@ let lastActivityTs = Date.now();
 const idleEvents = ['pointerdown', 'pointermove', 'keydown', 'touchstart', 'wheel'];
 const idleListenerOptions = { passive: true };
 
+function formatDateTime(ts){
+  if (ts == null) return "";
+  let date;
+  if (ts instanceof Date) date = ts;
+  else if (typeof ts === "number") date = new Date(ts);
+  else if (typeof ts === "string" && ts) date = new Date(ts);
+  else return "";
+  if (Number.isNaN(date.getTime())) return "";
+  try { return date.toLocaleString("it-IT"); }
+  catch { return date.toISOString(); }
+}
+
 function stopIdleTracking(){
   if (!idleTracking) return;
   idleTracking = false;
@@ -1799,7 +1811,18 @@ function showPendingAssociationModal(pending){
   if (!pending) return;
   const uidDisplay = formatUid(pending.uid);
   const suggested = Number(pending?.suggested_id);
-  const defaultId = Number.isFinite(suggested) && suggested > 0 ? suggested : '';
+  const assignedIds = new Set((boardsCache.list || [])
+    .map((item) => Number(item?.node_id))
+    .filter((id) => Number.isFinite(id) && id > 0));
+  const availableIds = [];
+  for (let id = 1; id <= CAN_MAX_NODE_ID; id += 1) {
+    if (!assignedIds.has(id)) {
+      availableIds.push(id);
+    }
+  }
+  const defaultId = Number.isFinite(suggested) && suggested > 0 && availableIds.includes(suggested)
+    ? suggested
+    : (availableIds[0] ?? '');
   const lastSeen = pending?.last_seen_ms ? formatDateTime(pending.last_seen_ms) : '';
   const modal = showModal(`
     <div class="modal-head">
@@ -1814,8 +1837,11 @@ function showPendingAssociationModal(pending){
       <form class="form" id="pendingAssignForm">
         <label class="field">
           <span>ID da assegnare</span>
-          <input id="pendingAssignId" type="number" min="1" max="${CAN_MAX_NODE_ID}" required value="${defaultId}">
+          <input id="pendingAssignId" type="number" min="1" max="${CAN_MAX_NODE_ID}" required value="${defaultId}" list="pendingAssignOptions">
         </label>
+        <datalist id="pendingAssignOptions">
+          ${availableIds.map((id) => `<option value="${id}">ID ${id}</option>`).join('')}
+        </datalist>
         <small class="muted">Il sistema propone il primo ID libero, puoi cambiarlo se preferisci.</small>
         <div id="pendingAssignMsg" class="muted hidden" style="margin-top:.4rem"></div>
       </form>
@@ -1859,6 +1885,10 @@ function showPendingAssociationModal(pending){
     const chosen = Number.parseInt(input?.value ?? '', 10);
     if (!Number.isFinite(chosen) || chosen < 1 || chosen > CAN_MAX_NODE_ID) {
       setMessage(`Inserisci un ID tra 1 e ${CAN_MAX_NODE_ID}.`, 'error');
+      return;
+    }
+    if (assignedIds.has(chosen)) {
+      setMessage('ID già assegnato ad un altro nodo. Scegli un ID libero.', 'error');
       return;
     }
     submitBtn?.setAttribute('disabled', 'disabled');

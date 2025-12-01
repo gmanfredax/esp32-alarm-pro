@@ -3,6 +3,7 @@
 
 #include <string.h>
 #include <inttypes.h>
+#include <stdlib.h>
 
 #if CONFIG_APP_CAN_ENABLED
 
@@ -32,6 +33,7 @@
 #define CAN_NODE_TIMEOUT_MS      (2500ULL)
 #define CAN_MAX_NODE_ID          (127u)
 #define CAN_SCAN_WINDOW_US       (2000000ULL)
+#define CAN_SCAN_EVENT_STACK     (4096)
 
 typedef struct {
     bool used;
@@ -77,6 +79,11 @@ static bool s_scan_in_progress = false;
 static size_t s_scan_new_nodes = 0;
 static TimerHandle_t s_scan_timer = NULL;
 
+typedef struct {
+    uint64_t ts;
+    size_t discovered;
+} scan_event_ctx_t;
+
 static SemaphoreHandle_t state_lock_get(void);
 static SemaphoreHandle_t scan_lock_get(void);
 static void can_master_rx_task(void *arg);
@@ -99,6 +106,7 @@ static void can_master_notify_io_state(uint8_t node_id,
                                        uint64_t timestamp_ms);
 static void can_scan_note_new_node(void);
 static esp_err_t can_master_driver_start_internal(void);
+static void scan_broadcast_task(void *arg);
 static void scan_timer_cb(TimerHandle_t timer);
 static twai_timing_config_t can_timing_config(void);
 static void can_master_handle_addr_request(const can_proto_addr_request_t *req);
@@ -259,6 +267,25 @@ static void can_scan_note_new_node(void)
     xSemaphoreGive(lock);
 }
 
+static void scan_broadcast_task(void *arg)
+{
+    if (!arg) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    scan_event_ctx_t ctx = *(scan_event_ctx_t *)arg;
+    free(arg);
+
+    cJSON *evt = cJSON_CreateObject();
+    if (evt) {
+        cJSON_AddNumberToObject(evt, "ts", (double)ctx.ts);
+        cJSON_AddNumberToObject(evt, "new_nodes", (double)ctx.discovered);
+        web_server_ws_broadcast_event("scan_completed", evt);
+    }
+    vTaskDelete(NULL);
+}
+
 static void scan_timer_cb(TimerHandle_t timer)
 {
     (void)timer;
@@ -272,12 +299,18 @@ static void scan_timer_cb(TimerHandle_t timer)
         xSemaphoreGive(lock);
     }
 
-    uint64_t ts = now_ms();
-    cJSON *evt = cJSON_CreateObject();
-    if (evt) {
-        cJSON_AddNumberToObject(evt, "ts", (double)ts);
-        cJSON_AddNumberToObject(evt, "new_nodes", (double)discovered);
-        web_server_ws_broadcast_event("scan_completed", evt);
+    scan_event_ctx_t *params = calloc(1, sizeof(*params));
+    if (params) {
+        params->ts = now_ms();
+        params->discovered = discovered;
+        if (xTaskCreate(scan_broadcast_task,
+                        "scan_evt",
+                        CAN_SCAN_EVENT_STACK,
+                        params,
+                        tskIDLE_PRIORITY + 1,
+                        NULL) != pdPASS) {
+            free(params);
+        }
     }
 }
 
