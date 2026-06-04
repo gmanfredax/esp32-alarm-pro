@@ -58,6 +58,7 @@
     .diag-message.error{color:#f87171}
     .diag-message.ok{color:#34d399}
     .diag-empty{margin-top:.6rem;font-size:.9rem}
+    .ads-table-wrap{margin-top:.75rem;overflow-x:auto}.ads-table{width:100%;border-collapse:collapse;min-width:900px;font-size:.9rem}.ads-table th,.ads-table td{padding:.5rem;border:1px solid rgba(255,255,255,.08);vertical-align:top}.ads-actions{display:flex;flex-wrap:wrap;gap:.35rem}.ads-actions .btn{padding:.35rem .55rem;font-size:.82rem}.ads-chip{display:inline-flex;border-radius:999px;padding:.12rem .45rem;background:rgba(255,255,255,.08)}.ads-chip.ok{color:#34d399}.ads-chip.warn{color:#fbbf24}.ads-chip.err{color:#f87171}
     .analog-table-wrap{margin-top:.75rem;overflow-x:auto}
     .analog-table{width:100%;border-collapse:collapse;font-size:.9rem;min-width:520px}
     .analog-table th,.analog-table td{padding:.55rem .6rem;text-align:left;border:1px solid rgba(255,255,255,.08);vertical-align:top}
@@ -129,7 +130,7 @@
             <li><button class="btn w-100" data-view="view-notifications">Notifiche</button></li>
             <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
             <li><button class="btn w-100" data-view="view-expansions">Espansioni CAN</button></li>
-            <li><button class="btn w-100" data-view="view-diagnostics">Diagnostica</button></li>
+            <li><button class="btn w-100" data-view="view-diagnostics">ADS1115</button></li>
           </ul>
         </aside>
 
@@ -351,11 +352,16 @@
           <section id="view-diagnostics" class="view">
             <div class="card">
               <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap">
-                <h3>Diagnostica ADS1115</h3>
-                <button class="btn" id="adsDiagRefreshBtn" type="button">Aggiorna</button>
+                <h3>ADS1115</h3>
+                <div class="row" style="gap:.4rem;flex-wrap:wrap">
+                  <button class="btn" id="adsDiagScanBtn" type="button">Scan I²C</button>
+                  <button class="btn outline" id="adsDiagAddBtn" type="button">Aggiungi modulo</button>
+                  <button class="btn secondary" id="adsDiagRefreshBtn" type="button">Aggiorna</button>
+                </div>
               </div>
               <p id="adsDiagSummary" class="status-line muted" role="status">Premi “Aggiorna” per caricare lo stato degli ADS1115.</p>
-              <div id="adsDiagDevices" class="diag-grid"></div>
+              <div class="ads-table-wrap"><table class="ads-table"><thead><tr><th>ID</th><th>Label</th><th>Indirizzo</th><th>Abilitato</th><th>Rilevato</th><th>Online</th><th>Ultimo errore</th><th>Ultimo rilevamento</th><th>Zone</th><th>Azioni</th></tr></thead><tbody id="adsDiagDevices"></tbody></table></div>
+              <p id="adsDiagUnconfigured" class="diag-empty muted hidden"></p>
               <p id="adsDiagEmpty" class="diag-empty muted hidden">Nessun ADS1115 configurato.</p>
               <p id="adsDiagTimestamp" class="muted hidden" style="margin-top:.6rem;font-size:.8rem"></p>
             </div>

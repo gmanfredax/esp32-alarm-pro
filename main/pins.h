@@ -101,6 +101,8 @@
   #define ADS1115_COUNT 3
 #endif
 
+#define ADS1115_ADMIN_MAX_MODULES 4
+
 #if ADS1115_COUNT > 0
   #ifndef ADS1115_ADDR_0
     #define ADS1115_ADDR_0 0x48
@@ -116,6 +118,11 @@
     #define ADS1115_ADDR_2 0x4A
   #endif
 #endif
+#if ADS1115_COUNT > 3
+  #ifndef ADS1115_ADDR_3
+    #define ADS1115_ADDR_3 0x4B
+  #endif
+#endif
 
 #ifndef ANALOG_SUPPLY_DIVIDER_R1_OHMS
   #define ANALOG_SUPPLY_DIVIDER_R1_OHMS 47000.0f
@@ -124,7 +131,7 @@
   #define ANALOG_SUPPLY_DIVIDER_R2_OHMS 10000.0f
 #endif
 
-_Static_assert(ADS1115_COUNT >= 0 && ADS1115_COUNT <= 3, "Supporto massimo: tre ADS1115");
+_Static_assert(ADS1115_COUNT >= 0 && ADS1115_COUNT <= ADS1115_ADMIN_MAX_MODULES, "Supporto massimo: quattro ADS1115");
 
 
 // ================================ MCP23017 ===================================

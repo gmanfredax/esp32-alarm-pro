@@ -379,11 +379,42 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
     }
     for (int i = 0; i < total; ++i) {
         bool active = zone_mask_test(&limited, (uint16_t)i);
+        bool unavailable = false;
+#if ADS1115_COUNT > 0
+        if (i >= INPUT_ZONES_COUNT) {
+            unavailable = !inputs_analog_zone_available((size_t)(i - INPUT_ZONES_COUNT));
+        }
+#endif
         cJSON_AddItemToArray(arr, cJSON_CreateBool(active));
         char topic[MQTT_TOPIC_MAX_LEN];
         snprintf(topic, sizeof(topic), "%s/zones/%d/state", s_base_topic, i + 1);
-        publish_raw(topic, active ? "ON" : "OFF", CONFIG_APP_CLOUD_QOS_STATE, false);
+        publish_raw(topic, unavailable ? "unavailable" : (active ? "ON" : "OFF"), CONFIG_APP_CLOUD_QOS_STATE, false);
     }
+
+#if ADS1115_COUNT > 0
+    for (size_t i = 0; i < inputs_ads1115_expected_devices(); ++i) {
+        input_ads1115_module_info_t info;
+        if (inputs_ads1115_get_module_info(i, &info) != ESP_OK) continue;
+        char topic[MQTT_TOPIC_MAX_LEN];
+        snprintf(topic, sizeof(topic), "%s/ads1115/%s/online", s_base_topic, info.id);
+        publish_raw(topic, info.online ? "ON" : "OFF", CONFIG_APP_CLOUD_QOS_STATE, false);
+        snprintf(topic, sizeof(topic), "%s/ads1115/%s/diagnostics", s_base_topic, info.id);
+        cJSON* diag = cJSON_CreateObject();
+        if (diag) {
+            cJSON_AddStringToObject(diag, "id", info.id);
+            cJSON_AddStringToObject(diag, "label", info.label);
+            cJSON_AddNumberToObject(diag, "address", (double)info.i2c_address);
+            cJSON_AddBoolToObject(diag, "enabled", info.enabled);
+            cJSON_AddBoolToObject(diag, "detected", info.detected);
+            cJSON_AddBoolToObject(diag, "online", info.online);
+            cJSON_AddStringToObject(diag, "last_error", info.last_error);
+            cJSON_AddNumberToObject(diag, "consecutive_failures", (double)info.consecutive_failures);
+            char* d_payload = cJSON_PrintUnformatted(diag);
+            cJSON_Delete(diag);
+            if (d_payload) { publish_raw(topic, d_payload, CONFIG_APP_CLOUD_QOS_STATE, false); cJSON_free(d_payload); }
+        }
+    }
+#endif
 
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -536,6 +567,29 @@ esp_err_t mqtt_publish_discovery(void)
         payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
         if (payload) { publish_raw(topic, payload, 1, true); cJSON_free(payload); }
     }
+
+#if ADS1115_COUNT > 0
+    for (size_t i = 0; i < inputs_ads1115_expected_devices(); ++i) {
+        input_ads1115_module_info_t info;
+        if (inputs_ads1115_get_module_info(i, &info) != ESP_OK) continue;
+        snprintf(topic, sizeof(topic), "%s/binary_sensor/%s/%s_online/config", s_discovery_prefix, s_device_id, info.id);
+        root = cJSON_CreateObject();
+        if (!root) continue;
+        char name[64]; snprintf(name, sizeof(name), "%s online", info.label);
+        char uid[96]; snprintf(uid, sizeof(uid), "%s_%s_online", s_device_id, info.id);
+        char state_topic[MQTT_TOPIC_MAX_LEN]; snprintf(state_topic, sizeof(state_topic), "%s/ads1115/%s/online", s_base_topic, info.id);
+        cJSON_AddStringToObject(root, "name", name);
+        cJSON_AddStringToObject(root, "unique_id", uid);
+        cJSON_AddStringToObject(root, "state_topic", state_topic);
+        cJSON_AddStringToObject(root, "payload_on", "ON");
+        cJSON_AddStringToObject(root, "payload_off", "OFF");
+        cJSON_AddStringToObject(root, "device_class", "connectivity");
+        cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
+        dev = cJSON_AddObjectToObject(root, "device"); ids = cJSON_AddArrayToObject(dev, "identifiers"); cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
+        payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
+        if (payload) { publish_raw(topic, payload, 1, true); cJSON_free(payload); }
+    }
+#endif
 
     const char *sensors[][3] = {
         {"firmware_version", "Firmware version", "{{ value_json.firmware.version }}"},

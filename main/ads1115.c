@@ -5,6 +5,7 @@
 
 #include "esp_check.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/i2c_master.h"
 
 #include "freertos/FreeRTOS.h"
@@ -27,6 +28,7 @@
 static const char* TAG = "ads1115";
 
 #define ADS1115_I2C_TIMEOUT_MS        200
+#define ADS1115_SCAN_TIMEOUT_MS       25
 #define ADS1115_ERROR_BACKOFF_SHORT   pdMS_TO_TICKS(100)
 #define ADS1115_ERROR_BACKOFF_MEDIUM  pdMS_TO_TICKS(500)
 #define ADS1115_ERROR_BACKOFF_LONG    pdMS_TO_TICKS(2000)
@@ -43,6 +45,8 @@ typedef struct {
     TickType_t poll_delay_ticks;
     TickType_t resume_at_tick;
     uint32_t consecutive_failures;
+    uint64_t last_seen_ms;
+    esp_err_t last_error;
 } ads1115_device_t;
 
 static ads1115_device_t s_devices[ADS1115_MAX_DEVICES];
@@ -112,6 +116,21 @@ static ads1115_device_t* get_device(size_t unit)
     return &s_devices[unit];
 }
 
+bool ads1115_is_valid_address(uint8_t address)
+{
+    return address >= 0x48 && address <= 0x4B;
+}
+
+static ads1115_device_t* find_device_by_address(uint8_t address)
+{
+    for (size_t i = 0; i < s_device_count; ++i) {
+        if (s_devices[i].in_use && s_devices[i].address == address) {
+            return &s_devices[i];
+        }
+    }
+    return NULL;
+}
+
 static TickType_t select_backoff_ticks(uint32_t failures)
 {
     if (failures > 6) {
@@ -131,6 +150,7 @@ static bool error_requires_reset(esp_err_t err)
 static void record_failure(size_t unit, ads1115_device_t* dev, esp_err_t err)
 {
     dev->consecutive_failures++;
+    dev->last_error = err;
     TickType_t backoff = select_backoff_ticks(dev->consecutive_failures);
     dev->resume_at_tick = xTaskGetTickCount() + backoff;
 
@@ -155,6 +175,8 @@ static void record_success(ads1115_device_t* dev)
 {
     dev->consecutive_failures = 0;
     dev->resume_at_tick = 0;
+    dev->last_error = ESP_OK;
+    dev->last_seen_ms = esp_timer_get_time() / 1000ULL;
 }
 
 static bool device_is_suspended(ads1115_device_t* dev)
@@ -221,6 +243,8 @@ static void reset_state(void)
         s_devices[i].poll_delay_ticks = ensure_min_tick(pdMS_TO_TICKS(1));
         s_devices[i].resume_at_tick = 0;
         s_devices[i].consecutive_failures = 0;
+        s_devices[i].last_seen_ms = 0;
+        s_devices[i].last_error = ESP_OK;
     }
     s_device_count = 0;
 }
@@ -280,6 +304,7 @@ esp_err_t ads1115_install(const ads1115_device_config_t* configs, size_t count)
         dev->poll_delay_ticks = ensure_min_tick(pdMS_TO_TICKS(1));
         dev->in_use = true;
         dev->address = cfg->address;
+        dev->last_error = ESP_OK;
 
         bool skip_thresholds = (dev->options.comp_queue == ADS1115_COMP_QUEUE_DISABLE);
         if (!skip_thresholds) {
@@ -304,6 +329,7 @@ esp_err_t ads1115_install(const ads1115_device_config_t* configs, size_t count)
         ESP_LOGI(TAG, "ADS1115[%zu] ready @0x%02X (mode=%s, gain=%d, rate=%d SPS)", ready, cfg->address,
                  (cfg->options.mode == ADS1115_MODE_SINGLE_SHOT) ? "single" : "continuous",
                  cfg->options.gain, cfg->options.data_rate);
+        record_success(dev);
         ready++;
         continue;
 
@@ -355,6 +381,73 @@ esp_err_t ads1115_get_info(size_t unit, ads1115_device_info_t* out_info)
     out_info->options = dev->options;
     out_info->current_mux = dev->current_mux;
     out_info->last_config_word = dev->last_config_word;
+    out_info->detected = true;
+    out_info->online = !device_is_suspended(dev);
+    out_info->last_seen_ms = dev->last_seen_ms;
+    out_info->last_error = dev->last_error;
+    out_info->consecutive_failures = dev->consecutive_failures;
+    return ESP_OK;
+}
+
+esp_err_t ads1115_probe_address(uint8_t address, TickType_t timeout_ticks)
+{
+    if (!ads1115_is_valid_address(address)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint32_t timeout_ms = pdTICKS_TO_MS(timeout_ticks);
+    if (timeout_ms == 0 || timeout_ms > ADS1115_SCAN_TIMEOUT_MS) {
+        timeout_ms = ADS1115_SCAN_TIMEOUT_MS;
+    }
+
+    ads1115_device_t* existing = find_device_by_address(address);
+    uint16_t cfg = 0;
+    if (existing && existing->handle) {
+        esp_err_t err = read_reg(existing->handle, ADS1115_REG_CONFIG, &cfg);
+        if (err == ESP_OK) {
+            record_success(existing);
+        } else {
+            record_failure((size_t)(existing - s_devices), existing, err);
+        }
+        return err;
+    }
+
+    i2c_master_bus_handle_t bus = i2c_bus_get();
+    if (!bus) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    i2c_master_dev_handle_t tmp = NULL;
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = address,
+        .scl_speed_hz = I2C_SPEED_HZ,
+    };
+    esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg, &tmp);
+    if (err != ESP_OK) {
+        return err;
+    }
+    uint8_t reg = ADS1115_REG_CONFIG;
+    uint8_t rx[2] = {0};
+    err = i2c_master_transmit_receive(tmp, &reg, 1, rx, sizeof(rx), timeout_ms);
+    esp_err_t rm_err = i2c_master_bus_rm_device(tmp);
+    if (rm_err != ESP_OK) {
+        ESP_LOGW(TAG, "ADS1115 probe cleanup @0x%02X: %s", address, esp_err_to_name(rm_err));
+    }
+    return err;
+}
+
+esp_err_t ads1115_scan(ads1115_scan_result_t* out_result)
+{
+    if (!out_result) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out_result, 0, sizeof(*out_result));
+    out_result->scan_time_ms = esp_timer_get_time() / 1000ULL;
+    for (uint8_t address = 0x48; address <= 0x4B; ++address) {
+        esp_err_t err = ads1115_probe_address(address, pdMS_TO_TICKS(ADS1115_SCAN_TIMEOUT_MS));
+        out_result->detected[address - 0x48] = (err == ESP_OK);
+    }
     return ESP_OK;
 }
 

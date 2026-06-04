@@ -833,81 +833,82 @@
     return card;
   }
 
+  function adsBadge(value, okText = 'Sì', noText = 'No'){
+    return `<span class="ads-chip ${value ? 'ok' : 'err'}">${value ? okText : noText}</span>`;
+  }
+
+  async function adsAction(path, payload){
+    await apiPost(path, payload || {});
+    await loadAdsDiagnostics();
+  }
+
   function renderAdsDiagnostics(){
     const summary = $("#adsDiagSummary");
     const refreshBtn = $("#adsDiagRefreshBtn");
-    const container = $("#adsDiagDevices");
+    const scanBtn = $("#adsDiagScanBtn");
+    const addBtn = $("#adsDiagAddBtn");
+    const tbody = $("#adsDiagDevices");
     const emptyMsg = $("#adsDiagEmpty");
     const timestampEl = $("#adsDiagTimestamp");
+    const unconfiguredEl = $("#adsDiagUnconfigured");
 
-    if (refreshBtn) {
-      refreshBtn.disabled = !!adsDiagState.loading;
-    }
+    [refreshBtn, scanBtn, addBtn].forEach(btn => { if (btn) btn.disabled = !!adsDiagState.loading; });
 
+    const configured = Number(adsDiagState.expected || 0);
+    const detected = Number(adsDiagState.detected || 0);
+    const offline = Number(adsDiagState.offline || 0);
     if (summary) {
-      summary.classList.remove("error", "success", "muted");
+      summary.classList.remove("error", "success", "muted", "warn");
       if (adsDiagState.loading) {
-        summary.textContent = "Caricamento diagnostica ADS1115…";
-        summary.classList.add("muted");
+        summary.textContent = "Caricamento ADS1115…"; summary.classList.add("muted");
       } else if (adsDiagState.error) {
-        summary.textContent = `Errore: ${adsDiagState.error}`;
-        summary.classList.add("error");
-      } else if (!adsDiagState.enabled) {
-        summary.textContent = "Gli ADS1115 non sono abilitati in questo firmware.";
-        summary.classList.add("muted");
-      } else if (adsDiagState.expected === 0) {
-        summary.textContent = "Nessun ADS1115 configurato.";
-        summary.classList.add("muted");
-      } else if (adsDiagState.detected === adsDiagState.expected) {
-        summary.textContent = `Tutti gli ADS1115 sono online (${adsDiagState.detected} su ${adsDiagState.expected}).`;
-        summary.classList.add("success");
-      } else if (adsDiagState.detected > 0) {
-        summary.textContent = `Rilevati ${adsDiagState.detected} su ${adsDiagState.expected} ADS1115.`;
-        summary.classList.add("error");
+        summary.textContent = `Errore: ${adsDiagState.error}`; summary.classList.add("error");
+      } else if (!configured) {
+        summary.textContent = "Nessun modulo ADS1115 configurato. Lo scan può mostrare moduli rilevati ma non configurati."; summary.classList.add("muted");
+      } else if (offline > 0) {
+        summary.textContent = `Configurati ${configured}, rilevati ${detected}, offline ${offline}.`; summary.classList.add("warn");
       } else {
-        summary.textContent = "Nessun ADS1115 rilevato sul bus I²C.";
-        summary.classList.add("error");
+        summary.textContent = `Configurati ${configured}, rilevati ${detected}. Tutti i moduli abilitati sono online.`; summary.classList.add("success");
       }
     }
 
-    if (container && !adsDiagState.loading) {
-      container.innerHTML = "";
-      if (adsDiagState.enabled && Array.isArray(adsDiagState.devices) && adsDiagState.devices.length) {
-        const frag = document.createDocumentFragment();
-        adsDiagState.devices.forEach((device, idx) => {
-          const card = buildAdsDiagCard(device, idx);
-          if (card) frag.appendChild(card);
-        });
-        container.appendChild(frag);
-      }
+    if (tbody && !adsDiagState.loading) {
+      tbody.innerHTML = "";
+      const modules = Array.isArray(adsDiagState.devices) ? adsDiagState.devices : [];
+      modules.forEach((mod) => {
+        const zones = Array.isArray(mod.zones) ? mod.zones.map(z => `Z${z}`).join(', ') : '—';
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td><code>${escapeHtml(mod.id || '')}</code></td>
+          <td>${escapeHtml(mod.label || '')}<br><small class="muted">${escapeHtml(mod.role || '')}</small></td>
+          <td><code>${escapeHtml(mod.address_hex || '')}</code></td>
+          <td>${adsBadge(!!mod.enabled)}</td>
+          <td>${adsBadge(!!mod.detected)}</td>
+          <td>${adsBadge(!!mod.online, 'Online', 'Offline')}</td>
+          <td>${escapeHtml(mod.last_error || '—')}<br><small class="muted">fail: ${Number(mod.consecutive_failures || 0)}</small></td>
+          <td>${mod.last_seen ? formatDateTime(Number(mod.last_seen)) : '—'}</td>
+          <td>${escapeHtml(zones)}</td>
+          <td><div class="ads-actions">
+            <button class="btn outline" data-ads-act="edit" data-id="${escapeHtml(mod.id)}">Modifica</button>
+            <button class="btn outline" data-ads-act="replace" data-id="${escapeHtml(mod.id)}">Sostituisci</button>
+            <button class="btn outline" data-ads-act="test" data-id="${escapeHtml(mod.id)}">Test lettura</button>
+            <button class="btn outline" data-ads-act="reset" data-id="${escapeHtml(mod.id)}">Reset errori</button>
+            <button class="btn ${mod.enabled ? 'danger' : ''}" data-ads-act="${mod.enabled ? 'disable' : 'enable'}" data-id="${escapeHtml(mod.id)}">${mod.enabled ? 'Disabilita' : 'Riabilita'}</button>
+            <button class="btn danger" data-ads-act="delete" data-id="${escapeHtml(mod.id)}">Elimina</button>
+          </div></td>`;
+        tbody.appendChild(tr);
+      });
     }
 
-    if (emptyMsg) {
-      let show = false;
-      let message = "Nessun dato disponibile.";
-      if (!adsDiagState.loading) {
-        if (!adsDiagState.enabled) {
-          message = "Gli ADS1115 non sono abilitati in questo firmware.";
-          show = true;
-        } else if (adsDiagState.expected === 0) {
-          message = "Nessun ADS1115 configurato.";
-          show = true;
-        } else if (!adsDiagState.devices.length) {
-          show = true;
-        }
-      }
-      emptyMsg.textContent = message;
-      emptyMsg.classList.toggle("hidden", !show);
-    }
-
+    if (emptyMsg) emptyMsg.classList.toggle('hidden', adsDiagState.loading || (adsDiagState.devices || []).length > 0);
     if (timestampEl) {
-      if (!adsDiagState.loading && adsDiagState.enabled && adsDiagState.timestampMs) {
-        timestampEl.textContent = `Ultimo aggiornamento: ${formatDateTime(adsDiagState.timestampMs)}.`;
-        timestampEl.classList.remove("hidden");
-      } else {
-        timestampEl.textContent = "";
-        timestampEl.classList.add("hidden");
-      }
+      if (!adsDiagState.loading && adsDiagState.timestampMs) { timestampEl.textContent = `Ultimo scan/aggiornamento: ${formatDateTime(adsDiagState.timestampMs)}.`; timestampEl.classList.remove('hidden'); }
+      else { timestampEl.classList.add('hidden'); }
+    }
+    if (unconfiguredEl) {
+      const list = Array.isArray(adsDiagState.unconfigured) ? adsDiagState.unconfigured : [];
+      unconfiguredEl.textContent = list.length ? `Rilevati ma non configurati: ${list.join(', ')}.` : '';
+      unconfiguredEl.classList.toggle('hidden', !list.length);
     }
   }
 
@@ -917,20 +918,18 @@
     adsDiagState.error = "";
     renderAdsDiagnostics();
     try {
-      const data = await apiGet("/api/admin/diagnostics/ads1115");
-      adsDiagState.enabled = data?.enabled !== false;
-      adsDiagState.expected = Number.isFinite(Number(data?.expected)) ? Number(data.expected) : 0;
+      const data = await apiGet("/api/admin/ads1115");
+      adsDiagState.enabled = true;
+      adsDiagState.expected = Number.isFinite(Number(data?.configured)) ? Number(data.configured) : 0;
       adsDiagState.detected = Number.isFinite(Number(data?.detected)) ? Number(data.detected) : 0;
-      adsDiagState.timestampMs = Number.isFinite(Number(data?.timestamp_ms)) ? Number(data.timestamp_ms) : Date.now();
-      const devices = Array.isArray(data?.devices) ? data.devices : [];
-      adsDiagState.devices = adsDiagState.enabled ? devices : [];
-      adsDiagState.error = "";
+      adsDiagState.offline = Number.isFinite(Number(data?.offline)) ? Number(data.offline) : 0;
+      adsDiagState.timestampMs = Number.isFinite(Number(data?.last_scan)) && Number(data.last_scan) > 0 ? Number(data.last_scan) : Date.now();
+      adsDiagState.devices = Array.isArray(data?.modules) ? data.modules : [];
+      adsDiagState.unconfigured = Array.isArray(data?.detected_unconfigured) ? data.detected_unconfigured : [];
       adsDiagFetchedOnce = true;
     } catch (err){
-      adsDiagState.error = err?.message || "Impossibile caricare la diagnostica ADS1115.";
-      if (!adsDiagFetchedOnce) {
-        adsDiagState.devices = [];
-      }
+      adsDiagState.error = err?.message || "Impossibile caricare ADS1115.";
+      if (!adsDiagFetchedOnce) adsDiagState.devices = [];
     } finally {
       adsDiagState.loading = false;
       renderAdsDiagnostics();
@@ -939,14 +938,27 @@
 
   function setupAdsDiagnostics(){
     const refreshBtn = $("#adsDiagRefreshBtn");
-    if (refreshBtn && !refreshBtn._adsBound){
-      refreshBtn.addEventListener("click", (ev) => {
+    const scanBtn = $("#adsDiagScanBtn");
+    const addBtn = $("#adsDiagAddBtn");
+    if (refreshBtn && !refreshBtn._adsBound){ refreshBtn.addEventListener("click", (ev)=>{ ev.preventDefault(); loadAdsDiagnostics(); }); refreshBtn._adsBound = true; }
+    if (scanBtn && !scanBtn._adsBound){ scanBtn.addEventListener("click", async (ev)=>{ ev.preventDefault(); try { await apiPost('/api/admin/ads1115/scan', {}); await loadAdsDiagnostics(); } catch(err){ adsDiagState.error = err?.message || 'Scan fallito'; renderAdsDiagnostics(); } }); scanBtn._adsBound = true; }
+    if (addBtn && !addBtn._adsBound){ addBtn.addEventListener("click", async (ev)=>{ ev.preventDefault(); const address = prompt('Indirizzo I²C (0x48, 0x49, 0x4A, 0x4B)', '0x48'); if (!address) return; const label = prompt('Label modulo', 'ADS1115 Zone 1-4') || ''; try { await apiPost('/api/admin/ads1115', { address, label, enabled: true }); await loadAdsDiagnostics(); } catch(err){ alert(err?.message || 'Aggiunta fallita'); } }); addBtn._adsBound = true; }
+    if (!setupAdsDiagnostics._delegated){
+      document.addEventListener('click', async (ev) => {
+        const btn = ev.target?.closest?.('[data-ads-act]');
+        if (!btn) return;
         ev.preventDefault();
-        if (!adsDiagState.loading) {
-          loadAdsDiagnostics();
-        }
+        const id = btn.dataset.id;
+        const act = btn.dataset.adsAct;
+        try {
+          if (act === 'disable' || act === 'enable') await adsAction(`/api/admin/ads1115/${encodeURIComponent(id)}/${act}`);
+          else if (act === 'reset') await adsAction(`/api/admin/ads1115/${encodeURIComponent(id)}/reset-errors`);
+          else if (act === 'test') { const r = await apiPost(`/api/admin/ads1115/${encodeURIComponent(id)}/test-read`, {}); alert(`Raw: ${(r.raw || []).join(', ')}`); }
+          else if (act === 'replace' || act === 'edit') { const address = prompt('Nuovo indirizzo I²C', '0x48'); if (!address) return; const label = prompt('Nuova label (opzionale)', '') || ''; await adsAction(`/api/admin/ads1115/${encodeURIComponent(id)}/replace`, { new_address: address, label }); }
+          else if (act === 'delete') { const force = confirm('Forzare eliminazione se ci sono zone associate? OK=force, Annulla=senza force'); await apiDelete(`/api/admin/ads1115/${encodeURIComponent(id)}${force ? '?force=true' : ''}`); await loadAdsDiagnostics(); }
+        } catch(err){ alert(err?.message || 'Operazione ADS1115 fallita'); }
       });
-      refreshBtn._adsBound = true;
+      setupAdsDiagnostics._delegated = true;
     }
     return loadAdsDiagnostics();
   }
@@ -955,9 +967,7 @@
     if (adsDiagState.loading) return;
     const last = Number(adsDiagState.timestampMs) || 0;
     const stale = !adsDiagFetchedOnce || (Date.now() - last) > ADS_DIAG_REFRESH_THRESHOLD_MS;
-    if (adsDiagState.error || stale) {
-      loadAdsDiagnostics();
-    }
+    if (adsDiagState.error || stale) loadAdsDiagnostics();
   }
 
   function setAnalogStatus(text, variant){
@@ -2188,6 +2198,7 @@
   function formatValue(v){
     if (v === null || v === undefined) return "—";
     if (typeof v === "boolean") return v ? "sì" : "no";
+    if (typeof v === "object") return JSON.stringify(v);
     return String(v);
   }
 

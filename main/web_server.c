@@ -5060,6 +5060,181 @@ static esp_err_t api_admin_ads1115_diag_get(httpd_req_t* req)
     return json_reply_cjson(req, root);
 }
 
+static bool parse_ads_address_json(const cJSON* root, const char* key, uint8_t* out)
+{
+    const cJSON* item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!item || !out) return false;
+    long value = -1;
+    if (cJSON_IsString(item) && item->valuestring) {
+        char* end = NULL;
+        value = strtol(item->valuestring, &end, 0);
+    } else if (cJSON_IsNumber(item)) {
+        value = (long)item->valuedouble;
+    }
+    if (value < 0 || value > 0x7F || !ads1115_is_valid_address((uint8_t)value)) return false;
+    *out = (uint8_t)value;
+    return true;
+}
+
+static void ads_module_info_to_json(cJSON* arr, const input_ads1115_module_info_t* info)
+{
+    if (!arr || !info) return;
+    cJSON* item = cJSON_CreateObject();
+    if (!item) return;
+    cJSON_AddItemToArray(arr, item);
+    cJSON_AddStringToObject(item, "id", info->id);
+    cJSON_AddStringToObject(item, "label", info->label);
+    cJSON_AddStringToObject(item, "role", info->role);
+    cJSON_AddNumberToObject(item, "i2c_address", info->i2c_address);
+    char addr_hex[8]; snprintf(addr_hex, sizeof(addr_hex), "0x%02X", info->i2c_address);
+    cJSON_AddStringToObject(item, "address_hex", addr_hex);
+    cJSON_AddBoolToObject(item, "configured", info->configured);
+    cJSON_AddBoolToObject(item, "enabled", info->enabled);
+    cJSON_AddBoolToObject(item, "detected", info->detected);
+    cJSON_AddBoolToObject(item, "online", info->online);
+    cJSON_AddNumberToObject(item, "last_seen", (double)info->last_seen_ms);
+    cJSON_AddNumberToObject(item, "last_scan", (double)info->last_scan_ms);
+    cJSON_AddStringToObject(item, "last_error", info->last_error);
+    cJSON_AddNumberToObject(item, "consecutive_failures", (double)info->consecutive_failures);
+    cJSON* zones = cJSON_AddArrayToObject(item, "zones");
+    for (uint8_t i = 0; zones && i < info->zone_count; ++i) cJSON_AddItemToArray(zones, cJSON_CreateNumber(info->zones[i]));
+    cJSON_AddNumberToObject(item, "zone_count", (double)info->zone_count);
+}
+
+static esp_err_t api_admin_ads1115_get(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"), ESP_FAIL;
+    input_ads1115_summary_t sum;
+    inputs_ads1115_get_summary(&sum);
+    cJSON_AddNumberToObject(root, "configured", (double)sum.configured_count);
+    cJSON_AddNumberToObject(root, "enabled", (double)sum.enabled_count);
+    cJSON_AddNumberToObject(root, "detected", (double)sum.detected_count);
+    cJSON_AddNumberToObject(root, "offline", (double)sum.offline_count);
+    cJSON_AddNumberToObject(root, "last_scan", (double)sum.last_scan_ms);
+    cJSON_AddStringToObject(root, "bus_status", sum.bus_status);
+    cJSON_AddStringToObject(root, "last_error", sum.last_error);
+    cJSON* modules = cJSON_AddArrayToObject(root, "modules");
+    for (size_t i = 0; modules && i < inputs_ads1115_expected_devices(); ++i) {
+        input_ads1115_module_info_t info;
+        if (inputs_ads1115_get_module_info(i, &info) == ESP_OK) ads_module_info_to_json(modules, &info);
+    }
+    cJSON* unconfigured = cJSON_AddArrayToObject(root, "detected_unconfigured");
+    for (uint8_t addr = 0x48; unconfigured && addr <= 0x4B; ++addr) {
+        bool configured = false;
+        for (size_t i = 0; i < inputs_ads1115_expected_devices(); ++i) {
+            input_ads1115_module_info_t info;
+            if (inputs_ads1115_get_module_info(i, &info) == ESP_OK && info.i2c_address == addr) configured = true;
+        }
+        if (!configured && ads1115_probe_address(addr, pdMS_TO_TICKS(25)) == ESP_OK) {
+            char buf[8]; snprintf(buf, sizeof(buf), "0x%02X", addr);
+            cJSON_AddItemToArray(unconfigured, cJSON_CreateString(buf));
+        }
+    }
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_admin_ads1115_scan_post(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    esp_err_t err = inputs_ads1115_scan();
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, esp_err_to_name(err)), ESP_FAIL;
+    return api_admin_ads1115_get(req);
+}
+
+static esp_err_t api_admin_ads1115_post(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char body[512]; size_t bl=0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
+    cJSON* j = cJSON_ParseWithLength(body, bl);
+    if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
+    uint8_t address = 0;
+    bool ok = parse_ads_address_json(j, "address", &address) || parse_ads_address_json(j, "i2c_address", &address);
+    const cJSON* jl = cJSON_GetObjectItemCaseSensitive(j, "label");
+    const cJSON* je = cJSON_GetObjectItemCaseSensitive(j, "enabled");
+    bool enabled = !cJSON_IsBool(je) || cJSON_IsTrue(je);
+    bool detected = false;
+    esp_err_t err = ok ? inputs_ads1115_add_module(address, cJSON_IsString(jl) ? jl->valuestring : NULL, enabled, &detected) : ESP_ERR_INVALID_ARG;
+    cJSON_Delete(j);
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err)), ESP_FAIL;
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddBoolToObject(root, "detected", detected);
+    cJSON_AddStringToObject(root, "warning", detected ? "" : "Modulo salvato come previsto ma offline");
+    return json_reply_cjson(req, root);
+}
+
+static bool parse_ads_id_action(const char* uri, char* id, size_t id_len, const char** action)
+{
+    const char* base = "/api/admin/ads1115/";
+    size_t base_len = strlen(base);
+    if (!uri || strncmp(uri, base, base_len) != 0) return false;
+    const char* p = uri + base_len;
+    const char* slash = strchr(p, '/');
+    const char* query = strchr(p, '?');
+    const char* end = slash ? slash : (query ? query : p + strlen(p));
+    size_t n = (size_t)(end - p);
+    if (n == 0 || n >= id_len) return false;
+    memcpy(id, p, n); id[n] = '\0';
+    *action = slash ? slash + 1 : "";
+    return true;
+}
+
+static esp_err_t api_admin_ads1115_action_post(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char id[16]; const char* action = NULL;
+    if (!parse_ads_id_action(req->uri, id, sizeof(id), &action)) return httpd_resp_send_err(req,400,"uri"), ESP_FAIL;
+    char body[512]; size_t bl=0;
+    cJSON* j = NULL;
+    if (req->content_len > 0 && read_body_to_buf(req, body, sizeof(body), &bl)==ESP_OK) j = cJSON_ParseWithLength(body, bl);
+    esp_err_t err = ESP_ERR_INVALID_ARG;
+    bool detected = false;
+    if (strcmp(action, "disable") == 0) err = inputs_ads1115_set_enabled(id, false);
+    else if (strcmp(action, "enable") == 0) err = inputs_ads1115_set_enabled(id, true);
+    else if (strcmp(action, "reset-errors") == 0) err = inputs_ads1115_reset_errors(id);
+    else if (strcmp(action, "replace") == 0 && j) {
+        uint8_t addr = 0;
+        const cJSON* jl = cJSON_GetObjectItemCaseSensitive(j, "label");
+        if (parse_ads_address_json(j, "new_address", &addr)) err = inputs_ads1115_replace_module(id, addr, cJSON_IsString(jl) ? jl->valuestring : NULL, &detected);
+    } else if (strcmp(action, "test-read") == 0) {
+        int16_t raw[ADS1115_CHANNEL_COUNT] = {0};
+        err = inputs_ads1115_test_read(id, raw);
+        if (err == ESP_OK) {
+            cJSON* root = cJSON_CreateObject();
+            cJSON_AddBoolToObject(root, "ok", true);
+            cJSON* arr = cJSON_AddArrayToObject(root, "raw");
+            for (int i = 0; arr && i < ADS1115_CHANNEL_COUNT; ++i) cJSON_AddItemToArray(arr, cJSON_CreateNumber(raw[i]));
+            if (j) cJSON_Delete(j);
+            return json_reply_cjson(req, root);
+        }
+    }
+    if (j) cJSON_Delete(j);
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err)), ESP_FAIL;
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    if (strcmp(action, "replace") == 0) cJSON_AddBoolToObject(root, "detected", detected);
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_admin_ads1115_delete(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char id[16]; const char* action = NULL;
+    if (!parse_ads_id_action(req->uri, id, sizeof(id), &action)) return httpd_resp_send_err(req,400,"uri"), ESP_FAIL;
+    bool force = strstr(req->uri, "force=true") != NULL;
+    char query[64];
+    if (!force && httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char value[8];
+        force = httpd_query_key_value(query, "force", value, sizeof(value)) == ESP_OK && strcmp(value, "true") == 0;
+    }
+    esp_err_t err = inputs_ads1115_delete_module(id, force);
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, esp_err_to_name(err)), ESP_FAIL;
+    return json_reply(req, "{\"ok\":true}");
+}
+
 
 static esp_err_t api_admin_analog_eol_get(httpd_req_t* req)
 {
@@ -5859,6 +6034,11 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/admin/notifications", .method = HTTP_GET, .handler = api_admin_notifications_get },
     { .uri = "/api/admin/notifications", .method = HTTP_POST, .handler = api_admin_notifications_post },
     { .uri = "/api/admin/notifications/test", .method = HTTP_POST, .handler = api_admin_notifications_test_post },
+    { .uri = "/api/admin/ads1115", .method = HTTP_GET, .handler = api_admin_ads1115_get },
+    { .uri = "/api/admin/ads1115", .method = HTTP_POST, .handler = api_admin_ads1115_post },
+    { .uri = "/api/admin/ads1115/scan", .method = HTTP_POST, .handler = api_admin_ads1115_scan_post },
+    { .uri = "/api/admin/ads1115/*", .method = HTTP_POST, .handler = api_admin_ads1115_action_post },
+    { .uri = "/api/admin/ads1115/*", .method = HTTP_DELETE, .handler = api_admin_ads1115_delete },
     { .uri = "/api/admin/diagnostics/ads1115", .method = HTTP_GET, .handler = api_admin_ads1115_diag_get },
 #if ADS1115_COUNT > 0
     { .uri = "/api/admin/inputs/analog-eol", .method = HTTP_GET,  .handler = api_admin_analog_eol_get },

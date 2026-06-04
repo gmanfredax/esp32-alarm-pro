@@ -184,7 +184,19 @@ esp_err_t system_info_append_json(cJSON *root)
     cJSON_AddBoolToObject(p, "tamper", inputs_tamper(gpioab));
     cJSON_AddNumberToObject(p, "outputs_mask", outmask);
 #if ADS1115_COUNT > 0
-    cJSON_AddStringToObject(p, "ads1115", "configured");
+    input_ads1115_summary_t ads = {0};
+    if (inputs_ads1115_get_summary(&ads) == ESP_OK) {
+        cJSON *ads_obj = cJSON_AddObjectToObject(p, "ads1115");
+        cJSON_AddNumberToObject(ads_obj, "configured", (double)ads.configured_count);
+        cJSON_AddNumberToObject(ads_obj, "enabled", (double)ads.enabled_count);
+        cJSON_AddNumberToObject(ads_obj, "detected", (double)ads.detected_count);
+        cJSON_AddNumberToObject(ads_obj, "offline", (double)ads.offline_count);
+        cJSON_AddNumberToObject(ads_obj, "last_scan", (double)ads.last_scan_ms);
+        cJSON_AddStringToObject(ads_obj, "bus_status", ads.bus_status);
+        cJSON_AddStringToObject(ads_obj, "last_error", ads.last_error);
+    } else {
+        cJSON_AddStringToObject(p, "ads1115", "configured");
+    }
 #else
     cJSON_AddStringToObject(p, "ads1115", "not_configured");
 #endif

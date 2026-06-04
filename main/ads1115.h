@@ -8,11 +8,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "pins.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define ADS1115_MAX_DEVICES 3
+#define ADS1115_MAX_DEVICES ADS1115_ADMIN_MAX_MODULES
 #define ADS1115_CHANNEL_COUNT 4
 
 // ADS1115 register map
@@ -100,7 +102,17 @@ typedef struct {
     ads1115_operating_config_t options;
     ads1115_mux_t current_mux;
     uint16_t last_config_word;
+    bool detected;
+    bool online;
+    uint64_t last_seen_ms;
+    esp_err_t last_error;
+    uint32_t consecutive_failures;
 } ads1115_device_info_t;
+
+typedef struct {
+    bool detected[ADS1115_ADMIN_MAX_MODULES];
+    uint64_t scan_time_ms;
+} ads1115_scan_result_t;
 
 esp_err_t ads1115_install(const ads1115_device_config_t* configs, size_t count);
 esp_err_t ads1115_uninstall(void);
@@ -115,6 +127,9 @@ esp_err_t ads1115_single_shot(size_t unit, ads1115_mux_t mux, TickType_t timeout
 esp_err_t ads1115_set_thresholds(size_t unit, int16_t low, int16_t high);
 esp_err_t ads1115_get_thresholds(size_t unit, int16_t* low, int16_t* high);
 float ads1115_raw_to_voltage(int16_t raw, ads1115_gain_t gain);
+bool ads1115_is_valid_address(uint8_t address);
+esp_err_t ads1115_probe_address(uint8_t address, TickType_t timeout_ticks);
+esp_err_t ads1115_scan(ads1115_scan_result_t* out_result);
 void ads1115_debug_dump(void);
 
 #ifdef __cplusplus

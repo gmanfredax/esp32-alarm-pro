@@ -91,6 +91,33 @@ typedef struct {
     float adc_voltage;
     float supply_voltage;
 } input_supply_state_t;
+
+typedef struct {
+    char id[16];
+    char label[32];
+    char role[24];
+    uint8_t i2c_address;
+    bool configured;
+    bool enabled;
+    bool detected;
+    bool online;
+    uint64_t last_seen_ms;
+    uint64_t last_scan_ms;
+    char last_error[32];
+    uint32_t consecutive_failures;
+    uint8_t zone_count;
+    uint16_t zones[ADS1115_CHANNEL_COUNT];
+} input_ads1115_module_info_t;
+
+typedef struct {
+    size_t configured_count;
+    size_t enabled_count;
+    size_t detected_count;
+    size_t offline_count;
+    uint64_t last_scan_ms;
+    char bus_status[24];
+    char last_error[32];
+} input_ads1115_summary_t;
 #endif
 
 #if ADS1115_COUNT > 0
@@ -102,6 +129,17 @@ esp_err_t inputs_ads1115_read_all_raw(size_t index, TickType_t timeout_per_chann
 esp_err_t inputs_ads1115_read_all_voltage(size_t index, TickType_t timeout_per_channel, float out_voltage[ADS1115_CHANNEL_COUNT]);
 esp_err_t inputs_ads1115_get_expected_config(size_t index, ads1115_device_config_t* out_cfg);
 int inputs_ads1115_detected_index_for_address(uint8_t address);
+esp_err_t inputs_ads1115_scan(void);
+esp_err_t inputs_ads1115_get_module_info(size_t index, input_ads1115_module_info_t* out_info);
+size_t inputs_ads1115_configured_count(void);
+esp_err_t inputs_ads1115_get_summary(input_ads1115_summary_t* out_summary);
+esp_err_t inputs_ads1115_add_module(uint8_t address, const char* label, bool enabled, bool* detected);
+esp_err_t inputs_ads1115_replace_module(const char* id, uint8_t new_address, const char* label, bool* detected);
+esp_err_t inputs_ads1115_set_enabled(const char* id, bool enabled);
+esp_err_t inputs_ads1115_delete_module(const char* id, bool force);
+esp_err_t inputs_ads1115_reset_errors(const char* id);
+esp_err_t inputs_ads1115_test_read(const char* id, int16_t out_raw[ADS1115_CHANNEL_COUNT]);
+bool inputs_analog_zone_available(size_t index);
 
 size_t inputs_analog_zone_count(void);
 void inputs_analog_load_defaults(void);
