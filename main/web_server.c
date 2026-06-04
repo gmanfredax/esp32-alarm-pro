@@ -5837,7 +5837,11 @@ static esp_err_t zones_config_post(httpd_req_t* req){
         if(cJSON_IsBool(jn)) z_delay = cJSON_IsTrue(jn);
 
         jn = cJSON_GetObjectItemCaseSensitive(it, "zone_time");
-        if(cJSON_IsNumber(jn)) z_time = (uint16_t)jn->valuedouble;
+        if(cJSON_IsNumber(jn)) {
+            double raw_time = jn->valuedouble;
+            if(raw_time < 0 || raw_time > 600) { cJSON_Delete(json); httpd_resp_send_err(req, 400, "zone_time"); return ESP_FAIL; }
+            z_time = (uint16_t)raw_time;
+        }
 
         // fallback legacy
         jn = cJSON_GetObjectItemCaseSensitive(it, "entry_delay");
@@ -5846,9 +5850,15 @@ static esp_err_t zones_config_post(httpd_req_t* req){
         if(cJSON_IsBool(jn)) z_delay = (z_delay || cJSON_IsTrue(jn));
 
         jn = cJSON_GetObjectItemCaseSensitive(it, "entry_time");
-        if(cJSON_IsNumber(jn) && (uint16_t)jn->valuedouble>0) z_time = (uint16_t)jn->valuedouble;
+        if(cJSON_IsNumber(jn) && jn->valuedouble>0) {
+            if(jn->valuedouble > 600) { cJSON_Delete(json); httpd_resp_send_err(req, 400, "entry_time"); return ESP_FAIL; }
+            z_time = (uint16_t)jn->valuedouble;
+        }
         jn = cJSON_GetObjectItemCaseSensitive(it, "exit_time");
-        if(cJSON_IsNumber(jn) && (uint16_t)jn->valuedouble>0) z_time = (uint16_t)jn->valuedouble;
+        if(cJSON_IsNumber(jn) && jn->valuedouble>0) {
+            if(jn->valuedouble > 600) { cJSON_Delete(json); httpd_resp_send_err(req, 400, "exit_time"); return ESP_FAIL; }
+            z_time = (uint16_t)jn->valuedouble;
+        }
 
         jn = cJSON_GetObjectItemCaseSensitive(it, "auto_exclude");
         if(cJSON_IsBool(jn)) c->auto_exclude = cJSON_IsTrue(jn);

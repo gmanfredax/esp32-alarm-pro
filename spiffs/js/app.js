@@ -31,7 +31,10 @@ const state = {
   activeTab: '',
   sceneActiveMask: 0,
   sceneMaskKnown: false,
-  sceneMaskSyncedForAlarm: false
+  sceneMaskSyncedForAlarm: false,
+  runtimeOnline: true,
+  zonesConfigDirty: false,
+  zonesConfigSnapshot: null
 };
 
 const STATUS_POLL_INTERVAL = 2000;
@@ -42,6 +45,8 @@ let zonesPollTimer = null;
 let idleTimer = null;
 let idleTracking = false;
 let idleTriggering = false;
+let statusRefreshInFlight = false;
+let zonesRefreshInFlight = false;
 let lastActivityTs = Date.now();
 const idleEvents = ['pointerdown', 'pointermove', 'keydown', 'touchstart', 'wheel'];
 const idleListenerOptions = { passive: true };
@@ -374,7 +379,8 @@ function setActiveTab(name){
   state.activeTab = name;
   if (name !== 'status') {
     stopStatusUpdates();
-  } else if (name !== 'zones') {
+  }
+  if (name !== 'zones') {
     stopZonesUpdates();
   }
   switch (name) {
@@ -417,7 +423,18 @@ function showNotice(text, type = 'info'){
 
   el.textContent = text;
   el.classList.remove('hidden');
-  el.style.color = type === 'error' ? '#f87171' : '#a5f3fc';
+  el.style.color = type === 'error' ? '#f87171' : (type === 'warn' ? '#fbbf24' : '#a5f3fc');
+}
+
+
+function setRuntimeConnection(ok, message = ''){
+  state.runtimeOnline = Boolean(ok);
+  const text = ok ? '' : (message || 'Connessione persa: aggiornamento live sospeso, i dati inseriti restano intatti.');
+  if (!ok) {
+    showNotice(text, 'warn');
+  } else if ($('#appNotice')?.textContent === 'Connessione persa: aggiornamento live sospeso, i dati inseriti restano intatti.') {
+    showNotice('', 'info');
+  }
 }
 
 function updateHardwareNotice(status){
@@ -660,8 +677,11 @@ function kpiCard({ title, valueHTML }){
 }
 
 async function refreshStatus(){
+  if (statusRefreshInFlight) return;
+  statusRefreshInFlight = true;
   try {
     const data = await apiGet('/api/status');
+    setRuntimeConnection(true);
     const prevStateName = state.status?.state || '';
     const prevAlarmZoneIds = Array.isArray(state.alarmZoneIds) ? [...state.alarmZoneIds] : [];
     state.status = data;
@@ -739,7 +759,9 @@ async function refreshStatus(){
     }
   } catch (err) {
     console.error('refreshStatus', err);
-    showNotice('Impossibile recuperare lo stato.', 'error');
+    setRuntimeConnection(false);
+  } finally {
+    statusRefreshInFlight = false;
   }
 }
 
@@ -750,6 +772,105 @@ function buildZoneBadge(zone){
   const time = Number(zone?.zone_time);
   if (Number.isFinite(time) && time > 0) badges.push(`<span class="badge" title="Tempo">${time}s</span>`);
   return badges.join('');
+}
+
+
+function zoneRuntimeText(zone, offline = false){
+  if (offline) return 'Offline';
+  if (!zone) return '—';
+  if (zone.active) return 'Aperta';
+  if (zone.fault) return 'Guasto';
+  if (zone.unavailable) return 'N/D';
+  return 'Chiusa';
+}
+
+function zoneRuntimeClass(zone, offline = false){
+  if (offline) return 'offline';
+  if (zone?.active) return 'open';
+  if (zone?.fault || zone?.unavailable) return 'fault';
+  return 'closed';
+}
+
+function updateZoneRuntimeElement(el, zone, { offline = false } = {}){
+  if (!el) return;
+  el.textContent = zoneRuntimeText(zone, offline);
+  el.className = `zone-runtime-badge ${zoneRuntimeClass(zone, offline)}`;
+}
+
+function updateOpenZonesConfigRuntime(){
+  const modal = $('.zones-config-modal');
+  if (!modal) return;
+  $$('.zone-config-card', modal).forEach((card) => {
+    const id = Number(card.dataset.zoneId);
+    const boardId = Number(card.dataset.boardId);
+    if (!Number.isFinite(id)) return;
+    const zone = state.zones.find((item) => Number(item?.id) === id && (Number(item?.board) || 0) === (Number.isFinite(boardId) ? boardId : 0));
+    const meta = getBoardMeta(Number.isFinite(boardId) ? boardId : 0);
+    const offline = boardStatusDetails(meta)?.className === 'offline';
+    updateZoneRuntimeElement($('.zone-runtime-badge', card), zone, { offline });
+  });
+}
+
+function setZonesConfigDirty(dirty, modal = $('.zones-config-modal')){
+  state.zonesConfigDirty = Boolean(dirty);
+  if (!modal) return;
+  modal.classList.toggle('dirty', state.zonesConfigDirty);
+  const badge = $('#zonesCfgDirtyBadge', modal);
+  const msg = $('#zonesCfgDirtyMsg', modal);
+  badge?.classList.toggle('hidden', !state.zonesConfigDirty);
+  msg?.classList.toggle('hidden', !state.zonesConfigDirty);
+}
+
+function readZoneConfigFromModal(modal, fallbackBoard = 0){
+  return $$('.zone-config-card', modal).map((card) => {
+    const id = Number(card.dataset.zoneId);
+    if (!Number.isFinite(id)) return null;
+    const cardBoardId = Number(card.dataset.boardId);
+    const nameInput = $('[data-field="name"]', card);
+    const delayInput = $('[data-field="zone_delay"]', card);
+    const timeInput = $('[data-field="zone_time"]', card);
+    const autoInput = $('[data-field="auto_exclude"]', card);
+    return {
+      id,
+      name: nameInput?.value?.trim() || '',
+      zone_delay: !!(delayInput && delayInput.checked),
+      zone_time: Math.max(0, Number.parseInt(timeInput?.value ?? '0', 10) || 0),
+      auto_exclude: !!(autoInput && autoInput.checked),
+      board: Number.isFinite(cardBoardId) ? cardBoardId : fallbackBoard
+    };
+  }).filter(Boolean);
+}
+
+function applyZoneConfigSnapshot(modal, snapshot){
+  if (!modal || !Array.isArray(snapshot)) return;
+  const byKey = new Map(snapshot.map((item) => [`${item.board || 0}:${item.id}`, item]));
+  $$('.zone-config-card', modal).forEach((card) => {
+    const id = Number(card.dataset.zoneId);
+    const boardId = Number(card.dataset.boardId) || 0;
+    const item = byKey.get(`${boardId}:${id}`);
+    if (!item) return;
+    const nameInput = $('[data-field="name"]', card);
+    const delayInput = $('[data-field="zone_delay"]', card);
+    const timeInput = $('[data-field="zone_time"]', card);
+    const autoInput = $('[data-field="auto_exclude"]', card);
+    if (nameInput) nameInput.value = item.name || '';
+    if (delayInput) delayInput.checked = !!item.zone_delay;
+    if (timeInput) timeInput.value = String(Math.max(0, Number.parseInt(item.zone_time ?? '0', 10) || 0));
+    if (autoInput) autoInput.checked = !!item.auto_exclude;
+  });
+}
+
+function showZonesConfigMessage(modal, text, type = 'info'){
+  const msg = $('#zonesCfgMsg', modal);
+  if (!msg) return;
+  msg.textContent = text || '';
+  msg.classList.toggle('hidden', !text);
+  msg.style.color = type === 'error' ? '#f87171' : (type === 'warn' ? '#fbbf24' : '#34d399');
+}
+
+function confirmDiscardZonesConfig(){
+  if (!state.zonesConfigDirty) return true;
+  return window.confirm('Ci sono modifiche non salvate. Annullarle?');
 }
 
 function renderZoneChip(zone, options = {}){
@@ -769,7 +890,8 @@ function renderZoneChip(zone, options = {}){
   return `
     <div class="card mini zone-card" data-zone-id="${Number.isFinite(id) ? id : ''}" data-board-id="${Number.isFinite(boardId) ? boardId : 0}">
       <div class="${cls}" title="${escapeHtml(titleParts.join(' • '))}">
-        ${display}
+        <span class="zone-chip-label">${display}</span>
+        <span class="zone-state-badge">${escapeHtml(zoneRuntimeText(zone, offline))}</span>
         ${badges ? `<span class="badges">${badges}</span>` : ''}
       </div>
     </div>`;
@@ -802,8 +924,11 @@ function renderBoardSection(boardId, zones){
 }
 
 async function refreshZones(){
+  if (zonesRefreshInFlight) return;
+  zonesRefreshInFlight = true;
   try {
     const data = await apiGet('/api/zones');
+    setRuntimeConnection(true);
     const zones = Array.isArray(data?.zones) ? data.zones : [];
     state.zones = zones;
     const container = $('#zonesBoards');
@@ -840,6 +965,7 @@ async function refreshZones(){
       container.innerHTML = '<div class="log-empty">Nessuna zona configurata.</div>';
       updateAlarmZonesSummary();
       updateZonesAlarmHighlight();
+      updateOpenZonesConfigRuntime();
       return;
     }
     container.innerHTML = boardIds.map((boardId) => {
@@ -848,9 +974,12 @@ async function refreshZones(){
     }).join('');
     updateAlarmZonesSummary();
     updateZonesAlarmHighlight();
+    updateOpenZonesConfigRuntime();
   } catch (err) {
     console.error('refreshZones', err);
-    showNotice('Errore durante il caricamento delle zone.', 'error');
+    setRuntimeConnection(false);
+  } finally {
+    zonesRefreshInFlight = false;
   }
 }
 
@@ -867,6 +996,7 @@ function renderZoneConfigCard(zone){
     <div class="zone-config-card" data-zone-id="${Number.isFinite(id) ? id : ''}" data-board-id="${Number.isFinite(boardId) ? boardId : 0}">
       <div class="zone-config-card-head">
         <strong>Z${Number.isFinite(id) ? id : '?'}</strong>
+        <span class="zone-runtime-badge">—</span>
         ${badges ? `<span class="badges">${badges}</span>` : ''}
       </div>
       <label class="field"><span>Nome</span><input type="text" data-field="name" value="${nameValue}" placeholder="Z${Number.isFinite(id) ? id : ''}"></label>
@@ -915,11 +1045,13 @@ async function openZonesConfig({ boardId = null } = {}){
       ? `<div class="zone-config-grid">${boardItems.map((zone) => renderZoneConfigCard(zone)).join('')}</div>`
       : '<div class="log-empty small">Nessuna zona configurabile per questa scheda.</div>';
 
+    let closeModal = () => { clearModals(); };
     const modal = showModal(`
       <div class="zones-config">
         <div class="zones-config-header">
           <div class="zones-config-title-row">
             <h3>Configurazione zone</h3>
+            <span id="zonesCfgDirtyBadge" class="badge dirty-badge hidden">Modifiche non salvate</span>
             <button class="btn tiny outline" type="button" id="zonesCfgClose">Chiudi</button>
           </div>
           <div class="zones-config-subtitle">
@@ -933,58 +1065,89 @@ async function openZonesConfig({ boardId = null } = {}){
         <div class="zones-config-body" data-board="${parsedBoard}">
           ${bodyHtml}
         </div>
+        <div id="zonesCfgDirtyMsg" class="msg small warn hidden">Modifiche non salvate: salva o annulla prima di ricaricare questa configurazione.</div>
         <div id="zonesCfgMsg" class="msg small hidden"></div>
         <div class="row" style="justify-content:flex-end;gap:.5rem;margin-top:1rem">
+          <button class="btn secondary" type="button" id="zonesCfgReload">Ricarica dati</button>
           <button class="btn" type="button" id="zonesCfgCancel">Annulla</button>
           <button class="btn primary" type="button" id="zonesCfgSave">Salva</button>
         </div>
       </div>
-    `, { modalClass: 'zones-config-modal' });
+    `, { modalClass: 'zones-config-modal', onClose: () => closeModal() });
 
     if (!modal) return;
 
-    const closeModal = () => { clearModals(); };
+    const parsedItems = boardItems.map((item) => ({
+      id: Number(item?.id),
+      name: item?.name ? String(item.name) : '',
+      zone_delay: !!item?.zone_delay,
+      zone_time: Math.max(0, Number.parseInt(item?.zone_time ?? '0', 10) || 0),
+      auto_exclude: !!item?.auto_exclude,
+      board: Number.isFinite(Number(item?.board)) ? Number(item.board) : parsedBoard
+    })).filter((item) => Number.isFinite(item.id));
+    state.zonesConfigSnapshot = parsedItems;
+    setZonesConfigDirty(false, modal);
+    updateOpenZonesConfigRuntime();
+
+    closeModal = () => {
+      if (!confirmDiscardZonesConfig()) return;
+      setZonesConfigDirty(false, modal);
+      state.zonesConfigSnapshot = null;
+      clearModals();
+    };
     $('#zonesCfgClose', modal)?.addEventListener('click', closeModal);
-    $('#zonesCfgCancel', modal)?.addEventListener('click', closeModal);
+    $('#zonesCfgCancel', modal)?.addEventListener('click', () => {
+      applyZoneConfigSnapshot(modal, state.zonesConfigSnapshot);
+      setZonesConfigDirty(false, modal);
+      showZonesConfigMessage(modal, 'Modifiche annullate.', 'info');
+    });
+    $('#zonesCfgReload', modal)?.addEventListener('click', () => {
+      if (state.zonesConfigDirty) {
+        showZonesConfigMessage(modal, 'Salva o annulla prima di ricaricare questa configurazione.', 'warn');
+        return;
+      }
+      openZonesConfig({ boardId: parsedBoard });
+    });
+    modal.addEventListener('input', (event) => {
+      if (event.target.closest('.zone-config-card')) {
+        setZonesConfigDirty(true, modal);
+        showZonesConfigMessage(modal, '', 'info');
+      }
+    });
+    modal.addEventListener('change', (event) => {
+      if (event.target.closest('.zone-config-card')) {
+        setZonesConfigDirty(true, modal);
+        showZonesConfigMessage(modal, '', 'info');
+      }
+    });
+    modal.addEventListener('keydown', (event) => {
+      if (event.target.closest('.zone-config-card') && event.key.length === 1) {
+        setZonesConfigDirty(true, modal);
+      }
+    });
 
     $('#zonesCfgSave', modal)?.addEventListener('click', async () => {
-      const cards = $$('.zone-config-card', modal);
-      const itemsPayload = cards.map((card) => {
-        const id = Number(card.dataset.zoneId);
-        if (!Number.isFinite(id)) return null;
-        const nameInput = $('[data-field="name"]', card);
-        const delayInput = $('[data-field="zone_delay"]', card);
-        const timeInput = $('[data-field="zone_time"]', card);
-        const autoInput = $('[data-field="auto_exclude"]', card);
-        const cardBoardId = Number(card.dataset.boardId);
-        return {
-          id,
-          name: nameInput?.value?.trim() || '',
-          zone_delay: !!(delayInput && delayInput.checked),
-          zone_time: Math.max(0, Number.parseInt(timeInput?.value ?? '0', 10) || 0),
-          auto_exclude: !!(autoInput && autoInput.checked),
-          board: Number.isFinite(cardBoardId) ? cardBoardId : parsedBoard
-        };
-      }).filter(Boolean);
-
-      const msg = $('#zonesCfgMsg', modal);
-      if (msg) {
-        msg.textContent = '';
-        msg.classList.add('hidden');
-      }
+      const itemsPayload = readZoneConfigFromModal(modal, parsedBoard);
+      const saveBtn = $('#zonesCfgSave', modal);
+      if (saveBtn) saveBtn.disabled = true;
+      showZonesConfigMessage(modal, '', 'info');
 
       try {
         await apiPost('/api/zones/config', { items: itemsPayload });
+        state.zonesConfigSnapshot = itemsPayload.map((item) => ({ ...item }));
+        setZonesConfigDirty(false, modal);
+        showZonesConfigMessage(modal, 'Salvato.', 'info');
         showNotice('Configurazione zone aggiornata.', 'info');
-        clearModals();
-        refreshZones();
+        await refreshZones();
       } catch (err) {
         console.error('saveZonesConfig', err);
-        if (msg) {
-          msg.textContent = err instanceof HttpError ? err.message : 'Errore durante il salvataggio.';
-          msg.classList.remove('hidden');
-          msg.style.color = '#f87171';
+        if (err instanceof HttpError && err.status === 409) {
+          showZonesConfigMessage(modal, 'La configurazione è stata modificata altrove. Ricarica o forza salvataggio.', 'warn');
+        } else {
+          showZonesConfigMessage(modal, err instanceof HttpError ? err.message : 'Errore durante il salvataggio.', 'error');
         }
+      } finally {
+        if (saveBtn) saveBtn.disabled = false;
       }
     });
   } catch (err) {
@@ -1421,6 +1584,7 @@ function setupCommands(){
         return;
       }
       try {
+        btn.disabled = true;
         await apiPost('/api/arm', { mode, pin });
         showNotice(`Comando ${mode?.toUpperCase()} inviato.`, 'info');
         refreshStatus();
@@ -1440,6 +1604,8 @@ function setupCommands(){
         } else {
           showNotice('Errore durante l’invio del comando.', 'error');
         }
+      } finally {
+        btn.disabled = false;
       }
     });
   });
@@ -1456,6 +1622,8 @@ function setupCommands(){
       return;
     }
     try {
+      const disarmBtn = $('#disarmBtn');
+      if (disarmBtn) disarmBtn.disabled = true;
       await apiPost('/api/disarm', { pin });
       showNotice('Centrale disarmata.', 'info');
       refreshStatus();
@@ -1475,6 +1643,9 @@ function setupCommands(){
       } else {
         showNotice('Errore durante il comando di disarmo.', 'error');
       }
+    } finally {
+      const disarmBtn = $('#disarmBtn');
+      if (disarmBtn) disarmBtn.disabled = false;
     }
   });
 
@@ -2067,9 +2238,13 @@ async function init(){
     stopStatusUpdates();
     stopZonesUpdates();    
   });
-  window.addEventListener('beforeunload', () => {    
+  window.addEventListener('beforeunload', (event) => {
     stopStatusUpdates();
-    stopZonesUpdates();    
+    stopZonesUpdates();
+    if (state.zonesConfigDirty) {
+      event.preventDefault();
+      event.returnValue = '';
+    }
   });
 
   try {
