@@ -5,3 +5,7 @@
 // Inizializza (se non già fatto) e restituisce l'handle del bus I2C master condiviso.
 esp_err_t i2c_bus_init(void);
 i2c_master_bus_handle_t i2c_bus_get(void);
+
+// Prova a recuperare il bus in caso di errori. Può essere invocata in modo
+// asincrono dai client quando rilevano una condizione di timeout/NACK.
+esp_err_t i2c_bus_reset(void);

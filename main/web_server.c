@@ -60,6 +60,8 @@
 #include "app_mqtt.h"
 #include "can_master.h"
 #include "can_bus_protocol.h"
+#include "system_info.h"
+#include "notification_events.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -198,11 +200,19 @@ typedef struct {
 } provisioning_net_config_t;
 
 typedef struct {
-    char uri[96];
-    char cid[64];
-    char user[64];
-    char pass[64];
+    bool enabled;
+    char uri[128];
+    bool tls_enabled;
+    char cid[80];
+    char user[80];
+    char pass[96];
     uint32_t keepalive;
+    char tenant_id[48];
+    char site_id[48];
+    char device_id[64];
+    char base_topic[320];
+    bool discovery_enabled;
+    char discovery_prefix[64];
 } provisioning_mqtt_config_t;
 
 typedef struct {
@@ -2125,19 +2135,37 @@ static void provisioning_load_net(provisioning_net_config_t* cfg){
 static void provisioning_load_mqtt(provisioning_mqtt_config_t* cfg){
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
+    cfg->enabled = true;
+    cfg->discovery_enabled = true;
+    cfg->tls_enabled = false;
     strlcpy(cfg->uri, CONFIG_APP_CLOUD_MQTT_URI, sizeof(cfg->uri));
+    strlcpy(cfg->tenant_id, "default", sizeof(cfg->tenant_id));
+    strlcpy(cfg->site_id, "default", sizeof(cfg->site_id));
+    strlcpy(cfg->discovery_prefix, "homeassistant", sizeof(cfg->discovery_prefix));
     cfg->keepalive = CONFIG_APP_CLOUD_KEEPALIVE;
+    char device_id[DEVICE_ID_MAX] = {0};
+    make_device_id(device_id);
+    strlcpy(cfg->device_id, device_id, sizeof(cfg->device_id));
+    strlcpy(cfg->cid, device_id, sizeof(cfg->cid));
+    strlcpy(cfg->user, device_id, sizeof(cfg->user));
     nvs_handle_t nvs;
     if (nvs_open("sys", NVS_READONLY, &nvs) == ESP_OK){
+        uint8_t b = 0;
+        if (nvs_get_u8(nvs, "mq_enabled", &b) == ESP_OK) cfg->enabled = b != 0;
+        if (nvs_get_u8(nvs, "mq_tls", &b) == ESP_OK) cfg->tls_enabled = b != 0;
+        if (nvs_get_u8(nvs, "mq_disc", &b) == ESP_OK) cfg->discovery_enabled = b != 0;
         nvs_get_str_def(nvs, "mq_uri",  cfg->uri,  sizeof(cfg->uri),  CONFIG_APP_CLOUD_MQTT_URI);
+        nvs_get_str_def(nvs, "mq_cid",  cfg->cid,  sizeof(cfg->cid), cfg->cid);
+        nvs_get_str_def(nvs, "mq_user", cfg->user, sizeof(cfg->user), cfg->user);
         nvs_get_str_def(nvs, "mq_pass", cfg->pass, sizeof(cfg->pass), "");
+        nvs_get_str_def(nvs, "mq_tenant", cfg->tenant_id, sizeof(cfg->tenant_id), cfg->tenant_id);
+        nvs_get_str_def(nvs, "mq_site", cfg->site_id, sizeof(cfg->site_id), cfg->site_id);
+        nvs_get_str_def(nvs, "mq_device", cfg->device_id, sizeof(cfg->device_id), cfg->device_id);
+        nvs_get_str_def(nvs, "mq_disc_pref", cfg->discovery_prefix, sizeof(cfg->discovery_prefix), cfg->discovery_prefix);
         cfg->keepalive = nvs_get_u32_def(nvs, "mq_keep", CONFIG_APP_CLOUD_KEEPALIVE);
         nvs_close(nvs);
     }
-    char device_id[DEVICE_ID_MAX] = {0};
-    make_device_id(device_id);
-    strlcpy(cfg->cid, device_id, sizeof(cfg->cid));
-    strlcpy(cfg->user, device_id, sizeof(cfg->user));
+    snprintf(cfg->base_topic, sizeof(cfg->base_topic), "tenants/%s/sites/%s/devices/%s", cfg->tenant_id, cfg->site_id, cfg->device_id);
 }
 
 static void provisioning_load_cloudflare(provisioning_cloudflare_config_t* cfg){
@@ -2163,6 +2191,49 @@ static esp_err_t only_admin(httpd_req_t* req){
     return ESP_OK;
 }
 
+static esp_err_t api_admin_system_get(httpd_req_t* req){
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    system_info_append_json(root);
+    cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
+    cJSON_AddBoolToObject(mqtt, "connected", mqtt_is_connected());
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_admin_mqtt_rediscover_post(httpd_req_t* req){
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    esp_err_t err = mqtt_publish_discovery();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mqtt"), ESP_FAIL;
+    return json_reply(req, "{\"ok\":true}");
+}
+
+static esp_err_t api_admin_notifications_get(httpd_req_t* req){
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    notification_events_append_config_json(root);
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_admin_notifications_post(httpd_req_t* req){
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char body[512]; size_t bl=0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
+    cJSON* j = cJSON_ParseWithLength(body, bl);
+    if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
+    esp_err_t err = notification_events_update_config_from_json(j);
+    cJSON_Delete(j);
+    if (err != ESP_OK) return httpd_resp_send_err(req,500,"nvs"), ESP_FAIL;
+    return json_reply(req, "{\"ok\":true}");
+}
+
+static esp_err_t api_admin_notifications_test_post(httpd_req_t* req){
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    notification_events_emit_simple("test_notification", NOTIFY_SEVERITY_INFO, "web", -1, "Test notifica", "Evento di test generato dalla UI admin", false);
+    return json_reply(req, "{\"ok\":true}");
+}
+
 // ---- /api/sys/net GET/POST ----
 static esp_err_t sys_net_get(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
@@ -2180,7 +2251,7 @@ static esp_err_t sys_net_get(httpd_req_t* req){
 
 static esp_err_t sys_net_post(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
-    char body[256]; size_t bl=0;
+    char body[1024]; size_t bl=0;
     if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
     cJSON* j = cJSON_ParseWithLength(body, bl);
     if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
@@ -2294,27 +2365,41 @@ static esp_err_t sys_mqtt_reveal_post(httpd_req_t* req){
 
 static esp_err_t sys_mqtt_post(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
-    char body[256]; size_t bl=0;
+    char body[1024]; size_t bl=0;
     if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
     cJSON* j = cJSON_ParseWithLength(body, bl);
     if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
+    const cJSON* jen =cJSON_GetObjectItemCaseSensitive(j,"enabled");
     const cJSON* juri=cJSON_GetObjectItemCaseSensitive(j,"uri");
+    const cJSON* jtls=cJSON_GetObjectItemCaseSensitive(j,"tls_enabled");
+    const cJSON* jcid=cJSON_GetObjectItemCaseSensitive(j,"cid");
+    const cJSON* juser=cJSON_GetObjectItemCaseSensitive(j,"user");
     const cJSON* jpw =cJSON_GetObjectItemCaseSensitive(j,"pass");
     const cJSON* jka =cJSON_GetObjectItemCaseSensitive(j,"keepalive");
+    const cJSON* jtenant=cJSON_GetObjectItemCaseSensitive(j,"tenant_id");
+    const cJSON* jsite=cJSON_GetObjectItemCaseSensitive(j,"site_id");
+    const cJSON* jdev=cJSON_GetObjectItemCaseSensitive(j,"device_id");
+    const cJSON* jdisc=cJSON_GetObjectItemCaseSensitive(j,"discovery_enabled");
+    const cJSON* jdp=cJSON_GetObjectItemCaseSensitive(j,"discovery_prefix");
     const char* pass = NULL;
     if (cJSON_IsString(jpw) && jpw->valuestring) pass = jpw->valuestring;
     if (pass && !mqtt_password_is_valid(pass)){
         cJSON_Delete(j);
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, MQTT_PASSWORD_POLICY_ERROR), ESP_FAIL;
     }
-    char device_id[DEVICE_ID_MAX] = {0};
-    make_device_id(device_id);
     nvs_handle_t nvs; if (nvs_open("sys", NVS_READWRITE, &nvs)!=ESP_OK){ cJSON_Delete(j); return httpd_resp_send_err(req,500,"nvs"), ESP_FAIL; }
+    if (cJSON_IsBool(jen)) nvs_set_u8(nvs,"mq_enabled", cJSON_IsTrue(jen)?1:0);
     if (cJSON_IsString(juri)) nvs_set_str(nvs,"mq_uri", juri->valuestring);
-    nvs_set_str(nvs,"mq_cid", device_id);
-    nvs_set_str(nvs,"mq_user", device_id);
+    if (cJSON_IsBool(jtls)) nvs_set_u8(nvs,"mq_tls", cJSON_IsTrue(jtls)?1:0);
+    if (cJSON_IsString(jcid)) nvs_set_str(nvs,"mq_cid", jcid->valuestring);
+    if (cJSON_IsString(juser)) nvs_set_str(nvs,"mq_user", juser->valuestring);
     if (pass) nvs_set_str(nvs,"mq_pass",pass);
     if (cJSON_IsNumber(jka)) nvs_set_u32(nvs,"mq_keep",(uint32_t)jka->valuedouble);
+    if (cJSON_IsString(jtenant)) nvs_set_str(nvs,"mq_tenant", jtenant->valuestring);
+    if (cJSON_IsString(jsite)) nvs_set_str(nvs,"mq_site", jsite->valuestring);
+    if (cJSON_IsString(jdev)) nvs_set_str(nvs,"mq_device", jdev->valuestring);
+    if (cJSON_IsBool(jdisc)) nvs_set_u8(nvs,"mq_disc", cJSON_IsTrue(jdisc)?1:0);
+    if (cJSON_IsString(jdp)) nvs_set_str(nvs,"mq_disc_pref", jdp->valuestring);
     nvs_commit(nvs); nvs_close(nvs); cJSON_Delete(j);
 
     esp_err_t reload_err = mqtt_reload_config();
@@ -5767,6 +5852,13 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/logout",       .method = HTTP_POST,    .handler = api_logout_post },
     { .uri = "/api/me",           .method = HTTP_GET,     .handler = api_me_get },
     { .uri = "/api/admin/secret", .method = HTTP_GET,     .handler = api_admin_only_get },
+    { .uri = "/api/admin/system", .method = HTTP_GET, .handler = api_admin_system_get },
+    { .uri = "/api/admin/mqtt", .method = HTTP_GET, .handler = sys_mqtt_get },
+    { .uri = "/api/admin/mqtt", .method = HTTP_POST, .handler = sys_mqtt_post },
+    { .uri = "/api/admin/mqtt/rediscover", .method = HTTP_POST, .handler = api_admin_mqtt_rediscover_post },
+    { .uri = "/api/admin/notifications", .method = HTTP_GET, .handler = api_admin_notifications_get },
+    { .uri = "/api/admin/notifications", .method = HTTP_POST, .handler = api_admin_notifications_post },
+    { .uri = "/api/admin/notifications/test", .method = HTTP_POST, .handler = api_admin_notifications_test_post },
     { .uri = "/api/admin/diagnostics/ads1115", .method = HTTP_GET, .handler = api_admin_ads1115_diag_get },
 #if ADS1115_COUNT > 0
     { .uri = "/api/admin/inputs/analog-eol", .method = HTTP_GET,  .handler = api_admin_analog_eol_get },

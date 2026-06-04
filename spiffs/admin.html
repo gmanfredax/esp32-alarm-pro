@@ -72,6 +72,9 @@
     .analog-config-row input,.analog-config-row select{background:#0d1525;border:1px solid var(--border);color:var(--text);padding:.35rem .5rem;border-radius:8px}
     .analog-config-row input:disabled{opacity:.55}
     .analog-mode-select{min-width:120px}
+    .info-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:.75rem;margin-top:.75rem}
+    .info-card{background:rgba(255,255,255,.02);border:1px solid var(--border);border-radius:10px;padding:.85rem}
+    .info-card h4{margin:.1rem 0 .5rem}.info-row{display:flex;justify-content:space-between;gap:.6rem;margin:.25rem 0}.info-row span{color:var(--muted)}.info-row code{word-break:break-all}
   </style>
 </head>
 <body>
@@ -121,7 +124,9 @@
             <li><button class="btn w-100 active" data-view="view-users">Utenti</button></li>
             <li><button class="btn w-100" data-view="view-general">Generale</button></li>
             <li><button class="btn w-100" data-view="view-network">Rete</button></li>
-            <li><button class="btn w-100" data-view="view-mqtt">MQTT</button></li>
+            <li><button class="btn w-100" data-view="view-system">Sistema</button></li>
+            <li><button class="btn w-100" data-view="view-mqtt">MQTT / Home Assistant</button></li>
+            <li><button class="btn w-100" data-view="view-notifications">Notifiche</button></li>
             <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
             <li><button class="btn w-100" data-view="view-expansions">Espansioni CAN</button></li>
             <li><button class="btn w-100" data-view="view-diagnostics">Diagnostica</button></li>
@@ -223,28 +228,76 @@
             </div>
           </section>
 
+
+          <!-- SISTEMA -->
+          <section id="view-system" class="view">
+            <div class="card">
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap">
+                <h3>Informazioni sistema</h3>
+                <button class="btn" id="btnSystemReload" type="button">Aggiorna</button>
+              </div>
+              <p class="muted">Dati tecnici firmware, runtime, scheda, rete, storage e periferiche. Nessun segreto viene esposto.</p>
+              <div id="systemInfoStatus" class="status-line muted">Caricamento…</div>
+              <div id="systemInfoGrid" class="info-grid"></div>
+            </div>
+          </section>
           <!-- MQTT -->
           <section id="view-mqtt" class="view">
             <div class="card">
-              <h3>MQTT</h3>
+              <h3>MQTT / Home Assistant / EMQX</h3>
               <form class="form" id="mqttForm">
                 <div class="row" style="gap:1rem;flex-wrap:wrap">
+                  <label class="field"><span>MQTT abilitato</span><select id="mq_enabled"><option value="1">Sì</option><option value="0">No</option></select></label>
+                  <label class="field"><span>TLS</span><select id="mq_tls"><option value="0">No</option><option value="1">Sì</option></select></label>
                   <div class="field"><span>URI broker</span><input id="mq_uri" type="text" placeholder="mqtt://192.168.1.10:1883" /></div>
-                  <div class="field"><span>Client ID</span><input id="mq_cid" type="text" placeholder="CentraleESP32-xxxx" /></div>
                 </div>
                 <div class="row" style="gap:1rem;flex-wrap:wrap">
+                  <div class="field"><span>Client ID</span><input id="mq_cid" type="text" placeholder="nsalarmpro-device" /></div>
                   <div class="field"><span>Username</span><input id="mq_user" type="text" /></div>
-                  <div class="field"><span>Password</span><input id="mq_pass" type="password" /></div>
+                  <div class="field"><span>Password</span><input id="mq_pass" type="password" placeholder="Lascia vuoto per non modificare" /></div>
                   <div class="field"><span>Keepalive (s)</span><input id="mq_keep" type="number" min="10" max="600" value="60" /></div>
                 </div>
-                <div class="row" style="justify-content:flex-end;margin-top:.6rem">
+                <div class="row" style="gap:1rem;flex-wrap:wrap">
+                  <div class="field"><span>Tenant ID</span><input id="mq_tenant" type="text" placeholder="default" /></div>
+                  <div class="field"><span>Site ID</span><input id="mq_site" type="text" placeholder="default" /></div>
+                  <div class="field"><span>Device ID</span><input id="mq_device" type="text" /></div>
+                  <div class="field"><span>Base topic</span><input id="mq_base" type="text" readonly /></div>
+                </div>
+                <div class="row" style="gap:1rem;flex-wrap:wrap">
+                  <label class="field"><span>Discovery HA</span><select id="mq_discovery"><option value="1">Abilitata</option><option value="0">Disabilitata</option></select></label>
+                  <div class="field"><span>Discovery prefix</span><input id="mq_disc_prefix" type="text" placeholder="homeassistant" /></div>
+                  <div class="field"><span>Stato MQTT</span><input id="mq_status" type="text" readonly /></div>
+                </div>
+                <div class="row" style="justify-content:flex-end;margin-top:.6rem;gap:.5rem">
+                  <button class="btn outline" id="btnMqttRediscover" type="button">Ripubblica discovery</button>
                   <button class="btn" id="btnMqttSave" type="button">Salva</button>
                 </div>
-                <small class="muted">Nota: le impostazioni MQTT sono attualmente da Kconfig; il salvataggio runtime verrà abilitato in seguito.</small>
+                <small class="muted">Broker-agnostic: Mosquitto, EMQX/EMQX Cloud o qualsiasi broker MQTT standard. Topic: tenants/&lt;tenant&gt;/sites/&lt;site&gt;/devices/&lt;device&gt;/...</small>
               </form>
             </div>
           </section>
 
+
+          <!-- NOTIFICHE -->
+          <section id="view-notifications" class="view">
+            <div class="card">
+              <h3>Notifiche / Eventi</h3>
+              <p class="muted">Il firmware genera eventi strutturati via MQTT; Home Assistant, EMQX o un gateway esterno gestiscono Telegram, push, email o SMS.</p>
+              <form class="form" id="notifyForm">
+                <div class="row" style="gap:1rem;flex-wrap:wrap">
+                  <label class="field"><span>Pubblica eventi MQTT</span><select id="notify_mqtt"><option value="1">Sì</option><option value="0">No</option></select></label>
+                  <label class="field"><span>Severity minima</span><select id="notify_sev"><option value="info">info</option><option value="warning">warning</option><option value="alarm">alarm</option><option value="critical">critical</option><option value="technical">technical</option></select></label>
+                  <label class="field"><span>Ripeti critici non confermati</span><select id="notify_repeat"><option value="1">Sì</option><option value="0">No</option></select></label>
+                  <div class="field"><span>Intervallo ripetizione (s)</span><input id="notify_interval" type="number" min="60" max="86400" /></div>
+                </div>
+                <div class="row" style="justify-content:flex-end;margin-top:.6rem;gap:.5rem">
+                  <button class="btn outline" id="btnNotifyTest" type="button">Test evento</button>
+                  <button class="btn" id="btnNotifySave" type="button">Salva</button>
+                </div>
+                <small class="muted">Webhook e GSM/SMS sono predisposti solo come capacità futura: nessun token o canale cloud obbligatorio è gestito qui.</small>
+              </form>
+            </div>
+          </section>
           <!-- SICUREZZA WEB -->
           <section id="view-websec" class="view">
             <div class="card">

@@ -283,7 +283,11 @@ esp_err_t inputs_ads1115_read_channel_voltage(size_t index, int channel, TickTyp
 {
     ESP_RETURN_ON_FALSE(voltage != NULL, ESP_ERR_INVALID_ARG, TAG, "voltage null");
     int16_t raw = 0;
-    ESP_RETURN_ON_ERROR(inputs_ads1115_read_channel_raw(index, channel, timeout, &raw), TAG, "raw");
+    esp_err_t raw_res = inputs_ads1115_read_channel_raw(index, channel, timeout, &raw);
+    if (raw_res == ESP_ERR_TIMEOUT) {
+        return raw_res;
+    }
+    ESP_RETURN_ON_ERROR(raw_res, TAG, "raw");
     ads1115_operating_config_t cfg;
     ESP_RETURN_ON_ERROR(ads1115_get_config(index, &cfg), TAG, "cfg");
     *voltage = ads1115_raw_to_voltage(raw, cfg.gain);

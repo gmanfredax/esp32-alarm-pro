@@ -2184,6 +2184,66 @@
     });
   }
 
+
+  function formatValue(v){
+    if (v === null || v === undefined) return "—";
+    if (typeof v === "boolean") return v ? "sì" : "no";
+    return String(v);
+  }
+
+  function renderInfoObject(title, obj){
+    const rows = Object.entries(obj || {}).map(([k,v]) => `<div class="info-row"><span>${escapeHtml(k)}</span><strong><code>${escapeHtml(formatValue(v))}</code></strong></div>`).join("");
+    return `<div class="info-card"><h4>${escapeHtml(title)}</h4>${rows || '<p class="muted">N/D</p>'}</div>`;
+  }
+
+  async function loadSystemInfo(){
+    const grid = $("#systemInfoGrid");
+    const status = $("#systemInfoStatus");
+    if (!grid) return;
+    try{
+      if (status) status.textContent = "Caricamento…";
+      const data = await apiGet("/api/admin/system");
+      grid.innerHTML = ["firmware","hardware","runtime","network","storage","peripherals","mqtt","diagnostics"]
+        .map(k => renderInfoObject(k, data?.[k] || {})).join("");
+      if (status) status.textContent = `Aggiornato: ${new Date().toLocaleString()}`;
+    }catch(e){
+      if (status) status.textContent = "Errore caricando sistema: " + e.message;
+    }
+  }
+
+  function setupSystemSection(){
+    $("#btnSystemReload")?.addEventListener("click", loadSystemInfo);
+    loadSystemInfo().catch(()=>{});
+  }
+
+  async function loadNotifications(){
+    try{
+      const c = await apiGet("/api/admin/notifications");
+      $("#notify_mqtt") && ($("#notify_mqtt").value = c.mqtt_publish_enabled ? "1" : "0");
+      $("#notify_sev") && ($("#notify_sev").value = c.min_severity || "info");
+      $("#notify_repeat") && ($("#notify_repeat").value = c.repeat_critical_unacked ? "1" : "0");
+      $("#notify_interval") && ($("#notify_interval").value = c.repeat_interval_s ?? 300);
+    }catch(e){ toast("Errore caricando notifiche: " + e.message, false); }
+  }
+
+  function setupNotificationsSection(){
+    loadNotifications().catch(()=>{});
+    $("#btnNotifySave")?.addEventListener("click", async () => {
+      const body = {
+        mqtt_publish_enabled: ($("#notify_mqtt")?.value || "1") === "1",
+        min_severity: $("#notify_sev")?.value || "info",
+        repeat_critical_unacked: ($("#notify_repeat")?.value || "1") === "1",
+        repeat_interval_s: parseInt($("#notify_interval")?.value || "300", 10) || 300,
+      };
+      try{ await apiPost("/api/admin/notifications", body); toast("Notifiche salvate"); }
+      catch(e){ toast("Errore salvataggio notifiche: " + e.message, false); }
+    });
+    $("#btnNotifyTest")?.addEventListener("click", async () => {
+      try{ await apiPost("/api/admin/notifications/test", {}); toast("Evento di test pubblicato"); }
+      catch(e){ toast("Test notifica: " + e.message, false); }
+    });
+  }
+
   // ========== RETE / MQTT (placeholder salva)
   async function loadNetwork(){
     const updateStaticVisibility = () => {
@@ -2221,22 +2281,39 @@
   async function loadMqtt(){
     try{
       const c = await apiGet("/api/sys/mqtt");
+      $("#mq_enabled") && ($("#mq_enabled").value = c.enabled ? "1" : "0");
       $("#mq_uri")  && ($("#mq_uri").value  = c.uri  || "");
+      $("#mq_tls") && ($("#mq_tls").value = c.tls_enabled ? "1" : "0");
       $("#mq_cid")  && ($("#mq_cid").value  = c.cid  || "");
       $("#mq_user") && ($("#mq_user").value = c.user || "");
+      $("#mq_tenant") && ($("#mq_tenant").value = c.tenant_id || "default");
+      $("#mq_site") && ($("#mq_site").value = c.site_id || "default");
+      $("#mq_device") && ($("#mq_device").value = c.device_id || "");
+      $("#mq_base") && ($("#mq_base").value = c.base_topic || "");
+      $("#mq_discovery") && ($("#mq_discovery").value = c.discovery_enabled ? "1" : "0");
+      $("#mq_disc_prefix") && ($("#mq_disc_prefix").value = c.discovery_prefix || "homeassistant");
+      $("#mq_status") && ($("#mq_status").value = c.connected ? "connesso" : "disconnesso");
       const hasSecret = (typeof c.has_pass === "boolean") ? c.has_pass : (typeof c.pass === "string" && c.pass.length > 0);
       initMqttPasswordField(!!hasSecret);
       $("#mq_keep") && ($("#mq_keep").value = (c.keepalive ?? 60));
     }catch(e){ toast("Errore caricando MQTT: " + e.message, false); }
     ensureMqttRevealButton();
+    $("#btnMqttRediscover")?.addEventListener("click", async () => { try{ await apiPost("/api/admin/mqtt/rediscover", {}); toast("Discovery ripubblicata"); } catch(e){ toast("Discovery MQTT: " + e.message, false); } });
     const saveBtn = $("#btnMqttSave");
     if (saveBtn && !saveBtn._mqttBound){
       saveBtn.addEventListener("click", async ()=>{
         const body = {
+          enabled: ($("#mq_enabled")?.value || "1") === "1",
           uri:  $("#mq_uri")?.value  || "",
+          tls_enabled: ($("#mq_tls")?.value || "0") === "1",
           cid:  $("#mq_cid")?.value  || "",
           user: $("#mq_user")?.value || "",
           keepalive: parseInt($("#mq_keep")?.value || "60", 10) || 60,
+          tenant_id: $("#mq_tenant")?.value || "default",
+          site_id: $("#mq_site")?.value || "default",
+          device_id: $("#mq_device")?.value || "",
+          discovery_enabled: ($("#mq_discovery")?.value || "1") === "1",
+          discovery_prefix: $("#mq_disc_prefix")?.value || "homeassistant",
         };
         const passField = getMqttPassField();
         const passEdited = passField?.dataset.userEdited === "1";
@@ -2380,7 +2457,9 @@
     const setupPromises = [
       setupAdsDiagnostics(),
       setupAnalogGeneralSection(),
+      setupSystemSection(),
       setupNetMqttForms(),
+      setupNotificationsSection(),
       setupWebSecForm(),
       setupExpansionsSection()
     ];

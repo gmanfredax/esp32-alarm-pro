@@ -1,10 +1,14 @@
 #include "ads1115.h"
 
+#include <inttypes.h>
 #include <string.h>
 
 #include "esp_check.h"
 #include "esp_log.h"
 #include "driver/i2c_master.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "i2c_bus.h"
 #include "pins.h"
@@ -22,6 +26,11 @@
 
 static const char* TAG = "ads1115";
 
+#define ADS1115_I2C_TIMEOUT_MS        200
+#define ADS1115_ERROR_BACKOFF_SHORT   pdMS_TO_TICKS(100)
+#define ADS1115_ERROR_BACKOFF_MEDIUM  pdMS_TO_TICKS(500)
+#define ADS1115_ERROR_BACKOFF_LONG    pdMS_TO_TICKS(2000)
+
 typedef struct {
     bool in_use;
     i2c_master_dev_handle_t handle;
@@ -32,6 +41,8 @@ typedef struct {
     uint16_t last_config_word;
     TickType_t conversion_wait_ticks;
     TickType_t poll_delay_ticks;
+    TickType_t resume_at_tick;
+    uint32_t consecutive_failures;
 } ads1115_device_t;
 
 static ads1115_device_t s_devices[ADS1115_MAX_DEVICES];
@@ -80,13 +91,13 @@ static TickType_t compute_wait_ticks(const ads1115_operating_config_t* opt)
 static esp_err_t write_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint16_t value)
 {
     uint8_t payload[3] = { reg, (uint8_t)(value >> 8), (uint8_t)(value & 0xFF) };
-    return i2c_master_transmit(dev, payload, sizeof(payload), 1000);
+    return i2c_master_transmit(dev, payload, sizeof(payload), ADS1115_I2C_TIMEOUT_MS);
 }
 
 static esp_err_t read_reg(i2c_master_dev_handle_t dev, uint8_t reg, uint16_t* value)
 {
     uint8_t rx[2] = { 0 };
-    esp_err_t err = i2c_master_transmit_receive(dev, &reg, 1, rx, sizeof(rx), 1000);
+    esp_err_t err = i2c_master_transmit_receive(dev, &reg, 1, rx, sizeof(rx), ADS1115_I2C_TIMEOUT_MS);
     if (err == ESP_OK && value) {
         *value = ((uint16_t)rx[0] << 8) | rx[1];
     }
@@ -99,6 +110,64 @@ static ads1115_device_t* get_device(size_t unit)
         return NULL;
     }
     return &s_devices[unit];
+}
+
+static TickType_t select_backoff_ticks(uint32_t failures)
+{
+    if (failures > 6) {
+        return ensure_min_tick(ADS1115_ERROR_BACKOFF_LONG);
+    }
+    if (failures > 3) {
+        return ensure_min_tick(ADS1115_ERROR_BACKOFF_MEDIUM);
+    }
+    return ensure_min_tick(ADS1115_ERROR_BACKOFF_SHORT);
+}
+
+static bool error_requires_reset(esp_err_t err)
+{
+    return err == ESP_ERR_TIMEOUT || err == ESP_FAIL || err == ESP_ERR_INVALID_STATE;
+}
+
+static void record_failure(size_t unit, ads1115_device_t* dev, esp_err_t err)
+{
+    dev->consecutive_failures++;
+    TickType_t backoff = select_backoff_ticks(dev->consecutive_failures);
+    dev->resume_at_tick = xTaskGetTickCount() + backoff;
+
+    if (dev->consecutive_failures == 1 || (dev->consecutive_failures % 3u) == 0u) {
+        ESP_LOGW(TAG,
+                 "ADS1115[%zu] I2C failure (%s). Consecutive=%" PRIu32 " backoff=%lu ticks",
+                 unit,
+                 esp_err_to_name(err),
+                 (uint32_t)dev->consecutive_failures,
+                 (unsigned long)backoff);
+    }
+
+    if (error_requires_reset(err)) {
+        esp_err_t reset_err = i2c_bus_reset();
+        if (reset_err != ESP_OK) {
+            ESP_LOGW(TAG, "ADS1115[%zu] bus reset reported: %s", unit, esp_err_to_name(reset_err));
+        }
+    }
+}
+
+static void record_success(ads1115_device_t* dev)
+{
+    dev->consecutive_failures = 0;
+    dev->resume_at_tick = 0;
+}
+
+static bool device_is_suspended(ads1115_device_t* dev)
+{
+    if (dev->resume_at_tick == 0) {
+        return false;
+    }
+    TickType_t now = xTaskGetTickCount();
+    if ((int32_t)(now - dev->resume_at_tick) < 0) {
+        return true;
+    }
+    dev->resume_at_tick = 0;
+    return false;
 }
 
 static esp_err_t apply_config_to_device(ads1115_device_t* dev, ads1115_mux_t mux)
@@ -150,6 +219,8 @@ static void reset_state(void)
         s_devices[i].last_config_word = 0;
         s_devices[i].conversion_wait_ticks = 1;
         s_devices[i].poll_delay_ticks = ensure_min_tick(pdMS_TO_TICKS(1));
+        s_devices[i].resume_at_tick = 0;
+        s_devices[i].consecutive_failures = 0;
     }
     s_device_count = 0;
 }
@@ -320,8 +391,17 @@ esp_err_t ads1115_read_latest(size_t unit, int16_t* raw_value)
     ESP_RETURN_ON_FALSE(dev && dev->in_use, ESP_ERR_INVALID_ARG, TAG, "invalid unit");
     ESP_RETURN_ON_FALSE(raw_value != NULL, ESP_ERR_INVALID_ARG, TAG, "null out");
 
+    if (device_is_suspended(dev)) {
+        return ESP_ERR_TIMEOUT;
+    }
+
     uint16_t reg_val = 0;
-    ESP_RETURN_ON_ERROR(read_reg(dev->handle, ADS1115_REG_CONVERSION, &reg_val), TAG, "read conv");
+    esp_err_t err = read_reg(dev->handle, ADS1115_REG_CONVERSION, &reg_val);
+    if (err != ESP_OK) {
+        record_failure(unit, dev, err);
+        return err;
+    }
+    record_success(dev);
     *raw_value = (int16_t)reg_val;
     return ESP_OK;
 }
@@ -333,9 +413,32 @@ esp_err_t ads1115_single_shot(size_t unit, ads1115_mux_t mux, TickType_t timeout
     ESP_RETURN_ON_FALSE(raw_value != NULL, ESP_ERR_INVALID_ARG, TAG, "null out");
     ESP_RETURN_ON_FALSE(dev->options.mode == ADS1115_MODE_SINGLE_SHOT, ESP_ERR_INVALID_STATE, TAG, "not in single-shot mode");
 
-    ESP_RETURN_ON_ERROR(apply_config_to_device(dev, mux), TAG, "start single");
-    ESP_RETURN_ON_ERROR(wait_conversion_ready(dev, timeout_ticks), TAG, "wait");
-    return ads1115_read_latest(unit, raw_value);
+    if (device_is_suspended(dev)) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = apply_config_to_device(dev, mux);
+    if (err != ESP_OK) {
+        record_failure(unit, dev, err);
+        return err;
+    }
+
+    err = wait_conversion_ready(dev, timeout_ticks);
+    if (err != ESP_OK) {
+        record_failure(unit, dev, err);
+        return err;
+    }
+
+    uint16_t reg_val = 0;
+    err = read_reg(dev->handle, ADS1115_REG_CONVERSION, &reg_val);
+    if (err != ESP_OK) {
+        record_failure(unit, dev, err);
+        return err;
+    }
+
+    record_success(dev);
+    *raw_value = (int16_t)reg_val;
+    return ESP_OK;
 }
 
 esp_err_t ads1115_set_thresholds(size_t unit, int16_t low, int16_t high)

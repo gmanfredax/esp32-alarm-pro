@@ -1,5 +1,5 @@
 # Colleziona tutti i .c nella cartella main (comodo se aggiungi file spesso)
-#file(GLOB MAIN_SRCS "ads1115.c" "gpio_inputs.c" "main.c" "mqtt_client.c" "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
+#file(GLOB MAIN_SRCS "system_info.c" "notification_events.c" "i2c_bus.c" "ads1115.c" "gpio_inputs.c" "main.c" "mqtt_client.c" "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
 file(GLOB MAIN_SRCS "*.c")
 
 #set(MAIN_EMBED_TXTFILES
@@ -8,6 +8,36 @@ file(GLOB MAIN_SRCS "*.c")
 ##    "certs/broker_ca.pem"
 #)
 set(MAIN_EMBED_TXTFILES)
+
+# Build/version metadata with Git-optional fallbacks
+set(FW_VERSION "0.1.0" CACHE STRING "Firmware version")
+string(TIMESTAMP BUILD_DATE "%Y-%m-%d" UTC)
+string(TIMESTAMP BUILD_TIME "%H:%M:%S UTC" UTC)
+execute_process(COMMAND git rev-parse --short=12 HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+execute_process(COMMAND git rev-parse --abbrev-ref HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE GIT_BRANCH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+execute_process(COMMAND git diff --quiet
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    RESULT_VARIABLE GIT_DIFF_RESULT
+    ERROR_QUIET)
+if(NOT GIT_COMMIT)
+    set(GIT_COMMIT "unknown")
+endif()
+if(NOT GIT_BRANCH)
+    set(GIT_BRANCH "unknown")
+endif()
+if(GIT_DIFF_RESULT EQUAL 0)
+    set(GIT_DIRTY "false")
+else()
+    set(GIT_DIRTY "true")
+endif()
 
 
 set(MQTT_BROKER_CA_RELATIVE "certs/broker_ca.pem")
@@ -29,6 +59,7 @@ idf_component_register(
     INCLUDE_DIRS
         "."
     REQUIRES
+        app_update
         mdns
         esp_http_server
         esp_event

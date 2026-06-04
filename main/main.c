@@ -53,6 +53,8 @@
 #include "pdo.h"
 #include "web_server.h"
 #include "cJSON.h"
+#include "system_info.h"
+#include "notification_events.h"
 
 //#ifndef TWAI_FRAME_MAX_DLC
 //#define TWAI_FRAME_MAX_DLC 8
@@ -1576,7 +1578,10 @@ static void system_main_task(void *arg)
     } else {
         ESP_LOGW(TAG, "Skipping SNTP start because Ethernet is not ready");
     }
+    ESP_ERROR_CHECK(system_info_init());
+    ESP_ERROR_CHECK(notification_events_init());
     ESP_ERROR_CHECK(mqtt_start());
+    notification_events_emit_simple("system_boot", NOTIFY_SEVERITY_INFO, "system", -1, "Avvio sistema", "Firmware avviato", false);
 
     alarm_init();
     mqtt_publish_state();

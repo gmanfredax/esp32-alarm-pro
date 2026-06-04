@@ -1,5 +1,6 @@
 #include "i2c_bus.h"
 #include "esp_check.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "pins.h"  // I2C_SDA_GPIO, I2C_SCL_GPIO, I2C_SPEED_HZ
 
@@ -28,4 +29,22 @@ i2c_master_bus_handle_t i2c_bus_get(void)
         if (i2c_bus_init() != ESP_OK) return NULL;
     }
     return s_bus;
+}
+
+esp_err_t i2c_bus_reset(void)
+{
+    if (!s_bus) {
+        return i2c_bus_init();
+    }
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 1, 0)
+    esp_err_t err = i2c_master_bus_reset(s_bus);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "I2C bus reset failed: %s", esp_err_to_name(err));
+    }
+    return err;
+#else
+    ESP_LOGW(TAG, "I2C bus reset not supported on this ESP-IDF version");
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
 }

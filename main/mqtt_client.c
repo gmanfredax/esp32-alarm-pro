@@ -31,8 +31,18 @@
 #include "roster.h"
 #include "audit_log.h"
 #include "zone_mask.h"
+#include "auth.h"
+#include "system_info.h"
+#include "notification_events.h"
 
 #include "cJSON.h"
+
+#ifndef FW_VERSION
+#define FW_VERSION "unknown"
+#endif
+
+#define MQTT_BASE_TOPIC_MAX_LEN 256
+#define MQTT_TOPIC_MAX_LEN      320
 
 static uint8_t s_device_secret[DEVICE_SECRET_LEN];
 static char    s_password_hex[DEVICE_SECRET_LEN*2 + 1];
@@ -52,12 +62,25 @@ static char                     s_mqtt_client_id[64] = {0};
 static char                     s_mqtt_user[64] = {0};
 static char                     s_mqtt_pass[96] = {0};
 static uint32_t                 s_mqtt_keepalive = CONFIG_APP_CLOUD_KEEPALIVE;
-static char                     s_topic_state[128];
-static char                     s_topic_zones[128];
-static char                     s_topic_avail[128];
-static char                     s_topic_scenes[128];
-static char                     s_topic_cmd_base[128];
-static char                     s_topic_cmd_sub[160];
+static char                     s_topic_state[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_zones[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_avail[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_scenes[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_cmd_base[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_cmd_sub[MQTT_TOPIC_MAX_LEN];
+static char                     s_base_topic[MQTT_BASE_TOPIC_MAX_LEN];
+static char                     s_topic_alarm_state[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_alarm_attr[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_alarm_cmd[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_events[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_events_critical[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_events_technical[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_notify_ack[MQTT_TOPIC_MAX_LEN];
+static char                     s_discovery_prefix[64] = "homeassistant";
+static bool                     s_enabled = true;
+static bool                     s_discovery_enabled = true;
+static char                     s_tenant_id[48] = "default";
+static char                     s_site_id[48] = "default";
 static size_t                   s_cmd_base_len = 0;
 static zone_mask_t              s_last_zone_mask;
 static int                      s_last_zone_count = -1;
@@ -100,13 +123,20 @@ static void build_device_id(void)
 
 static void build_topics(void)
 {
-    const char *root = CONFIG_APP_CLOUD_TOPIC_ROOT;
-    snprintf(s_topic_state, sizeof(s_topic_state), "%s/state/%s/status", root, s_device_id);
-    snprintf(s_topic_zones, sizeof(s_topic_zones), "%s/state/%s/zones", root, s_device_id);
-    snprintf(s_topic_avail, sizeof(s_topic_avail), "%s/state/%s/availability", root, s_device_id);
-    snprintf(s_topic_scenes, sizeof(s_topic_scenes), "%s/state/%s/scenes", root, s_device_id);
-    snprintf(s_topic_cmd_base, sizeof(s_topic_cmd_base), "%s/cmd/%s", root, s_device_id);
-    snprintf(s_topic_cmd_sub, sizeof(s_topic_cmd_sub), "%s/#", s_topic_cmd_base);
+    snprintf(s_base_topic, sizeof(s_base_topic), "tenants/%s/sites/%s/devices/%s", s_tenant_id, s_site_id, s_device_id);
+    snprintf(s_topic_state, sizeof(s_topic_state), "%s/system/state", s_base_topic);
+    snprintf(s_topic_zones, sizeof(s_topic_zones), "%s/zones/state", s_base_topic);
+    snprintf(s_topic_avail, sizeof(s_topic_avail), "%s/availability", s_base_topic);
+    snprintf(s_topic_scenes, sizeof(s_topic_scenes), "%s/scenes", s_base_topic);
+    snprintf(s_topic_alarm_state, sizeof(s_topic_alarm_state), "%s/alarm/state", s_base_topic);
+    snprintf(s_topic_alarm_attr, sizeof(s_topic_alarm_attr), "%s/alarm/attributes", s_base_topic);
+    snprintf(s_topic_alarm_cmd, sizeof(s_topic_alarm_cmd), "%s/alarm/command", s_base_topic);
+    snprintf(s_topic_events, sizeof(s_topic_events), "%s/events", s_base_topic);
+    snprintf(s_topic_events_critical, sizeof(s_topic_events_critical), "%s/events/critical", s_base_topic);
+    snprintf(s_topic_events_technical, sizeof(s_topic_events_technical), "%s/events/technical", s_base_topic);
+    snprintf(s_topic_notify_ack, sizeof(s_topic_notify_ack), "%s/notifications/ack", s_base_topic);
+    snprintf(s_topic_cmd_base, sizeof(s_topic_cmd_base), "%s/cmd", s_base_topic);
+    snprintf(s_topic_cmd_sub, sizeof(s_topic_cmd_sub), "%s/#", s_base_topic);
     s_cmd_base_len = strlen(s_topic_cmd_base);
 }
 
@@ -122,6 +152,11 @@ static void load_mqtt_config_from_nvs(void)
     strlcpy(s_mqtt_user, default_user, sizeof(s_mqtt_user));
     strlcpy(s_mqtt_pass, default_pass, sizeof(s_mqtt_pass));
     s_mqtt_keepalive = CONFIG_APP_CLOUD_KEEPALIVE;
+    s_enabled = true;
+    s_discovery_enabled = true;
+    strlcpy(s_discovery_prefix, "homeassistant", sizeof(s_discovery_prefix));
+    strlcpy(s_tenant_id, "default", sizeof(s_tenant_id));
+    strlcpy(s_site_id, "default", sizeof(s_site_id));
 
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("sys", NVS_READONLY, &nvs);
@@ -159,6 +194,14 @@ static void load_mqtt_config_from_nvs(void)
     if (err == ESP_OK && keepalive > 0) {
         s_mqtt_keepalive = keepalive;
     }
+    uint8_t b = 0;
+    if (nvs_get_u8(nvs, "mq_enabled", &b) == ESP_OK) s_enabled = b != 0;
+    if (nvs_get_u8(nvs, "mq_disc", &b) == ESP_OK) s_discovery_enabled = b != 0;
+    len = sizeof(s_tenant_id); nvs_get_str(nvs, "mq_tenant", s_tenant_id, &len);
+    len = sizeof(s_site_id); nvs_get_str(nvs, "mq_site", s_site_id, &len);
+    len = sizeof(s_device_id); nvs_get_str(nvs, "mq_device", s_device_id, &len);
+    len = sizeof(s_base_topic); if (nvs_get_str(nvs, "mq_base", s_base_topic, &len) == ESP_OK && s_base_topic[0]) { /* rebuilt below if empty */ }
+    len = sizeof(s_discovery_prefix); nvs_get_str(nvs, "mq_disc_pref", s_discovery_prefix, &len);
 
     nvs_close(nvs);
 }
@@ -167,8 +210,8 @@ static void mqtt_prepare_configuration(void)
 {
     build_device_id();
     s_secret_ready = load_device_secret_hex();
-    build_topics();
     load_mqtt_config_from_nvs();
+    build_topics();
     s_config_initialized = true;
 }
 
@@ -276,13 +319,24 @@ esp_err_t mqtt_publish_state(void)
     cJSON_AddNumberToObject(root, "entry_pending_ms", (double)entry_ms);
     cJSON_AddNumberToObject(root, "entry_zone", (double)entry_zone);
     ensure_timestamp(root);
+    system_info_append_json(root);
 
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!payload) return ESP_ERR_NO_MEM;
 
     esp_err_t err = publish_raw(s_topic_state, payload, CONFIG_APP_CLOUD_QOS_STATE, true);
+    publish_raw(s_topic_alarm_attr, payload, CONFIG_APP_CLOUD_QOS_STATE, true);
     cJSON_free(payload);
+    const char *ha_state = "disarmed";
+    if (entry_pending) ha_state = "pending";
+    else if (exit_pending) ha_state = "arming";
+    else if (st == ALARM_ARMED_HOME) ha_state = "armed_home";
+    else if (st == ALARM_ARMED_AWAY) ha_state = "armed_away";
+    else if (st == ALARM_ARMED_NIGHT) ha_state = "armed_night";
+    else if (st == ALARM_ARMED_CUSTOM) ha_state = "armed_custom";
+    else if (st == ALARM_ALARM) ha_state = "triggered";
+    publish_raw(s_topic_alarm_state, ha_state, CONFIG_APP_CLOUD_QOS_STATE, true);
     return err;
 }
 
@@ -326,6 +380,9 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
     for (int i = 0; i < total; ++i) {
         bool active = zone_mask_test(&limited, (uint16_t)i);
         cJSON_AddItemToArray(arr, cJSON_CreateBool(active));
+        char topic[MQTT_TOPIC_MAX_LEN];
+        snprintf(topic, sizeof(topic), "%s/zones/%d/state", s_base_topic, i + 1);
+        publish_raw(topic, active ? "ON" : "OFF", CONFIG_APP_CLOUD_QOS_STATE, false);
     }
 
     char *payload = cJSON_PrintUnformatted(root);
@@ -410,6 +467,102 @@ esp_err_t mqtt_publish_scenes(void)
     return err;
 }
 
+
+esp_err_t mqtt_publish_event_json(const char *payload, const char *severity)
+{
+    if (!s_client || !payload) return ESP_ERR_INVALID_STATE;
+    esp_err_t err = publish_raw(s_topic_events, payload, CONFIG_APP_CLOUD_QOS_STATE, false);
+    if (severity && strcmp(severity, "critical") == 0) publish_raw(s_topic_events_critical, payload, CONFIG_APP_CLOUD_QOS_STATE, false);
+    if (severity && strcmp(severity, "technical") == 0) publish_raw(s_topic_events_technical, payload, CONFIG_APP_CLOUD_QOS_STATE, false);
+    return err;
+}
+
+bool mqtt_is_connected(void) { return s_connected; }
+
+static bool mqtt_command_pin_valid(cJSON *root)
+{
+    if (!root) return false;
+    cJSON *ju = cJSON_GetObjectItemCaseSensitive(root, "user");
+    cJSON *jc = cJSON_GetObjectItemCaseSensitive(root, "code");
+    if (!cJSON_IsString(jc)) jc = cJSON_GetObjectItemCaseSensitive(root, "pin");
+    if (!cJSON_IsString(ju) || !cJSON_IsString(jc)) return false;
+    return auth_verify_pin(ju->valuestring, jc->valuestring);
+}
+
+esp_err_t mqtt_publish_discovery(void)
+{
+    if (!s_client || !s_discovery_enabled) return ESP_OK;
+    char topic[MQTT_TOPIC_MAX_LEN];
+    snprintf(topic, sizeof(topic), "%s/alarm_control_panel/%s/panel/config", s_discovery_prefix, s_device_id);
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_ERR_NO_MEM;
+    cJSON_AddStringToObject(root, "name", "NS Alarm Pro");
+    cJSON_AddStringToObject(root, "unique_id", s_device_id);
+    cJSON_AddStringToObject(root, "state_topic", s_topic_alarm_state);
+    cJSON_AddStringToObject(root, "command_topic", s_topic_alarm_cmd);
+    cJSON_AddBoolToObject(root, "code_arm_required", true);
+    cJSON_AddBoolToObject(root, "code_disarm_required", true);
+    cJSON_AddStringToObject(root, "command_template", "{\"command\":\"{{ action }}\",\"code\":\"{{ code }}\",\"user\":\"ha\"}");
+    cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
+    cJSON *dev = cJSON_AddObjectToObject(root, "device");
+    cJSON *ids = cJSON_AddArrayToObject(dev, "identifiers"); cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
+    cJSON_AddStringToObject(dev, "manufacturer", "NeXtorSystem");
+    cJSON_AddStringToObject(dev, "model", "NS Alarm Pro");
+    cJSON_AddStringToObject(dev, "name", "NS Alarm Pro");
+    cJSON_AddStringToObject(dev, "sw_version", FW_VERSION);
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!payload) return ESP_ERR_NO_MEM;
+    esp_err_t err = publish_raw(topic, payload, 1, true);
+    cJSON_free(payload);
+
+    uint16_t total = roster_effective_zones(inputs_master_zone_capacity());
+    if (total > SCENES_MAX_ZONES) total = SCENES_MAX_ZONES;
+    for (int i = 0; i < total; ++i) {
+        snprintf(topic, sizeof(topic), "%s/binary_sensor/%s/zone_%d/config", s_discovery_prefix, s_device_id, i + 1);
+        root = cJSON_CreateObject();
+        if (!root) continue;
+        char name[32]; snprintf(name, sizeof(name), "Zona %d", i + 1);
+        char uid[96]; snprintf(uid, sizeof(uid), "%s_zone_%d", s_device_id, i + 1);
+        char state_topic[MQTT_TOPIC_MAX_LEN]; snprintf(state_topic, sizeof(state_topic), "%s/zones/%d/state", s_base_topic, i + 1);
+        cJSON_AddStringToObject(root, "name", name);
+        cJSON_AddStringToObject(root, "unique_id", uid);
+        cJSON_AddStringToObject(root, "state_topic", state_topic);
+        cJSON_AddStringToObject(root, "payload_on", "ON");
+        cJSON_AddStringToObject(root, "payload_off", "OFF");
+        cJSON_AddStringToObject(root, "device_class", "opening");
+        cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
+        dev = cJSON_AddObjectToObject(root, "device"); ids = cJSON_AddArrayToObject(dev, "identifiers"); cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
+        payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
+        if (payload) { publish_raw(topic, payload, 1, true); cJSON_free(payload); }
+    }
+
+    const char *sensors[][3] = {
+        {"firmware_version", "Firmware version", "{{ value_json.firmware.version }}"},
+        {"uptime", "Uptime", "{{ value_json.runtime.uptime_s }}"},
+        {"free_heap", "Free heap", "{{ value_json.hardware.free_heap }}"},
+        {"min_free_heap", "Minimum free heap", "{{ value_json.hardware.min_free_heap }}"},
+        {"reset_reason", "Reset reason", "{{ value_json.runtime.reset_reason }}"},
+        {"boot_count", "Boot count", "{{ value_json.runtime.boot_count }}"},
+        {"ip_address", "IP address", "{{ value_json.network.ip }}"},
+        {"mqtt_status", "MQTT status", "online"},
+    };
+    for (size_t i = 0; i < sizeof(sensors)/sizeof(sensors[0]); ++i) {
+        snprintf(topic, sizeof(topic), "%s/sensor/%s/%s/config", s_discovery_prefix, s_device_id, sensors[i][0]);
+        root = cJSON_CreateObject(); if (!root) continue;
+        char uid[96]; snprintf(uid, sizeof(uid), "%s_%s", s_device_id, sensors[i][0]);
+        cJSON_AddStringToObject(root, "name", sensors[i][1]);
+        cJSON_AddStringToObject(root, "unique_id", uid);
+        cJSON_AddStringToObject(root, "state_topic", strcmp(sensors[i][0], "mqtt_status") == 0 ? s_topic_avail : s_topic_state);
+        if (strcmp(sensors[i][0], "mqtt_status") != 0) cJSON_AddStringToObject(root, "value_template", sensors[i][2]);
+        cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
+        dev = cJSON_AddObjectToObject(root, "device"); ids = cJSON_AddArrayToObject(dev, "identifiers"); cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
+        payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
+        if (payload) { publish_raw(topic, payload, 1, true); cJSON_free(payload); }
+    }
+    return err;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Command handling
 // ─────────────────────────────────────────────────────────────────────────────
@@ -424,7 +577,19 @@ static void handle_arm_command(const char *payload)
     }
     zone_mask_t requested_bypass;
     bool bypass_present = false;
+    if (root && !mqtt_command_pin_valid(root)) {
+        ESP_LOGW(TAG, "ARM MQTT rifiutato: PIN/codice mancante o non valido");
+        cJSON_Delete(root);
+        return;
+    }
     if (root) {
+        cJSON *cmd = cJSON_GetObjectItemCaseSensitive(root, "command");
+        if (cJSON_IsString(cmd) && cmd->valuestring) {
+            if (strcasecmp(cmd->valuestring, "ARM_HOME") == 0) strlcpy(mode_buf, "home", sizeof(mode_buf));
+            else if (strcasecmp(cmd->valuestring, "ARM_NIGHT") == 0) strlcpy(mode_buf, "night", sizeof(mode_buf));
+            else if (strcasecmp(cmd->valuestring, "ARM_CUSTOM") == 0) strlcpy(mode_buf, "custom", sizeof(mode_buf));
+            else strlcpy(mode_buf, "away", sizeof(mode_buf));
+        }
         cJSON *m = cJSON_GetObjectItemCaseSensitive(root, "mode");
         if (cJSON_IsString(m) && m->valuestring) {
             strncpy(mode_buf, m->valuestring, sizeof(mode_buf) - 1);
@@ -506,8 +671,14 @@ static void handle_arm_command(const char *payload)
     mqtt_publish_state();
 }
 
-static void handle_disarm_command(void)
+static void handle_disarm_command(const char *payload)
 {
+    cJSON *root = payload && payload[0] ? cJSON_Parse(payload) : NULL;
+    if (!root || !mqtt_command_pin_valid(root)) {
+        ESP_LOGW(TAG, "DISARM MQTT rifiutato: PIN/codice mancante o non valido");
+        if (root) cJSON_Delete(root);
+        return;
+    }
     alarm_state_t prev_state = alarm_get_state();
     zone_mask_t scene_mask;
     scenes_get_active_mask(&scene_mask);
@@ -546,6 +717,7 @@ static void handle_disarm_command(void)
     alarm_disarm();
     audit_append("alarm_disarm", "mqtt", 1, note);
     mqtt_publish_state();
+    cJSON_Delete(root);
 }
 
 static void handle_outputs_command(const char *payload)
@@ -629,6 +801,8 @@ static void handle_bypass_set(const char *payload)
 static void handle_command(const char *topic, const char *payload)
 {
     if (!topic) return;
+    if (strcmp(topic, s_topic_alarm_cmd) == 0) { cJSON *r = payload ? cJSON_Parse(payload) : NULL; cJSON *cmd = r ? cJSON_GetObjectItemCaseSensitive(r, "command") : NULL; const char *c = cJSON_IsString(cmd) ? cmd->valuestring : ""; if (!strncasecmp(c, "DISARM", 6)) handle_disarm_command(payload); else handle_arm_command(payload); if (r) cJSON_Delete(r); return; }
+    if (strcmp(topic, s_topic_notify_ack) == 0) { notification_events_mark_ack(payload, "mqtt"); return; }
     if (strncmp(topic, s_topic_cmd_base, s_cmd_base_len) != 0) return;
     const char *suffix = topic + s_cmd_base_len;
     if (*suffix == '/') ++suffix;
@@ -637,8 +811,16 @@ static void handle_command(const char *topic, const char *payload)
 
     if (strcmp(suffix, "arm") == 0) {
         handle_arm_command(payload);
+    } else if (strcmp(suffix, "alarm/command") == 0) {
+        cJSON *r = payload ? cJSON_Parse(payload) : NULL;
+        cJSON *cmd = r ? cJSON_GetObjectItemCaseSensitive(r, "command") : NULL;
+        const char *c = cJSON_IsString(cmd) ? cmd->valuestring : "";
+        if (!strncasecmp(c, "DISARM", 6)) handle_disarm_command(payload); else handle_arm_command(payload);
+        if (r) cJSON_Delete(r);
+    } else if (strcmp(suffix, "notifications/ack") == 0) {
+        notification_events_mark_ack(payload, "mqtt");
     } else if (strcmp(suffix, "disarm") == 0) {
-        handle_disarm_command();
+        handle_disarm_command(payload);
     } else if (strcmp(suffix, "outputs/set") == 0) {
         handle_outputs_command(payload);
     } else if (strcmp(suffix, "scenes/set") == 0) {
@@ -666,7 +848,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         s_connected = true;
         ESP_LOGI(TAG, "MQTT connected");
         publish_availability("online");
+        notification_events_emit_simple("mqtt_connected", NOTIFY_SEVERITY_TECHNICAL, "mqtt", -1, "MQTT connesso", "Connessione broker attiva", false);
         esp_mqtt_client_subscribe(s_client, s_topic_cmd_sub, CONFIG_APP_CLOUD_QOS_COMMANDS);
+        esp_mqtt_client_subscribe(s_client, s_topic_alarm_cmd, CONFIG_APP_CLOUD_QOS_COMMANDS);
+        esp_mqtt_client_subscribe(s_client, s_topic_notify_ack, CONFIG_APP_CLOUD_QOS_COMMANDS);
+        mqtt_publish_discovery();
         mqtt_publish_state();
         publish_zones_internal(&s_last_zone_mask, true);
         mqtt_publish_scenes();
@@ -674,10 +860,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_DISCONNECTED:
         s_connected = false;
         ESP_LOGW(TAG, "MQTT disconnected");
+        notification_events_emit_simple("mqtt_disconnected", NOTIFY_SEVERITY_TECHNICAL, "mqtt", -1, "MQTT disconnesso", "Broker MQTT non raggiungibile", false);
         break;
     case MQTT_EVENT_DATA: {
         if (!e->topic || !e->data) break;
-        char topic[160];
+        char topic[MQTT_TOPIC_MAX_LEN];
         size_t tlen = (size_t)e->topic_len;
         if (tlen >= sizeof(topic)) tlen = sizeof(topic) - 1;
         memcpy(topic, e->topic, tlen);
@@ -710,7 +897,10 @@ esp_err_t mqtt_start(void)
     if (!s_config_initialized) {
         mqtt_prepare_configuration();
     }
-
+    if (!s_enabled) {
+        ESP_LOGI(TAG, "MQTT disabilitato da configurazione");
+        return ESP_OK;
+    }
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = s_mqtt_uri,
