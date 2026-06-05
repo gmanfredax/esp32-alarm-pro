@@ -197,12 +197,12 @@ esp_err_t system_info_append_json(cJSON *root)
     cJSON_AddStringToObject(st, "active_partition", running ? running->label : "unknown");
     cJSON_AddStringToObject(st, "partition_type", running ? "app" : "unknown");
 
-    uint16_t gpioab = 0; inputs_read_all(&gpioab);
     uint16_t outmask = 0; outputs_get_mask(&outmask);
     cJSON *p = cJSON_AddObjectToObject(root, "peripherals");
     cJSON_AddStringToObject(p, "i2c", "configured");
     cJSON_AddNumberToObject(p, "zones_configured", roster_effective_zones(inputs_master_zone_capacity()));
-    cJSON_AddBoolToObject(p, "tamper", inputs_tamper(gpioab));
+    input_debounce_state_t tamper_state = {0};
+    cJSON_AddBoolToObject(p, "tamper", inputs_get_filtered_tamper(&tamper_state) ? tamper_state.stable_value : false);
     cJSON_AddNumberToObject(p, "outputs_mask", outmask);
 #if ADS1115_COUNT > 0
     input_ads1115_summary_t ads = {0};

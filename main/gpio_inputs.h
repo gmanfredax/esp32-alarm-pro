@@ -6,9 +6,10 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "zone_mask.h"
+
 #if ADS1115_COUNT > 0
 #include "ads1115.h"
-#include "zone_mask.h"
 #endif
 
 // Numero di zone esposte dal MCP23017: A0..A7 (8) + B0..B3 (4) = 12
@@ -37,6 +38,63 @@
 #endif
 
 #define INPUT_MASTER_ZONES_COUNT (INPUT_ZONES_COUNT + INPUT_ANALOG_ZONES_COUNT)
+
+// Parametri anti-debounce/anti-glitch centralizzati per gli ingressi.
+#ifndef INPUT_DIGITAL_DEBOUNCE_MS
+#define INPUT_DIGITAL_DEBOUNCE_MS 60u
+#endif
+#ifndef INPUT_TAMPER_DEBOUNCE_MS
+#define INPUT_TAMPER_DEBOUNCE_MS 120u
+#endif
+#ifndef INPUT_ANALOG_DEBOUNCE_MS
+#define INPUT_ANALOG_DEBOUNCE_MS 250u
+#endif
+#ifndef INPUT_ANALOG_CONFIRM_SAMPLES
+#define INPUT_ANALOG_CONFIRM_SAMPLES 4u
+#endif
+#ifndef INPUT_ANALOG_HYSTERESIS_MV
+#define INPUT_ANALOG_HYSTERESIS_MV 75u
+#endif
+#ifndef INPUT_BOOT_SETTLE_MS
+#define INPUT_BOOT_SETTLE_MS 1000u
+#endif
+#ifndef INPUT_FAULT_CONFIRM_MS
+#define INPUT_FAULT_CONFIRM_MS 500u
+#endif
+
+typedef struct {
+    bool raw_value;
+    bool filtered_value;
+    bool stable_value;
+    bool previous_stable_value;
+    bool debouncing;
+    bool unavailable;
+    bool initialized;
+    uint64_t last_raw_change_ms;
+    uint64_t last_stable_change_ms;
+    uint32_t required_stable_ms;
+    uint32_t bounce_count;
+} input_debounce_state_t;
+
+typedef struct {
+    bool known;
+    bool alarm;
+    bool tamper;
+    bool unavailable;
+    bool debouncing;
+    float voltage;
+    uint32_t bounce_count;
+    uint32_t discarded_samples;
+    uint64_t last_raw_change_ms;
+    uint64_t last_stable_change_ms;
+} input_zone_filtered_state_t;
+
+void inputs_debounce_bool(input_debounce_state_t* state, bool raw_value, bool unavailable, uint32_t stable_ms, uint64_t now_ms);
+esp_err_t inputs_baseline_init(uint16_t gpioab, uint16_t zones_total);
+esp_err_t inputs_compose_debounced_mask(uint16_t gpioab, uint16_t zones_total, zone_mask_t* out_mask, bool* tamper_out);
+bool inputs_get_filtered_zone_state(uint16_t zero_based_index, input_zone_filtered_state_t* out_state);
+bool inputs_get_filtered_tamper(input_debounce_state_t* out_state);
+uint32_t inputs_filter_change_counter(void);
 
 
 /**

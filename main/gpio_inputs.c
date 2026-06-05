@@ -50,6 +50,117 @@ _Static_assert(INPUT_ANALOG_SUPPLY_INDEX < INPUT_ANALOG_TOTAL_CHANNELS,
 
 static const char* TAG = "inputs";
 
+#define INPUT_FILTER_ANALOG_WINDOW 4u
+
+typedef enum {
+    ANALOG_CANDIDATE_NORMAL = 0,
+    ANALOG_CANDIDATE_ALARM,
+    ANALOG_CANDIDATE_TAMPER,
+    ANALOG_CANDIDATE_UNAVAILABLE,
+} input_analog_candidate_t;
+
+typedef struct {
+    bool initialized;
+    input_analog_candidate_t raw_state;
+    input_analog_candidate_t stable_state;
+    input_analog_candidate_t previous_stable_state;
+    input_analog_candidate_t candidate_state;
+    uint32_t candidate_samples;
+    uint32_t bounce_count;
+    uint32_t discarded_samples;
+    uint32_t i2c_errors;
+    uint64_t last_raw_change_ms;
+    uint64_t last_stable_change_ms;
+    uint64_t candidate_since_ms;
+    float window[INPUT_FILTER_ANALOG_WINDOW];
+    uint8_t window_count;
+    uint8_t window_pos;
+    float filtered_voltage;
+    bool debouncing;
+    bool device_present;
+    bool sample_valid;
+} input_analog_filter_state_t;
+
+static input_debounce_state_t s_digital_filters[INPUT_ZONES_COUNT];
+static input_debounce_state_t s_tamper_filter;
+static uint32_t s_filter_change_counter = 0;
+#if ADS1115_COUNT > 0
+static input_analog_filter_state_t s_analog_filters[INPUT_ANALOG_ZONES_COUNT];
+#endif
+
+static uint64_t input_now_ms(void)
+{
+    return (uint64_t)(esp_timer_get_time() / 1000ULL);
+}
+
+void inputs_debounce_bool(input_debounce_state_t* state, bool raw_value, bool unavailable, uint32_t stable_ms, uint64_t now_ms)
+{
+    if (!state) {
+        return;
+    }
+    if (!state->initialized) {
+        memset(state, 0, sizeof(*state));
+        state->initialized = true;
+        state->raw_value = raw_value;
+        state->filtered_value = raw_value;
+        state->stable_value = raw_value;
+        state->previous_stable_value = raw_value;
+        state->unavailable = unavailable;
+        state->required_stable_ms = stable_ms;
+        state->last_raw_change_ms = now_ms;
+        state->last_stable_change_ms = now_ms;
+        return;
+    }
+
+    state->required_stable_ms = stable_ms;
+    bool unavailable_changed = (unavailable != state->unavailable);
+    state->unavailable = unavailable;
+
+    if (raw_value != state->raw_value || unavailable_changed) {
+        state->raw_value = raw_value;
+        state->last_raw_change_ms = now_ms;
+        state->debouncing = true;
+        if (state->filtered_value != state->stable_value) {
+            state->bounce_count++;
+        }
+        state->filtered_value = raw_value;
+    }
+
+    if (state->stable_value != state->filtered_value) {
+        uint64_t elapsed = now_ms - state->last_raw_change_ms;
+        state->debouncing = elapsed < stable_ms;
+        if (!state->debouncing) {
+            state->previous_stable_value = state->stable_value;
+            state->stable_value = state->filtered_value;
+            state->last_stable_change_ms = now_ms;
+            s_filter_change_counter++;
+        }
+    } else {
+        state->debouncing = false;
+    }
+}
+
+static void input_filter_seed(input_debounce_state_t* state, bool raw_value, uint32_t stable_ms, uint64_t now_ms)
+{
+    if (!state) {
+        return;
+    }
+    memset(state, 0, sizeof(*state));
+    state->initialized = true;
+    state->raw_value = raw_value;
+    state->filtered_value = raw_value;
+    state->stable_value = raw_value;
+    state->previous_stable_value = raw_value;
+    state->required_stable_ms = stable_ms;
+    state->last_raw_change_ms = now_ms;
+    state->last_stable_change_ms = now_ms;
+}
+
+uint32_t inputs_filter_change_counter(void)
+{
+    return s_filter_change_counter;
+}
+
 #if ADS1115_COUNT > 0
 static ads1115_operating_config_t ads_default_options(void)
 {
@@ -938,6 +1049,140 @@ static void analog_cfg_evaluate(const input_analog_zone_config_t* cfg, float vol
     }
 }
 
+
+static input_analog_candidate_t analog_classify_with_hysteresis(const input_analog_zone_config_t* cfg,
+                                                                float voltage,
+                                                                input_analog_candidate_t stable_state)
+{
+    const float h = ((float)INPUT_ANALOG_HYSTERESIS_MV) / 1000.0f;
+    if (!cfg) {
+        return ANALOG_CANDIDATE_UNAVAILABLE;
+    }
+
+    if (stable_state == ANALOG_CANDIDATE_NORMAL &&
+        voltage >= (cfg->normal_min - h) && voltage <= (cfg->normal_max + h)) {
+        return ANALOG_CANDIDATE_NORMAL;
+    }
+    if (stable_state == ANALOG_CANDIDATE_ALARM &&
+        voltage >= (cfg->alarm_min - h) && voltage <= (cfg->alarm_max + h)) {
+        return ANALOG_CANDIDATE_ALARM;
+    }
+    if (cfg->mode != INPUT_ANALOG_EOL_1 && stable_state == ANALOG_CANDIDATE_TAMPER &&
+        (voltage <= (cfg->tamper_low + h) || voltage >= (cfg->tamper_high - h))) {
+        return ANALOG_CANDIDATE_TAMPER;
+    }
+
+    bool alarm = false;
+    bool tamper = false;
+    analog_cfg_evaluate(cfg, voltage, &alarm, &tamper);
+    if (cfg->mode == INPUT_ANALOG_EOL_1) {
+        tamper = false;
+    }
+    if (tamper) {
+        return ANALOG_CANDIDATE_TAMPER;
+    }
+    if (alarm) {
+        return ANALOG_CANDIDATE_ALARM;
+    }
+    return ANALOG_CANDIDATE_NORMAL;
+}
+
+static float analog_filter_push(input_analog_filter_state_t* filter, float voltage)
+{
+    filter->window[filter->window_pos] = voltage;
+    filter->window_pos = (uint8_t)((filter->window_pos + 1u) % INPUT_FILTER_ANALOG_WINDOW);
+    if (filter->window_count < INPUT_FILTER_ANALOG_WINDOW) {
+        filter->window_count++;
+    }
+
+    float sum = 0.0f;
+    for (uint8_t i = 0; i < filter->window_count; ++i) {
+        sum += filter->window[i];
+    }
+    return (filter->window_count > 0) ? (sum / (float)filter->window_count) : voltage;
+}
+
+static void analog_filter_update(size_t index, esp_err_t read_err, const input_analog_zone_state_t* raw_state, uint64_t now_ms)
+{
+    if (index >= INPUT_ANALOG_ZONES_COUNT) {
+        return;
+    }
+    input_analog_filter_state_t* filter = &s_analog_filters[index];
+    input_analog_candidate_t raw_candidate = ANALOG_CANDIDATE_UNAVAILABLE;
+    bool sample_valid = raw_state && raw_state->device_present && raw_state->sample_valid && read_err == ESP_OK;
+
+    filter->device_present = raw_state ? raw_state->device_present : false;
+    filter->sample_valid = sample_valid;
+
+    if (sample_valid) {
+        filter->filtered_voltage = analog_filter_push(filter, raw_state->voltage);
+        raw_candidate = analog_classify_with_hysteresis(&s_analog_cfg, filter->filtered_voltage, filter->stable_state);
+    } else {
+        filter->discarded_samples++;
+        if (read_err != ESP_OK) {
+            filter->i2c_errors++;
+        }
+    }
+
+    if (!filter->initialized) {
+        memset(filter->window, 0, sizeof(filter->window));
+        filter->window_count = sample_valid ? 1 : 0;
+        filter->window_pos = sample_valid ? 1 : 0;
+        if (sample_valid) {
+            filter->window[0] = raw_state->voltage;
+            filter->filtered_voltage = raw_state->voltage;
+        }
+        filter->initialized = true;
+        filter->raw_state = raw_candidate;
+        filter->stable_state = ANALOG_CANDIDATE_UNAVAILABLE;
+        filter->previous_stable_state = ANALOG_CANDIDATE_UNAVAILABLE;
+        filter->candidate_state = raw_candidate;
+        filter->candidate_samples = sample_valid ? 1u : 0u;
+        filter->candidate_since_ms = now_ms;
+        filter->last_raw_change_ms = now_ms;
+        filter->last_stable_change_ms = now_ms;
+        filter->debouncing = false;
+        return;
+    }
+
+    if (raw_candidate != filter->raw_state) {
+        if (filter->candidate_state != filter->stable_state) {
+            filter->bounce_count++;
+        }
+        filter->raw_state = raw_candidate;
+        filter->candidate_state = raw_candidate;
+        filter->candidate_samples = 1;
+        filter->candidate_since_ms = now_ms;
+        filter->last_raw_change_ms = now_ms;
+        filter->debouncing = true;
+    } else if (filter->candidate_state == raw_candidate) {
+        if (filter->candidate_samples < UINT32_MAX) {
+            filter->candidate_samples++;
+        }
+    } else {
+        filter->candidate_state = raw_candidate;
+        filter->candidate_samples = 1;
+        filter->candidate_since_ms = now_ms;
+        filter->debouncing = true;
+    }
+
+    uint32_t required_ms = (raw_candidate == ANALOG_CANDIDATE_UNAVAILABLE) ? INPUT_FAULT_CONFIRM_MS : INPUT_ANALOG_DEBOUNCE_MS;
+    if (filter->stable_state != filter->candidate_state) {
+        uint64_t elapsed = now_ms - filter->candidate_since_ms;
+        bool samples_ok = (filter->candidate_state == ANALOG_CANDIDATE_UNAVAILABLE) ||
+                          (filter->candidate_samples >= INPUT_ANALOG_CONFIRM_SAMPLES);
+        filter->debouncing = !(samples_ok && elapsed >= required_ms);
+        if (!filter->debouncing) {
+            filter->previous_stable_state = filter->stable_state;
+            filter->stable_state = filter->candidate_state;
+            filter->last_stable_change_ms = now_ms;
+            s_filter_change_counter++;
+        }
+    } else {
+        filter->debouncing = false;
+    }
+}
+
 esp_err_t inputs_analog_evaluate(size_t index, TickType_t timeout, input_analog_zone_state_t* out_state)
 {
     ESP_RETURN_ON_FALSE(out_state != NULL, ESP_ERR_INVALID_ARG, TAG, "analog state null");
@@ -978,7 +1223,8 @@ esp_err_t inputs_collect_tamper_snapshot(uint16_t gpioab, TickType_t timeout, in
 {
     ESP_RETURN_ON_FALSE(snapshot != NULL, ESP_ERR_INVALID_ARG, TAG, "tamper snapshot null");
     zone_mask_clear(&snapshot->zone_mask);
-    snapshot->global_tamper = inputs_tamper(gpioab);
+    (void)gpioab;
+    snapshot->global_tamper = s_tamper_filter.initialized ? s_tamper_filter.stable_value : false;
 
     for (size_t idx = 0; idx < INPUT_ANALOG_ZONES_COUNT; ++idx) {
         input_analog_zone_state_t state;
@@ -986,15 +1232,141 @@ esp_err_t inputs_collect_tamper_snapshot(uint16_t gpioab, TickType_t timeout, in
         if (err != ESP_OK) {
             continue;
         }
-        if (!state.device_present || !state.sample_valid) {
-            continue;
-        }
-        if (state.tamper) {
+        input_zone_filtered_state_t filtered = {0};
+        if (inputs_get_filtered_zone_state((uint16_t)(INPUT_ZONES_COUNT + idx), &filtered) && filtered.known && filtered.tamper) {
             zone_mask_set(&snapshot->zone_mask, (uint16_t)(INPUT_ZONES_COUNT + idx));
         }
     }
 
     return ESP_OK;
+}
+
+
+esp_err_t inputs_baseline_init(uint16_t gpioab, uint16_t zones_total)
+{
+    uint64_t now_ms = input_now_ms();
+    uint16_t limit = zones_total;
+    if (limit > INPUT_ZONES_COUNT) {
+        limit = INPUT_ZONES_COUNT;
+    }
+    for (uint16_t i = 0; i < INPUT_ZONES_COUNT; ++i) {
+        bool raw = (i < limit) ? inputs_zone_bit(gpioab, (int)i + 1) : false;
+        input_filter_seed(&s_digital_filters[i], raw, INPUT_DIGITAL_DEBOUNCE_MS, now_ms);
+    }
+    input_filter_seed(&s_tamper_filter, inputs_tamper(gpioab), INPUT_TAMPER_DEBOUNCE_MS, now_ms);
+#if ADS1115_COUNT > 0
+    memset(s_analog_filters, 0, sizeof(s_analog_filters));
+#endif
+    ESP_LOGI(TAG, "input baseline initialized (zones=%u, boot_settle_ms=%u)",
+             (unsigned)zones_total, (unsigned)INPUT_BOOT_SETTLE_MS);
+    for (uint16_t i = 0; i < limit; ++i) {
+        ESP_LOGI(TAG, "zone %u stable after boot: %s", (unsigned)(i + 1u),
+                 s_digital_filters[i].stable_value ? "open" : "closed");
+    }
+    return ESP_OK;
+}
+
+esp_err_t inputs_compose_debounced_mask(uint16_t gpioab, uint16_t zones_total, zone_mask_t* out_mask, bool* tamper_out)
+{
+    ESP_RETURN_ON_FALSE(out_mask != NULL, ESP_ERR_INVALID_ARG, TAG, "mask null");
+    uint64_t now_ms = input_now_ms();
+    zone_mask_clear(out_mask);
+
+    uint16_t master_limit = INPUT_ZONES_COUNT;
+    if (master_limit > zones_total) {
+        master_limit = zones_total;
+    }
+
+    for (uint16_t i = 0; i < master_limit; ++i) {
+        bool raw = inputs_zone_bit(gpioab, (int)i + 1);
+        inputs_debounce_bool(&s_digital_filters[i], raw, false, INPUT_DIGITAL_DEBOUNCE_MS, now_ms);
+        if (s_digital_filters[i].stable_value) {
+            zone_mask_set(out_mask, i);
+        }
+    }
+
+    inputs_debounce_bool(&s_tamper_filter, inputs_tamper(gpioab), false, INPUT_TAMPER_DEBOUNCE_MS, now_ms);
+    bool tamper_detected = s_tamper_filter.stable_value;
+
+#if ADS1115_COUNT > 0
+    uint16_t analog_slots = 0;
+    if (zones_total > INPUT_ZONES_COUNT) {
+        uint16_t available = (uint16_t)(zones_total - INPUT_ZONES_COUNT);
+        analog_slots = (uint16_t)inputs_analog_zone_count();
+        if (analog_slots > available) {
+            analog_slots = available;
+        }
+    }
+
+    for (uint16_t idx = 0; idx < analog_slots; ++idx) {
+        input_analog_zone_state_t raw_state;
+        esp_err_t eval_err = inputs_analog_evaluate(idx, pdMS_TO_TICKS(75), &raw_state);
+        analog_filter_update(idx, eval_err, &raw_state, now_ms);
+
+        uint16_t zone_index = (uint16_t)(INPUT_ZONES_COUNT + idx);
+        if (zone_index >= zones_total) {
+            break;
+        }
+        input_analog_filter_state_t* filter = &s_analog_filters[idx];
+        if (filter->stable_state == ANALOG_CANDIDATE_ALARM) {
+            zone_mask_set(out_mask, zone_index);
+        } else if (filter->stable_state == ANALOG_CANDIDATE_TAMPER) {
+            tamper_detected = true;
+        }
+    }
+#endif
+
+    zone_mask_limit(out_mask, zones_total);
+    if (tamper_out) {
+        *tamper_out = tamper_detected;
+    }
+    return ESP_OK;
+}
+
+bool inputs_get_filtered_zone_state(uint16_t zero_based_index, input_zone_filtered_state_t* out_state)
+{
+    if (!out_state) {
+        return false;
+    }
+    memset(out_state, 0, sizeof(*out_state));
+    if (zero_based_index < INPUT_ZONES_COUNT) {
+        const input_debounce_state_t* st = &s_digital_filters[zero_based_index];
+        out_state->known = st->initialized && !st->unavailable;
+        out_state->alarm = st->stable_value;
+        out_state->debouncing = st->debouncing;
+        out_state->unavailable = st->unavailable;
+        out_state->bounce_count = st->bounce_count;
+        out_state->last_raw_change_ms = st->last_raw_change_ms;
+        out_state->last_stable_change_ms = st->last_stable_change_ms;
+        return st->initialized;
+    }
+#if ADS1115_COUNT > 0
+    uint16_t analog_index = (uint16_t)(zero_based_index - INPUT_ZONES_COUNT);
+    if (analog_index < INPUT_ANALOG_ZONES_COUNT) {
+        const input_analog_filter_state_t* st = &s_analog_filters[analog_index];
+        out_state->known = st->initialized && st->stable_state != ANALOG_CANDIDATE_UNAVAILABLE;
+        out_state->alarm = st->stable_state == ANALOG_CANDIDATE_ALARM;
+        out_state->tamper = st->stable_state == ANALOG_CANDIDATE_TAMPER;
+        out_state->unavailable = st->stable_state == ANALOG_CANDIDATE_UNAVAILABLE;
+        out_state->debouncing = st->debouncing;
+        out_state->voltage = st->filtered_voltage;
+        out_state->bounce_count = st->bounce_count;
+        out_state->discarded_samples = st->discarded_samples;
+        out_state->last_raw_change_ms = st->last_raw_change_ms;
+        out_state->last_stable_change_ms = st->last_stable_change_ms;
+        return st->initialized;
+    }
+#endif
+    return false;
+}
+
+bool inputs_get_filtered_tamper(input_debounce_state_t* out_state)
+{
+    if (!out_state) {
+        return false;
+    }
+    *out_state = s_tamper_filter;
+    return s_tamper_filter.initialized;
 }
 
 esp_err_t inputs_analog_supply_state(TickType_t timeout, input_supply_state_t* out_state)
@@ -1034,6 +1406,64 @@ esp_err_t inputs_analog_supply_state(TickType_t timeout, input_supply_state_t* o
     out_state->supply_voltage = analog_supply_from_adc(adc_voltage);
     return ESP_OK;
 #endif
+}
+#endif
+
+#if ADS1115_COUNT == 0
+esp_err_t inputs_baseline_init(uint16_t gpioab, uint16_t zones_total)
+{
+    uint64_t now_ms = input_now_ms();
+    uint16_t limit = zones_total > INPUT_ZONES_COUNT ? INPUT_ZONES_COUNT : zones_total;
+    for (uint16_t i = 0; i < INPUT_ZONES_COUNT; ++i) {
+        bool raw = (i < limit) ? inputs_zone_bit(gpioab, (int)i + 1) : false;
+        input_filter_seed(&s_digital_filters[i], raw, INPUT_DIGITAL_DEBOUNCE_MS, now_ms);
+    }
+    input_filter_seed(&s_tamper_filter, inputs_tamper(gpioab), INPUT_TAMPER_DEBOUNCE_MS, now_ms);
+    ESP_LOGI(TAG, "input baseline initialized (zones=%u, boot_settle_ms=%u)",
+             (unsigned)zones_total, (unsigned)INPUT_BOOT_SETTLE_MS);
+    for (uint16_t i = 0; i < limit; ++i) {
+        ESP_LOGI(TAG, "zone %u stable after boot: %s", (unsigned)(i + 1u),
+                 s_digital_filters[i].stable_value ? "open" : "closed");
+    }
+    return ESP_OK;
+}
+
+esp_err_t inputs_compose_debounced_mask(uint16_t gpioab, uint16_t zones_total, zone_mask_t* out_mask, bool* tamper_out)
+{
+    ESP_RETURN_ON_FALSE(out_mask != NULL, ESP_ERR_INVALID_ARG, TAG, "mask null");
+    uint64_t now_ms = input_now_ms();
+    zone_mask_clear(out_mask);
+    uint16_t master_limit = zones_total > INPUT_ZONES_COUNT ? INPUT_ZONES_COUNT : zones_total;
+    for (uint16_t i = 0; i < master_limit; ++i) {
+        inputs_debounce_bool(&s_digital_filters[i], inputs_zone_bit(gpioab, (int)i + 1), false, INPUT_DIGITAL_DEBOUNCE_MS, now_ms);
+        if (s_digital_filters[i].stable_value) zone_mask_set(out_mask, i);
+    }
+    inputs_debounce_bool(&s_tamper_filter, inputs_tamper(gpioab), false, INPUT_TAMPER_DEBOUNCE_MS, now_ms);
+    zone_mask_limit(out_mask, zones_total);
+    if (tamper_out) *tamper_out = s_tamper_filter.stable_value;
+    return ESP_OK;
+}
+
+bool inputs_get_filtered_zone_state(uint16_t zero_based_index, input_zone_filtered_state_t* out_state)
+{
+    if (!out_state || zero_based_index >= INPUT_ZONES_COUNT) return false;
+    memset(out_state, 0, sizeof(*out_state));
+    const input_debounce_state_t* st = &s_digital_filters[zero_based_index];
+    out_state->known = st->initialized && !st->unavailable;
+    out_state->alarm = st->stable_value;
+    out_state->debouncing = st->debouncing;
+    out_state->unavailable = st->unavailable;
+    out_state->bounce_count = st->bounce_count;
+    out_state->last_raw_change_ms = st->last_raw_change_ms;
+    out_state->last_stable_change_ms = st->last_stable_change_ms;
+    return st->initialized;
+}
+
+bool inputs_get_filtered_tamper(input_debounce_state_t* out_state)
+{
+    if (!out_state) return false;
+    *out_state = s_tamper_filter;
+    return s_tamper_filter.initialized;
 }
 #endif
 

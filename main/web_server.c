@@ -3590,12 +3590,14 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
     uint16_t gpioab = 0;
     bool gpio_ok = (inputs_read_all(&gpioab) == ESP_OK);
     for (int i = 0; i < snap->master_total; ++i) {
+        input_zone_filtered_state_t filtered = {0};
+        bool filtered_ok = inputs_get_filtered_zone_state((uint16_t)i, &filtered);
         zone_state_entry_t *entry = &snap->entries[i];
         entry->board = 0;
         entry->board_input = (uint8_t)i;
         entry->board_online = gpio_ok;
-        entry->known = gpio_ok;
-        entry->active = gpio_ok ? inputs_zone_bit(gpioab, i + 1) : false;
+        entry->known = filtered_ok ? filtered.known : gpio_ok;
+        entry->active = filtered_ok ? filtered.alarm : (gpio_ok ? inputs_zone_bit(gpioab, i + 1) : false);
         entry->analog = false;
         entry->analog_value = 0.0f;
         entry->tamper = false;
@@ -3640,16 +3642,18 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
 #if ADS1115_COUNT > 0
             size_t analog_index = (size_t)(dev * ADS1115_CHANNEL_COUNT + ch);
             input_analog_zone_state_t state;
+            input_zone_filtered_state_t filtered = {0};
+            bool filtered_ok = inputs_get_filtered_zone_state((uint16_t)(INPUT_ZONES_COUNT + analog_index), &filtered);
             if (inputs_analog_evaluate(analog_index, pdMS_TO_TICKS(75), &state) == ESP_OK) {
                 entry->analog_mode = (uint8_t)state.mode;
                 entry->analog_device_present = state.device_present;
                 entry->analog_sample_valid = state.sample_valid;
                 entry->board_online = state.device_present;
-                if (state.device_present && state.sample_valid) {
-                    entry->known = true;
-                    entry->active = state.alarm;
-                    entry->analog_value = state.voltage;
-                    entry->tamper = state.tamper;
+                if (filtered_ok) {
+                    entry->known = filtered.known;
+                    entry->active = filtered.alarm;
+                    entry->analog_value = filtered.voltage;
+                    entry->tamper = filtered.tamper;
                 }
             }
 #endif
@@ -4746,7 +4750,8 @@ static esp_err_t status_get(httpd_req_t* req){
 
     uint16_t gpioab = 0;
     inputs_read_all(&gpioab);
-    bool tamper_global = inputs_tamper(gpioab);
+    input_debounce_state_t tamper_state = {0};
+    bool tamper_global = inputs_get_filtered_tamper(&tamper_state) ? tamper_state.stable_value : false;
     zone_mask_t tamper_mask;
     zone_mask_clear(&tamper_mask);
     bool tamper_alarm = (alarm_last_alarm_was_tamper() && _st == ALARM_ALARM);
@@ -5557,6 +5562,17 @@ static esp_err_t zones_get(httpd_req_t* req){
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
         cJSON_AddBoolToObject(it, "analog", entry->analog);
         cJSON_AddBoolToObject(it, "tamper", entry->known ? entry->tamper : false);
+        input_zone_filtered_state_t diag = {0};
+        if (inputs_get_filtered_zone_state((uint16_t)idx, &diag)) {
+            cJSON_AddBoolToObject(it, "debouncing", diag.debouncing);
+            cJSON_AddBoolToObject(it, "unavailable", diag.unavailable);
+            cJSON_AddNumberToObject(it, "bounce_count", (double)diag.bounce_count);
+            cJSON_AddNumberToObject(it, "last_raw_change_ms", (double)diag.last_raw_change_ms);
+            cJSON_AddNumberToObject(it, "last_stable_change_ms", (double)diag.last_stable_change_ms);
+            if (entry->analog) {
+                cJSON_AddNumberToObject(it, "discarded_samples", (double)diag.discarded_samples);
+            }
+        }
 #if ADS1115_COUNT > 0
         if (entry->analog) {
             cJSON_AddBoolToObject(it, "analog_device_present", entry->analog_device_present);
@@ -6468,9 +6484,9 @@ static esp_err_t tamper_reset_post(httpd_req_t* req)
         return json_reply(req, "{\"error\":\"notamper\",\"message\":\"Allarme non generato dal tamper.\"}");
     }
 
-    uint16_t gpioab = 0;
-    inputs_read_all(&gpioab);
-    if (inputs_tamper(gpioab)) {
+    input_debounce_state_t tamper_state = {0};
+    bool tamper_known = inputs_get_filtered_tamper(&tamper_state);
+    if (tamper_known && tamper_state.stable_value) {
         cJSON_Delete(root);
         httpd_resp_set_status(req, "409 Conflict");
         return json_reply(req, "{\"error\":\"tamper_open\",\"message\":\"Linea tamper ancora aperta.\"}");

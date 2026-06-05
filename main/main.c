@@ -1376,6 +1376,8 @@ static void nvs_init_safe(void)
     }
 }
 
+static input_debounce_state_t s_can_input_filters[ALARM_MAX_ZONES];
+
 static void compose_zone_mask_core(uint16_t master_gpio, uint16_t zones_total, zone_mask_t *out_mask, bool *tamper_out)
 {
     if (!out_mask) {
@@ -1385,25 +1387,9 @@ static void compose_zone_mask_core(uint16_t master_gpio, uint16_t zones_total, z
         zones_total = ALARM_MAX_ZONES;
     }
 
-    zone_mask_clear(out_mask);
-    bool tamper_detected = inputs_tamper(master_gpio);
-    uint16_t master_limit = INPUT_ZONES_COUNT;
-    if (master_limit > zones_total) {
-        master_limit = zones_total;
-    }
-
-    for (uint16_t i = 1; i <= master_limit; ++i) {
-        if (inputs_zone_bit(master_gpio, i)) {
-            zone_mask_set(out_mask, (uint16_t)(i - 1u));
-        }
-    }
-
-    if (zones_total <= INPUT_ZONES_COUNT) {
-        zone_mask_limit(out_mask, zones_total);
-        if (tamper_out) {
-            *tamper_out = tamper_detected;
-        }
-        return;
+    bool tamper_detected = false;
+    if (inputs_compose_debounced_mask(master_gpio, zones_total, out_mask, &tamper_detected) != ESP_OK) {
+        zone_mask_clear(out_mask);
     }
 
     uint16_t analog_slots = 0;
@@ -1415,24 +1401,6 @@ static void compose_zone_mask_core(uint16_t master_gpio, uint16_t zones_total, z
             analog_slots = available;
         }
     }
-
-    for (uint16_t idx = 0; idx < analog_slots; ++idx) {
-        input_analog_zone_state_t state;
-        esp_err_t eval_err = inputs_analog_evaluate(idx, pdMS_TO_TICKS(75), &state);
-        uint16_t zone_index = (uint16_t)(INPUT_ZONES_COUNT + idx);
-        if (zone_index >= zones_total) {
-            break;
-        }
-        if (eval_err != ESP_OK || !state.device_present || !state.sample_valid) {
-            continue;
-        }
-        if (state.alarm) {
-            zone_mask_set(out_mask, zone_index);
-        }
-        if (state.tamper) {
-            tamper_detected = true;
-        }
-    }
 #endif
 
     roster_node_inputs_t nodes[32];
@@ -1442,12 +1410,16 @@ static void compose_zone_mask_core(uint16_t master_gpio, uint16_t zones_total, z
         offset = zones_total;
     }
 
+    uint64_t now_ms = (uint64_t)(esp_timer_get_time() / 1000ULL);
+
     for (size_t idx = 0; idx < node_count && offset < zones_total && offset < ALARM_MAX_ZONES; ++idx) {
         const roster_node_inputs_t *node = &nodes[idx];
         const uint8_t inputs = node->inputs_count;
         for (uint8_t bit = 0; bit < inputs && offset < zones_total && offset < ALARM_MAX_ZONES; ++bit, ++offset) {
-            bool active = node->inputs_valid && ((node->inputs_bitmap & (1u << bit)) != 0u);
-            if (active) {
+            bool unavailable = !node->inputs_valid;
+            bool raw_active = node->inputs_valid && ((node->inputs_bitmap & (1u << bit)) != 0u);
+            inputs_debounce_bool(&s_can_input_filters[offset], raw_active, unavailable, INPUT_DIGITAL_DEBOUNCE_MS, now_ms);
+            if (!s_can_input_filters[offset].unavailable && s_can_input_filters[offset].stable_value) {
                 zone_mask_set(out_mask, offset);
             }
         }
@@ -1587,13 +1559,18 @@ static void system_main_task(void *arg)
     mqtt_publish_state();
     mqtt_publish_scenes();
 
+    ESP_LOGI(TAG, "Attesa stabilizzazione iniziale ingressi: %u ms", (unsigned)INPUT_BOOT_SETTLE_MS);
+    vTaskDelay(pdMS_TO_TICKS(INPUT_BOOT_SETTLE_MS));
+
     uint16_t initial_gpio = 0;
     uint16_t last_zones_total = roster_effective_zones(inputs_master_zone_capacity());
     zone_mask_t last_mask;
     zone_mask_clear(&last_mask);
     bool first_cycle = true;
+    uint32_t last_filter_counter = inputs_filter_change_counter();
     if (inputs_read_all(&initial_gpio) == ESP_OK) {
         uint16_t zones_total = roster_effective_zones(inputs_master_zone_capacity());
+        ESP_ERROR_CHECK(inputs_baseline_init(initial_gpio, zones_total));
         zone_mask_t init_mask;
         compose_zone_mask(initial_gpio, zones_total, &init_mask, NULL);
         mqtt_publish_zones(&init_mask);
@@ -1626,17 +1603,25 @@ static void system_main_task(void *arg)
     
     while (true) {
         uint16_t ab = 0;
-        inputs_read_all(&ab);
+        esp_err_t read_err = inputs_read_all(&ab);
+        if (read_err != ESP_OK) {
+            ESP_LOGW(TAG, "Lettura ingressi MCP23017 fallita: %s", esp_err_to_name(read_err));
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
 
         uint16_t zones_total = roster_effective_zones(inputs_master_zone_capacity());
         zone_mask_t zmask;
         bool tamper = false;
         compose_zone_mask(ab, zones_total, &zmask, &tamper);
 
-        if (first_cycle || !zone_mask_equal(&zmask, &last_mask) || zones_total != last_zones_total) {
+        uint32_t filter_counter = inputs_filter_change_counter();
+        if (first_cycle || !zone_mask_equal(&zmask, &last_mask) ||
+            zones_total != last_zones_total || filter_counter != last_filter_counter) {
             mqtt_publish_zones(&zmask);
             zone_mask_copy(&last_mask, &zmask);
             last_zones_total = zones_total;
+            last_filter_counter = filter_counter;
             first_cycle = false;
         }
 

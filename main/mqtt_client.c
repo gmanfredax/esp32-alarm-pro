@@ -284,7 +284,8 @@ esp_err_t mqtt_publish_state(void)
 
     uint16_t gpioab = 0;
     inputs_read_all(&gpioab);
-    bool tamper = inputs_tamper(gpioab);
+    input_debounce_state_t tamper_state = {0};
+    bool tamper = inputs_get_filtered_tamper(&tamper_state) ? tamper_state.stable_value : false;
 #if ADS1115_COUNT > 0
     input_tamper_snapshot_t tamper_snapshot;
     zone_mask_clear(&tamper_snapshot.zone_mask);
@@ -380,11 +381,10 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
     for (int i = 0; i < total; ++i) {
         bool active = zone_mask_test(&limited, (uint16_t)i);
         bool unavailable = false;
-#if ADS1115_COUNT > 0
-        if (i >= INPUT_ZONES_COUNT) {
-            unavailable = !inputs_analog_zone_available((size_t)(i - INPUT_ZONES_COUNT));
+        input_zone_filtered_state_t filtered = {0};
+        if (inputs_get_filtered_zone_state((uint16_t)i, &filtered)) {
+            unavailable = filtered.unavailable || !filtered.known;
         }
-#endif
         cJSON_AddItemToArray(arr, cJSON_CreateBool(active));
         char topic[MQTT_TOPIC_MAX_LEN];
         snprintf(topic, sizeof(topic), "%s/zones/%d/state", s_base_topic, i + 1);
