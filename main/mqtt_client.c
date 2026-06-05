@@ -69,6 +69,7 @@ static char                     s_topic_scenes[MQTT_TOPIC_MAX_LEN];
 static char                     s_topic_cmd_base[MQTT_TOPIC_MAX_LEN];
 static char                     s_topic_cmd_sub[MQTT_TOPIC_MAX_LEN];
 static char                     s_base_topic[MQTT_BASE_TOPIC_MAX_LEN];
+static char                     s_configured_base_topic[MQTT_BASE_TOPIC_MAX_LEN];
 static char                     s_topic_alarm_state[MQTT_TOPIC_MAX_LEN];
 static char                     s_topic_alarm_attr[MQTT_TOPIC_MAX_LEN];
 static char                     s_topic_tamper_state[MQTT_TOPIC_MAX_LEN];
@@ -122,9 +123,30 @@ static void build_device_id(void)
              mac[2], mac[3], mac[4], mac[5]);
 }
 
+esp_err_t mqtt_build_effective_base_topic(const char *configured_base, const char *tenant_id, const char *site_id, const char *device_id, char *out, size_t out_len)
+{
+    if (!out || out_len == 0 || !tenant_id || !site_id || !device_id) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *base = configured_base ? configured_base : "";
+    if (base[0] != '\0') {
+        int written = snprintf(out, out_len, "%s", base);
+        return (written < 0 || (size_t)written >= out_len) ? ESP_ERR_INVALID_SIZE : ESP_OK;
+    }
+
+    int written = snprintf(out, out_len, "tenants/%s/sites/%s/devices/%s", tenant_id, site_id, device_id);
+    return (written < 0 || (size_t)written >= out_len) ? ESP_ERR_INVALID_SIZE : ESP_OK;
+}
+
 static void build_topics(void)
 {
-    snprintf(s_base_topic, sizeof(s_base_topic), "tenants/%s/sites/%s/devices/%s", s_tenant_id, s_site_id, s_device_id);
+    esp_err_t err = mqtt_build_effective_base_topic(s_configured_base_topic, s_tenant_id, s_site_id, s_device_id, s_base_topic, sizeof(s_base_topic));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Invalid MQTT base topic configuration: %s", esp_err_to_name(err));
+        s_base_topic[0] = '\0';
+    }
+    ESP_LOGI(TAG, "effective base topic: %s", s_base_topic);
     snprintf(s_topic_state, sizeof(s_topic_state), "%s/system/state", s_base_topic);
     snprintf(s_topic_zones, sizeof(s_topic_zones), "%s/zones/state", s_base_topic);
     snprintf(s_topic_avail, sizeof(s_topic_avail), "%s/availability", s_base_topic);
@@ -159,6 +181,7 @@ static void load_mqtt_config_from_nvs(void)
     strlcpy(s_discovery_prefix, "homeassistant", sizeof(s_discovery_prefix));
     strlcpy(s_tenant_id, "default", sizeof(s_tenant_id));
     strlcpy(s_site_id, "default", sizeof(s_site_id));
+    s_configured_base_topic[0] = '\0';
 
     nvs_handle_t nvs;
     esp_err_t err = nvs_open("sys", NVS_READONLY, &nvs);
@@ -202,7 +225,7 @@ static void load_mqtt_config_from_nvs(void)
     len = sizeof(s_tenant_id); nvs_get_str(nvs, "mq_tenant", s_tenant_id, &len);
     len = sizeof(s_site_id); nvs_get_str(nvs, "mq_site", s_site_id, &len);
     len = sizeof(s_device_id); nvs_get_str(nvs, "mq_device", s_device_id, &len);
-    len = sizeof(s_base_topic); if (nvs_get_str(nvs, "mq_base", s_base_topic, &len) == ESP_OK && s_base_topic[0]) { /* rebuilt below if empty */ }
+    len = sizeof(s_configured_base_topic); nvs_get_str(nvs, "mq_base", s_configured_base_topic, &len);
     len = sizeof(s_discovery_prefix); nvs_get_str(nvs, "mq_disc_pref", s_discovery_prefix, &len);
 
     nvs_close(nvs);
@@ -233,21 +256,31 @@ static inline const char* alarm_state_to_name(alarm_state_t st)
 
 static esp_err_t publish_raw(const char *topic, const char *payload, int qos, bool retain)
 {
-    if (!s_client) return ESP_ERR_INVALID_STATE;
-    if (!topic || !payload) return ESP_ERR_INVALID_ARG;
+    if (!s_client) {
+        ESP_LOGE(TAG, "publish error topic=%s code=%s", topic ? topic : "(null)", esp_err_to_name(ESP_ERR_INVALID_STATE));
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!topic || !payload) {
+        ESP_LOGE(TAG, "publish error topic=%s code=%s", topic ? topic : "(null)", esp_err_to_name(ESP_ERR_INVALID_ARG));
+        return ESP_ERR_INVALID_ARG;
+    }
     int msg_id = esp_mqtt_client_publish(s_client, topic, payload, 0, qos, retain);
     if (msg_id < 0) {
-        ESP_LOGW(TAG, "Publish failed topic=%s", topic);
+        ESP_LOGE(TAG, "publish error topic=%s code=%d", topic, msg_id);
         return ESP_FAIL;
     }
-    ESP_LOGD(TAG, "Publish topic=%s qos=%d retain=%d", topic, qos, retain);
+    ESP_LOGD(TAG, "Publish topic=%s qos=%d retain=%d msg_id=%d", topic, qos, retain, msg_id);
     return ESP_OK;
 }
 
-static void publish_availability(const char *state)
+static esp_err_t publish_availability(const char *state)
 {
-    if (!state) return;
-    publish_raw(s_topic_avail, state, CONFIG_APP_CLOUD_QOS_STATE, true);
+    if (!state) return ESP_ERR_INVALID_ARG;
+    esp_err_t err = publish_raw(s_topic_avail, state, CONFIG_APP_CLOUD_QOS_STATE, true);
+    if (err == ESP_OK && strcmp(state, "online") == 0) {
+        ESP_LOGI(TAG, "availability online published");
+    }
+    return err;
 }
 
 static void ensure_timestamp(cJSON *root)
@@ -412,7 +445,7 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
         cJSON_AddItemToArray(arr, cJSON_CreateBool(active));
         char topic[MQTT_TOPIC_MAX_LEN];
         snprintf(topic, sizeof(topic), "%s/zones/%d/state", s_base_topic, i + 1);
-        publish_raw(topic, unavailable ? "unavailable" : (active ? "ON" : "OFF"), CONFIG_APP_CLOUD_QOS_STATE, false);
+        publish_raw(topic, unavailable ? "unavailable" : (active ? "ON" : "OFF"), CONFIG_APP_CLOUD_QOS_STATE, true);
     }
 
 #if ADS1115_COUNT > 0
@@ -421,7 +454,7 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
         if (inputs_ads1115_get_module_info(i, &info) != ESP_OK) continue;
         char topic[MQTT_TOPIC_MAX_LEN];
         snprintf(topic, sizeof(topic), "%s/ads1115/%s/online", s_base_topic, info.id);
-        publish_raw(topic, info.online ? "ON" : "OFF", CONFIG_APP_CLOUD_QOS_STATE, false);
+        publish_raw(topic, info.online ? "ON" : "OFF", CONFIG_APP_CLOUD_QOS_STATE, true);
         snprintf(topic, sizeof(topic), "%s/ads1115/%s/diagnostics", s_base_topic, info.id);
         cJSON* diag = cJSON_CreateObject();
         if (diag) {
@@ -444,7 +477,7 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
     cJSON_Delete(root);
     if (!payload) return ESP_ERR_NO_MEM;
 
-    esp_err_t err = publish_raw(s_topic_zones, payload, CONFIG_APP_CLOUD_QOS_STATE, false);
+    esp_err_t err = publish_raw(s_topic_zones, payload, CONFIG_APP_CLOUD_QOS_STATE, true);
     cJSON_free(payload);
     return err;
 }
@@ -522,6 +555,42 @@ esp_err_t mqtt_publish_scenes(void)
     return err;
 }
 
+static void build_current_zone_mask(zone_mask_t *mask)
+{
+    if (!mask) return;
+    zone_mask_clear(mask);
+    uint16_t total = roster_effective_zones(inputs_master_zone_capacity());
+    if (total > SCENES_MAX_ZONES) {
+        total = SCENES_MAX_ZONES;
+    }
+
+    for (uint16_t i = 0; i < total; ++i) {
+        input_zone_filtered_state_t filtered = {0};
+        if (inputs_get_filtered_zone_state(i, &filtered) && filtered.known && filtered.alarm) {
+            zone_mask_set(mask, i);
+        }
+    }
+}
+
+static esp_err_t mqtt_publish_initial_states(void)
+{
+    esp_err_t first_err = mqtt_publish_state();
+
+    zone_mask_t current_mask;
+    build_current_zone_mask(&current_mask);
+    esp_err_t err = publish_zones_internal(&current_mask, true);
+    if (first_err == ESP_OK && err != ESP_OK) first_err = err;
+
+    err = mqtt_publish_scenes();
+    if (first_err == ESP_OK && err != ESP_OK) first_err = err;
+
+    if (first_err == ESP_OK) {
+        ESP_LOGI(TAG, "initial states published");
+    } else {
+        ESP_LOGE(TAG, "initial states publish error code=%s", esp_err_to_name(first_err));
+    }
+    return first_err;
+}
 
 esp_err_t mqtt_publish_event_json(const char *payload, const char *severity)
 {
@@ -533,6 +602,17 @@ esp_err_t mqtt_publish_event_json(const char *payload, const char *severity)
 }
 
 bool mqtt_is_connected(void) { return s_connected; }
+
+static void publish_discovery_config_payload(const char *topic, const char *payload, size_t *count, esp_err_t *first_err)
+{
+    if (!payload) return;
+    esp_err_t err = publish_raw(topic, payload, 1, true);
+    if (err == ESP_OK) {
+        if (count) (*count)++;
+    } else if (first_err && *first_err == ESP_OK) {
+        *first_err = err;
+    }
+}
 
 static bool mqtt_command_pin_valid(cJSON *root)
 {
@@ -547,6 +627,7 @@ static bool mqtt_command_pin_valid(cJSON *root)
 esp_err_t mqtt_publish_discovery(void)
 {
     if (!s_client || !s_discovery_enabled) return ESP_OK;
+    size_t discovery_count = 0;
     char topic[MQTT_TOPIC_MAX_LEN];
     snprintf(topic, sizeof(topic), "%s/alarm_control_panel/%s/panel/config", s_discovery_prefix, s_device_id);
     cJSON *root = cJSON_CreateObject();
@@ -568,7 +649,8 @@ esp_err_t mqtt_publish_discovery(void)
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!payload) return ESP_ERR_NO_MEM;
-    esp_err_t err = publish_raw(topic, payload, 1, true);
+    esp_err_t err = ESP_OK;
+    publish_discovery_config_payload(topic, payload, &discovery_count, &err);
     cJSON_free(payload);
 
     snprintf(topic, sizeof(topic), "%s/binary_sensor/%s/global_tamper/config", s_discovery_prefix, s_device_id);
@@ -584,7 +666,7 @@ esp_err_t mqtt_publish_discovery(void)
         cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
         dev = cJSON_AddObjectToObject(root, "device"); ids = cJSON_AddArrayToObject(dev, "identifiers"); cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
         payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
-        if (payload) { publish_raw(topic, payload, 1, true); cJSON_free(payload); }
+        if (payload) { publish_discovery_config_payload(topic, payload, &discovery_count, &err); cJSON_free(payload); }
     }
 
     uint16_t total = roster_effective_zones(inputs_master_zone_capacity());
@@ -605,7 +687,7 @@ esp_err_t mqtt_publish_discovery(void)
         cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
         dev = cJSON_AddObjectToObject(root, "device"); ids = cJSON_AddArrayToObject(dev, "identifiers"); cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
         payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
-        if (payload) { publish_raw(topic, payload, 1, true); cJSON_free(payload); }
+        if (payload) { publish_discovery_config_payload(topic, payload, &discovery_count, &err); cJSON_free(payload); }
     }
 
 #if ADS1115_COUNT > 0
@@ -627,7 +709,7 @@ esp_err_t mqtt_publish_discovery(void)
         cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
         dev = cJSON_AddObjectToObject(root, "device"); ids = cJSON_AddArrayToObject(dev, "identifiers"); cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
         payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
-        if (payload) { publish_raw(topic, payload, 1, true); cJSON_free(payload); }
+        if (payload) { publish_discovery_config_payload(topic, payload, &discovery_count, &err); cJSON_free(payload); }
     }
 #endif
 
@@ -652,8 +734,9 @@ esp_err_t mqtt_publish_discovery(void)
         cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
         dev = cJSON_AddObjectToObject(root, "device"); ids = cJSON_AddArrayToObject(dev, "identifiers"); cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
         payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
-        if (payload) { publish_raw(topic, payload, 1, true); cJSON_free(payload); }
+        if (payload) { publish_discovery_config_payload(topic, payload, &discovery_count, &err); cJSON_free(payload); }
     }
+    ESP_LOGI(TAG, "discovery published %u entities retained", (unsigned)discovery_count);
     return err;
 }
 
@@ -947,9 +1030,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         esp_mqtt_client_subscribe(s_client, s_topic_alarm_cmd, CONFIG_APP_CLOUD_QOS_COMMANDS);
         esp_mqtt_client_subscribe(s_client, s_topic_notify_ack, CONFIG_APP_CLOUD_QOS_COMMANDS);
         mqtt_publish_discovery();
-        mqtt_publish_state();
-        publish_zones_internal(&s_last_zone_mask, true);
-        mqtt_publish_scenes();
+        mqtt_publish_initial_states();
         break;
     case MQTT_EVENT_DISCONNECTED:
         s_connected = false;
@@ -1001,6 +1082,7 @@ esp_err_t mqtt_start(void)
     ESP_LOGI(TAG, "MQTT enabled");
     ESP_LOGI(TAG, "MQTT broker URI: %s", s_mqtt_uri);
     ESP_LOGI(TAG, "MQTT TLS: %s", tls_uri ? "yes" : "no");
+    ESP_LOGI(TAG, "effective base topic: %s", s_base_topic);
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = s_mqtt_uri,
@@ -1040,8 +1122,6 @@ esp_err_t mqtt_start(void)
     ESP_RETURN_ON_ERROR(esp_mqtt_client_start(s_client), TAG, "start");
     ESP_LOGI(TAG, "MQTT client started (device_id=%s)", s_device_id);
 
-    // Initial availability is offline until we receive MQTT_EVENT_CONNECTED
-    publish_availability("offline");
     return ESP_OK;
 }
 

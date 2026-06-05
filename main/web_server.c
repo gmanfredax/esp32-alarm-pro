@@ -211,6 +211,7 @@ typedef struct {
     char site_id[48];
     char device_id[64];
     char base_topic[320];
+    char configured_base_topic[320];
     bool discovery_enabled;
     char discovery_prefix[64];
 } provisioning_mqtt_config_t;
@@ -2061,6 +2062,7 @@ static void mqtt_config_add_json(cJSON* root, const provisioning_mqtt_config_t* 
     cJSON_AddStringToObject(root, "site_id", cfg->site_id);
     cJSON_AddStringToObject(root, "device_id", cfg->device_id);
     cJSON_AddStringToObject(root, "base_topic", cfg->base_topic);
+    cJSON_AddStringToObject(root, "configured_base_topic", cfg->configured_base_topic);
     cJSON_AddStringToObject(root, "discovery_prefix", cfg->discovery_prefix);
 }
 
@@ -2274,11 +2276,14 @@ static void provisioning_load_mqtt(provisioning_mqtt_config_t* cfg){
         nvs_get_str_def(nvs, "mq_tenant", cfg->tenant_id, sizeof(cfg->tenant_id), cfg->tenant_id);
         nvs_get_str_def(nvs, "mq_site", cfg->site_id, sizeof(cfg->site_id), cfg->site_id);
         nvs_get_str_def(nvs, "mq_device", cfg->device_id, sizeof(cfg->device_id), cfg->device_id);
+        nvs_get_str_def(nvs, "mq_base", cfg->configured_base_topic, sizeof(cfg->configured_base_topic), "");
         nvs_get_str_def(nvs, "mq_disc_pref", cfg->discovery_prefix, sizeof(cfg->discovery_prefix), cfg->discovery_prefix);
         cfg->keepalive = nvs_get_u32_def(nvs, "mq_keep", CONFIG_APP_CLOUD_KEEPALIVE);
         nvs_close(nvs);
     }
-    snprintf(cfg->base_topic, sizeof(cfg->base_topic), "tenants/%s/sites/%s/devices/%s", cfg->tenant_id, cfg->site_id, cfg->device_id);
+    if (mqtt_build_effective_base_topic(cfg->configured_base_topic, cfg->tenant_id, cfg->site_id, cfg->device_id, cfg->base_topic, sizeof(cfg->base_topic)) != ESP_OK) {
+        snprintf(cfg->base_topic, sizeof(cfg->base_topic), "tenants/%s/sites/%s/devices/%s", cfg->tenant_id, cfg->site_id, cfg->device_id);
+    }
 }
 
 static void provisioning_load_cloudflare(provisioning_cloudflare_config_t* cfg){
@@ -2506,6 +2511,7 @@ static esp_err_t sys_mqtt_post(httpd_req_t* req){
     const cJSON* jtenant = cJSON_GetObjectItemCaseSensitive(j,"tenant_id");
     const cJSON* jsite = cJSON_GetObjectItemCaseSensitive(j,"site_id");
     const cJSON* jdev = cJSON_GetObjectItemCaseSensitive(j,"device_id");
+    const cJSON* jbase = cJSON_GetObjectItemCaseSensitive(j,"base_topic");
     const cJSON* jdisc = mqtt_json_get_alias(j, "ha_discovery_enabled", "discovery_enabled");
     const cJSON* jdp = cJSON_GetObjectItemCaseSensitive(j,"discovery_prefix");
 
@@ -2537,6 +2543,7 @@ static esp_err_t sys_mqtt_post(httpd_req_t* req){
     if (cJSON_IsString(jtenant) && jtenant->valuestring){ strlcpy(cfg.tenant_id, jtenant->valuestring, sizeof(cfg.tenant_id)); trim_inplace(cfg.tenant_id); }
     if (cJSON_IsString(jsite) && jsite->valuestring){ strlcpy(cfg.site_id, jsite->valuestring, sizeof(cfg.site_id)); trim_inplace(cfg.site_id); }
     if (cJSON_IsString(jdev) && jdev->valuestring){ strlcpy(cfg.device_id, jdev->valuestring, sizeof(cfg.device_id)); trim_inplace(cfg.device_id); }
+    if (cJSON_IsString(jbase) && jbase->valuestring){ strlcpy(cfg.configured_base_topic, jbase->valuestring, sizeof(cfg.configured_base_topic)); trim_inplace(cfg.configured_base_topic); }
     if (cJSON_IsString(jdp) && jdp->valuestring){ strlcpy(cfg.discovery_prefix, jdp->valuestring, sizeof(cfg.discovery_prefix)); trim_inplace(cfg.discovery_prefix); }
 
     if (!cfg.cid[0]) strlcpy(cfg.cid, cfg.device_id, sizeof(cfg.cid));
@@ -2561,6 +2568,10 @@ static esp_err_t sys_mqtt_post(httpd_req_t* req){
         cJSON_Delete(j);
         return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_topic_identity", "tenant_id, site_id e device_id non validi"), ESP_FAIL;
     }
+    if (!mqtt_topic_field_is_valid(cfg.configured_base_topic, sizeof(cfg.configured_base_topic), true)){
+        cJSON_Delete(j);
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_base_topic", "Base topic MQTT non valido"), ESP_FAIL;
+    }
     if (!mqtt_topic_field_is_valid(cfg.discovery_prefix, sizeof(cfg.discovery_prefix), false)){
         cJSON_Delete(j);
         return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_discovery_prefix", "Discovery prefix non valido"), ESP_FAIL;
@@ -2578,7 +2589,10 @@ static esp_err_t sys_mqtt_post(httpd_req_t* req){
         }
     }
 
-    snprintf(cfg.base_topic, sizeof(cfg.base_topic), "tenants/%s/sites/%s/devices/%s", cfg.tenant_id, cfg.site_id, cfg.device_id);
+    if (mqtt_build_effective_base_topic(cfg.configured_base_topic, cfg.tenant_id, cfg.site_id, cfg.device_id, cfg.base_topic, sizeof(cfg.base_topic)) != ESP_OK) {
+        cJSON_Delete(j);
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_base_topic", "Base topic MQTT troppo lungo"), ESP_FAIL;
+    }
     cJSON_Delete(j);
 
     nvs_handle_t nvs;
@@ -2594,7 +2608,7 @@ static esp_err_t sys_mqtt_post(httpd_req_t* req){
     if (err == ESP_OK) err = nvs_set_str(nvs,"mq_tenant", cfg.tenant_id);
     if (err == ESP_OK) err = nvs_set_str(nvs,"mq_site", cfg.site_id);
     if (err == ESP_OK) err = nvs_set_str(nvs,"mq_device", cfg.device_id);
-    if (err == ESP_OK) err = nvs_set_str(nvs,"mq_base", cfg.base_topic);
+    if (err == ESP_OK) err = nvs_set_str(nvs,"mq_base", cfg.configured_base_topic);
     if (err == ESP_OK) err = nvs_set_str(nvs,"mq_disc_pref", cfg.discovery_prefix);
     if (err == ESP_OK && clear_password) {
         esp_err_t erase_err = nvs_erase_key(nvs, "mq_pass");
