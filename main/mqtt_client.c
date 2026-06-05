@@ -154,8 +154,8 @@ static void load_mqtt_config_from_nvs(void)
     strlcpy(s_mqtt_user, default_user, sizeof(s_mqtt_user));
     strlcpy(s_mqtt_pass, default_pass, sizeof(s_mqtt_pass));
     s_mqtt_keepalive = CONFIG_APP_CLOUD_KEEPALIVE;
-    s_enabled = true;
-    s_discovery_enabled = true;
+    s_enabled = false;
+    s_discovery_enabled = false;
     strlcpy(s_discovery_prefix, "homeassistant", sizeof(s_discovery_prefix));
     strlcpy(s_tenant_id, "default", sizeof(s_tenant_id));
     strlcpy(s_site_id, "default", sizeof(s_site_id));
@@ -992,9 +992,15 @@ esp_err_t mqtt_start(void)
         mqtt_prepare_configuration();
     }
     if (!s_enabled) {
-        ESP_LOGI(TAG, "MQTT disabilitato da configurazione");
+        ESP_LOGI(TAG, "MQTT disabled");
         return ESP_OK;
     }
+
+    bool tls_uri = (strncasecmp(s_mqtt_uri, "mqtts://", 8) == 0) ||
+                   (strncasecmp(s_mqtt_uri, "wss://", 6) == 0);
+    ESP_LOGI(TAG, "MQTT enabled");
+    ESP_LOGI(TAG, "MQTT broker URI: %s", s_mqtt_uri);
+    ESP_LOGI(TAG, "MQTT TLS: %s", tls_uri ? "yes" : "no");
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri = s_mqtt_uri,
@@ -1019,6 +1025,11 @@ esp_err_t mqtt_start(void)
             .disable_auto_reconnect = false,
         },
     };
+
+    if (!tls_uri) {
+        cfg.broker.verification.certificate = NULL;
+        cfg.broker.verification.certificate_len = 0;
+    }
 
     s_client = esp_mqtt_client_init(&cfg);
     ESP_RETURN_ON_FALSE(s_client != NULL, ESP_ERR_NO_MEM, TAG, "mqtt init");

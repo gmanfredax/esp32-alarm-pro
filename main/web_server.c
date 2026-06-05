@@ -402,6 +402,23 @@ static esp_err_t json_error_reply(httpd_req_t *req, const char *status, const ch
     return json_reply_cjson(req, resp);
 }
 
+static esp_err_t json_mqtt_error_reply(httpd_req_t* req, int status, const char* error, const char* message){
+    cJSON* root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    cJSON_AddBoolToObject(root, "ok", false);
+    cJSON_AddStringToObject(root, "error", error ? error : "error");
+    cJSON_AddStringToObject(root, "message", message ? message : "Errore");
+    char* payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!payload) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    set_http_security_headers(req);
+    httpd_resp_set_status(req, status == HTTPD_500_INTERNAL_SERVER_ERROR ? "500 Internal Server Error" : "400 Bad Request");
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr(req, payload);
+    free(payload);
+    return err;
+}
+
 // ----- START CANBUS -----------------------------------
 static SemaphoreHandle_t ws_lock_get(void)
 {
@@ -1951,6 +1968,102 @@ static bool mqtt_password_is_valid(const char* pass){
     return has_lower && has_upper && has_digit && has_special;
 }
 
+static bool mqtt_string_field_is_valid(const char* s, size_t max_len, bool allow_empty){
+    if (!s) return allow_empty;
+    size_t len = strlen(s);
+    if (len == 0) return allow_empty;
+    if (len >= max_len) return false;
+    for (size_t i = 0; i < len; ++i){
+        unsigned char ch = (unsigned char)s[i];
+        if (ch < 0x21 || ch == 0x7f) return false;
+        if (!(isalnum(ch) || ch == '_' || ch == '-' || ch == '.' || ch == '/' || ch == ':')) return false;
+    }
+    return true;
+}
+
+static bool mqtt_topic_field_is_valid(const char* s, size_t max_len, bool allow_empty){
+    if (!s) return allow_empty;
+    size_t len = strlen(s);
+    if (len == 0) return allow_empty;
+    if (len >= max_len || s[0] == '/' || s[len - 1] == '/') return false;
+    for (size_t i = 0; i < len; ++i){
+        unsigned char ch = (unsigned char)s[i];
+        if (ch < 0x21 || ch == 0x7f || ch == '+' || ch == '#') return false;
+    }
+    return true;
+}
+
+static esp_err_t mqtt_normalize_and_validate_uri(const char* input, bool tls_enabled, char* out, size_t out_len, const char** error, const char** message){
+    if (error) *error = "invalid_broker_uri";
+    if (message) *message = "URI broker non valido";
+    if (!input || !out || out_len == 0) return ESP_ERR_INVALID_ARG;
+    char uri[128] = {0};
+    strlcpy(uri, input, sizeof(uri));
+    trim_inplace(uri);
+    if (!uri[0]){
+        if (message) *message = "URI broker obbligatorio";
+        return ESP_ERR_INVALID_ARG;
+    }
+    bool has_mqtt = strncasecmp(uri, "mqtt://", 7) == 0;
+    bool has_mqtts = strncasecmp(uri, "mqtts://", 8) == 0;
+    if (has_mqtts && !tls_enabled){
+        if (message) *message = "TLS disabilitato: usa mqtt:// oppure abilita TLS";
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (has_mqtt && tls_enabled){
+        if (message) *message = "TLS abilitato: usa mqtts:// oppure disabilita TLS";
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!has_mqtt && !has_mqtts){
+        snprintf(out, out_len, "%s%s", tls_enabled ? "mqtts://" : "mqtt://", uri);
+    } else {
+        strlcpy(out, uri, out_len);
+    }
+    const char* host = out + (strncasecmp(out, "mqtts://", 8) == 0 ? 8 : 7);
+    if (!host[0] || strchr(host, '/') || strchr(host, ' ') || strchr(host, '\t')){
+        if (message) *message = "URI broker non valido: usa mqtt://host:1883 o mqtts://host:8883";
+        return ESP_ERR_INVALID_ARG;
+    }
+    const char* colon = strrchr(host, ':');
+    if (!colon || colon == host || !colon[1]){
+        size_t used = strlen(out);
+        snprintf(out + used, out_len > used ? out_len - used : 0, ":%u", tls_enabled ? 8883U : 1883U);
+    } else {
+        char* end = NULL;
+        long port = strtol(colon + 1, &end, 10);
+        if (!end || *end != '\0' || port <= 0 || port > 65535){
+            if (message) *message = "Porta broker MQTT non valida";
+            return ESP_ERR_INVALID_ARG;
+        }
+        if ((tls_enabled && port == 1883) || (!tls_enabled && port == 8883)){
+            snprintf((char*)colon + 1, out_len - (size_t)((colon + 1) - out), "%u", tls_enabled ? 8883U : 1883U);
+        }
+    }
+    return ESP_OK;
+}
+
+static void mqtt_config_add_json(cJSON* root, const provisioning_mqtt_config_t* cfg){
+    if (!root || !cfg) return;
+    cJSON_AddBoolToObject(root, "mqtt_enabled", cfg->enabled);
+    cJSON_AddBoolToObject(root, "enabled", cfg->enabled);
+    cJSON_AddBoolToObject(root, "ha_discovery_enabled", cfg->discovery_enabled);
+    cJSON_AddBoolToObject(root, "discovery_enabled", cfg->discovery_enabled);
+    cJSON_AddBoolToObject(root, "tls_enabled", cfg->tls_enabled);
+    cJSON_AddStringToObject(root, "broker_uri", cfg->uri);
+    cJSON_AddStringToObject(root, "uri", cfg->uri);
+    cJSON_AddStringToObject(root, "client_id", cfg->cid);
+    cJSON_AddStringToObject(root, "cid", cfg->cid);
+    cJSON_AddStringToObject(root, "username", cfg->user);
+    cJSON_AddStringToObject(root, "user", cfg->user);
+    cJSON_AddBoolToObject(root, "has_pass", cfg->pass[0] != '\0');
+    cJSON_AddNumberToObject(root, "keepalive", cfg->keepalive);
+    cJSON_AddStringToObject(root, "tenant_id", cfg->tenant_id);
+    cJSON_AddStringToObject(root, "site_id", cfg->site_id);
+    cJSON_AddStringToObject(root, "device_id", cfg->device_id);
+    cJSON_AddStringToObject(root, "base_topic", cfg->base_topic);
+    cJSON_AddStringToObject(root, "discovery_prefix", cfg->discovery_prefix);
+}
+
 static esp_netif_t* provisioning_get_primary_netif(void)
 {
     esp_netif_t* netif = eth_get_netif();
@@ -2135,10 +2248,10 @@ static void provisioning_load_net(provisioning_net_config_t* cfg){
 static void provisioning_load_mqtt(provisioning_mqtt_config_t* cfg){
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
-    cfg->enabled = true;
-    cfg->discovery_enabled = true;
+    cfg->enabled = false;
+    cfg->discovery_enabled = false;
     cfg->tls_enabled = false;
-    strlcpy(cfg->uri, CONFIG_APP_CLOUD_MQTT_URI, sizeof(cfg->uri));
+    strlcpy(cfg->uri, "", sizeof(cfg->uri));
     strlcpy(cfg->tenant_id, "default", sizeof(cfg->tenant_id));
     strlcpy(cfg->site_id, "default", sizeof(cfg->site_id));
     strlcpy(cfg->discovery_prefix, "homeassistant", sizeof(cfg->discovery_prefix));
@@ -2154,7 +2267,7 @@ static void provisioning_load_mqtt(provisioning_mqtt_config_t* cfg){
         if (nvs_get_u8(nvs, "mq_enabled", &b) == ESP_OK) cfg->enabled = b != 0;
         if (nvs_get_u8(nvs, "mq_tls", &b) == ESP_OK) cfg->tls_enabled = b != 0;
         if (nvs_get_u8(nvs, "mq_disc", &b) == ESP_OK) cfg->discovery_enabled = b != 0;
-        nvs_get_str_def(nvs, "mq_uri",  cfg->uri,  sizeof(cfg->uri),  CONFIG_APP_CLOUD_MQTT_URI);
+        nvs_get_str_def(nvs, "mq_uri",  cfg->uri,  sizeof(cfg->uri),  "");
         nvs_get_str_def(nvs, "mq_cid",  cfg->cid,  sizeof(cfg->cid), cfg->cid);
         nvs_get_str_def(nvs, "mq_user", cfg->user, sizeof(cfg->user), cfg->user);
         nvs_get_str_def(nvs, "mq_pass", cfg->pass, sizeof(cfg->pass), "");
@@ -2203,9 +2316,19 @@ static esp_err_t api_admin_system_get(httpd_req_t* req){
 
 static esp_err_t api_admin_mqtt_rediscover_post(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    provisioning_mqtt_config_t cfg; provisioning_load_mqtt(&cfg);
+    if (!cfg.enabled){
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "mqtt_disabled", "MQTT non è abilitato"), ESP_FAIL;
+    }
+    if (!cfg.discovery_enabled){
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "discovery_disabled", "Discovery Home Assistant non è abilitata"), ESP_FAIL;
+    }
+    if (!mqtt_is_connected()){
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "mqtt_not_connected", "MQTT non connesso: impossibile ripubblicare discovery"), ESP_FAIL;
+    }
     esp_err_t err = mqtt_publish_discovery();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mqtt"), ESP_FAIL;
-    return json_reply(req, "{\"ok\":true}");
+    if (err != ESP_OK) return json_mqtt_error_reply(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mqtt_publish_failed", "Ripubblicazione discovery fallita"), ESP_FAIL;
+    return json_reply(req, "{\"ok\":true,\"message\":\"Discovery ripubblicata\"}");
 }
 
 static esp_err_t api_admin_notifications_get(httpd_req_t* req){
@@ -2304,21 +2427,22 @@ static esp_err_t sys_net_post(httpd_req_t* req){
 }
 
 // ---- /api/sys/mqtt GET/POST ----
+static const cJSON* mqtt_json_get_alias(const cJSON* root, const char* a, const char* b){
+    const cJSON* v = cJSON_GetObjectItemCaseSensitive(root, a);
+    if (!v && b) v = cJSON_GetObjectItemCaseSensitive(root, b);
+    return v;
+}
+
 static esp_err_t sys_mqtt_get(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
     provisioning_mqtt_config_t cfg; provisioning_load_mqtt(&cfg);
     cJSON* root = cJSON_CreateObject();
     if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
-    cJSON_AddStringToObject(root, "uri", cfg.uri);
-    cJSON_AddStringToObject(root, "cid", cfg.cid);
-    cJSON_AddStringToObject(root, "user", cfg.user);
-    bool has_pass = cfg.pass[0] != '\0';
-    cJSON_AddStringToObject(root, "pass", has_pass ? "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022" : "");
-    cJSON_AddBoolToObject(root, "has_pass", has_pass);
-    cJSON_AddNumberToObject(root, "keepalive", cfg.keepalive);
-    cJSON_AddStringToObject(root, "device_id", cfg.cid);
-    cJSON_AddStringToObject(root, "default_uri", CONFIG_APP_CLOUD_MQTT_URI);
+    mqtt_config_add_json(root, &cfg);
+    cJSON_AddStringToObject(root, "default_uri", "");
     cJSON_AddNumberToObject(root, "default_keepalive", CONFIG_APP_CLOUD_KEEPALIVE);
+    cJSON_AddBoolToObject(root, "connected", mqtt_is_connected());
+    cJSON_AddStringToObject(root, "connection_status", mqtt_is_connected() ? "connected" : "disconnected");
     return json_reply_cjson(req, root);
 }
 
@@ -2365,50 +2489,137 @@ static esp_err_t sys_mqtt_reveal_post(httpd_req_t* req){
 
 static esp_err_t sys_mqtt_post(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
-    char body[1024]; size_t bl=0;
-    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
+    char body[1536]; size_t bl=0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_body", "Body richiesta non valido"), ESP_FAIL;
     cJSON* j = cJSON_ParseWithLength(body, bl);
-    if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
-    const cJSON* jen =cJSON_GetObjectItemCaseSensitive(j,"enabled");
-    const cJSON* juri=cJSON_GetObjectItemCaseSensitive(j,"uri");
-    const cJSON* jtls=cJSON_GetObjectItemCaseSensitive(j,"tls_enabled");
-    const cJSON* jcid=cJSON_GetObjectItemCaseSensitive(j,"cid");
-    const cJSON* juser=cJSON_GetObjectItemCaseSensitive(j,"user");
-    const cJSON* jpw =cJSON_GetObjectItemCaseSensitive(j,"pass");
-    const cJSON* jka =cJSON_GetObjectItemCaseSensitive(j,"keepalive");
-    const cJSON* jtenant=cJSON_GetObjectItemCaseSensitive(j,"tenant_id");
-    const cJSON* jsite=cJSON_GetObjectItemCaseSensitive(j,"site_id");
-    const cJSON* jdev=cJSON_GetObjectItemCaseSensitive(j,"device_id");
-    const cJSON* jdisc=cJSON_GetObjectItemCaseSensitive(j,"discovery_enabled");
-    const cJSON* jdp=cJSON_GetObjectItemCaseSensitive(j,"discovery_prefix");
-    const char* pass = NULL;
-    if (cJSON_IsString(jpw) && jpw->valuestring) pass = jpw->valuestring;
-    if (pass && !mqtt_password_is_valid(pass)){
-        cJSON_Delete(j);
-        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, MQTT_PASSWORD_POLICY_ERROR), ESP_FAIL;
-    }
-    nvs_handle_t nvs; if (nvs_open("sys", NVS_READWRITE, &nvs)!=ESP_OK){ cJSON_Delete(j); return httpd_resp_send_err(req,500,"nvs"), ESP_FAIL; }
-    if (cJSON_IsBool(jen)) nvs_set_u8(nvs,"mq_enabled", cJSON_IsTrue(jen)?1:0);
-    if (cJSON_IsString(juri)) nvs_set_str(nvs,"mq_uri", juri->valuestring);
-    if (cJSON_IsBool(jtls)) nvs_set_u8(nvs,"mq_tls", cJSON_IsTrue(jtls)?1:0);
-    if (cJSON_IsString(jcid)) nvs_set_str(nvs,"mq_cid", jcid->valuestring);
-    if (cJSON_IsString(juser)) nvs_set_str(nvs,"mq_user", juser->valuestring);
-    if (pass) nvs_set_str(nvs,"mq_pass",pass);
-    if (cJSON_IsNumber(jka)) nvs_set_u32(nvs,"mq_keep",(uint32_t)jka->valuedouble);
-    if (cJSON_IsString(jtenant)) nvs_set_str(nvs,"mq_tenant", jtenant->valuestring);
-    if (cJSON_IsString(jsite)) nvs_set_str(nvs,"mq_site", jsite->valuestring);
-    if (cJSON_IsString(jdev)) nvs_set_str(nvs,"mq_device", jdev->valuestring);
-    if (cJSON_IsBool(jdisc)) nvs_set_u8(nvs,"mq_disc", cJSON_IsTrue(jdisc)?1:0);
-    if (cJSON_IsString(jdp)) nvs_set_str(nvs,"mq_disc_pref", jdp->valuestring);
-    nvs_commit(nvs); nvs_close(nvs); cJSON_Delete(j);
+    if (!j) return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_json", "JSON non valido"), ESP_FAIL;
 
+    provisioning_mqtt_config_t cfg; provisioning_load_mqtt(&cfg);
+    const cJSON* jen = mqtt_json_get_alias(j, "mqtt_enabled", "enabled");
+    const cJSON* juri = mqtt_json_get_alias(j, "broker_uri", "uri");
+    const cJSON* jtls = cJSON_GetObjectItemCaseSensitive(j,"tls_enabled");
+    const cJSON* jcid = mqtt_json_get_alias(j, "client_id", "cid");
+    const cJSON* juser = mqtt_json_get_alias(j, "username", "user");
+    const cJSON* jpw = mqtt_json_get_alias(j, "password", "pass");
+    const cJSON* jclear = cJSON_GetObjectItemCaseSensitive(j, "clear_password");
+    const cJSON* jka = cJSON_GetObjectItemCaseSensitive(j,"keepalive");
+    const cJSON* jtenant = cJSON_GetObjectItemCaseSensitive(j,"tenant_id");
+    const cJSON* jsite = cJSON_GetObjectItemCaseSensitive(j,"site_id");
+    const cJSON* jdev = cJSON_GetObjectItemCaseSensitive(j,"device_id");
+    const cJSON* jdisc = mqtt_json_get_alias(j, "ha_discovery_enabled", "discovery_enabled");
+    const cJSON* jdp = cJSON_GetObjectItemCaseSensitive(j,"discovery_prefix");
+
+    if (jen && !cJSON_IsBool(jen)){ cJSON_Delete(j); return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_mqtt_enabled", "mqtt_enabled deve essere booleano"), ESP_FAIL; }
+    if (jdisc && !cJSON_IsBool(jdisc)){ cJSON_Delete(j); return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_discovery_enabled", "ha_discovery_enabled deve essere booleano"), ESP_FAIL; }
+    if (jtls && !cJSON_IsBool(jtls)){ cJSON_Delete(j); return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_tls_enabled", "tls_enabled deve essere booleano"), ESP_FAIL; }
+    if (jen) cfg.enabled = cJSON_IsTrue(jen);
+    if (jdisc) cfg.discovery_enabled = cJSON_IsTrue(jdisc);
+    if (jtls) cfg.tls_enabled = cJSON_IsTrue(jtls);
+    else if (cJSON_IsString(juri) && juri->valuestring){
+        if (strncasecmp(juri->valuestring, "mqtts://", 8) == 0) cfg.tls_enabled = true;
+        else if (strncasecmp(juri->valuestring, "mqtt://", 7) == 0) cfg.tls_enabled = false;
+    }
+
+    if (cJSON_IsString(juri) && juri->valuestring){
+        const char* err_code = NULL;
+        const char* msg = NULL;
+        if (mqtt_normalize_and_validate_uri(juri->valuestring, cfg.tls_enabled, cfg.uri, sizeof(cfg.uri), &err_code, &msg) != ESP_OK){
+            cJSON_Delete(j);
+            return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, err_code, msg), ESP_FAIL;
+        }
+    } else if (cfg.enabled && !cfg.uri[0]){
+        cJSON_Delete(j);
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_broker_uri", "URI broker obbligatorio quando MQTT è abilitato"), ESP_FAIL;
+    }
+
+    if (cJSON_IsString(jcid) && jcid->valuestring){ strlcpy(cfg.cid, jcid->valuestring, sizeof(cfg.cid)); trim_inplace(cfg.cid); }
+    if (cJSON_IsString(juser) && juser->valuestring){ strlcpy(cfg.user, juser->valuestring, sizeof(cfg.user)); trim_inplace(cfg.user); }
+    if (cJSON_IsString(jtenant) && jtenant->valuestring){ strlcpy(cfg.tenant_id, jtenant->valuestring, sizeof(cfg.tenant_id)); trim_inplace(cfg.tenant_id); }
+    if (cJSON_IsString(jsite) && jsite->valuestring){ strlcpy(cfg.site_id, jsite->valuestring, sizeof(cfg.site_id)); trim_inplace(cfg.site_id); }
+    if (cJSON_IsString(jdev) && jdev->valuestring){ strlcpy(cfg.device_id, jdev->valuestring, sizeof(cfg.device_id)); trim_inplace(cfg.device_id); }
+    if (cJSON_IsString(jdp) && jdp->valuestring){ strlcpy(cfg.discovery_prefix, jdp->valuestring, sizeof(cfg.discovery_prefix)); trim_inplace(cfg.discovery_prefix); }
+
+    if (!cfg.cid[0]) strlcpy(cfg.cid, cfg.device_id, sizeof(cfg.cid));
+    if (!cfg.device_id[0]) strlcpy(cfg.device_id, cfg.cid, sizeof(cfg.device_id));
+    if (!cfg.tenant_id[0]) strlcpy(cfg.tenant_id, "default", sizeof(cfg.tenant_id));
+    if (!cfg.site_id[0]) strlcpy(cfg.site_id, "default", sizeof(cfg.site_id));
+    if (!cfg.discovery_prefix[0]) strlcpy(cfg.discovery_prefix, "homeassistant", sizeof(cfg.discovery_prefix));
+
+    if (cJSON_IsNumber(jka)) cfg.keepalive = (uint32_t)jka->valuedouble;
+    else if (cJSON_IsString(jka) && jka->valuestring) cfg.keepalive = (uint32_t)strtoul(jka->valuestring, NULL, 10);
+    if (cfg.keepalive < 10 || cfg.keepalive > 600){
+        cJSON_Delete(j);
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_keepalive", "Keepalive MQTT deve essere tra 10 e 600 secondi"), ESP_FAIL;
+    }
+    if (!mqtt_string_field_is_valid(cfg.cid, sizeof(cfg.cid), false)){
+        cJSON_Delete(j);
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_client_id", "Client ID MQTT non valido"), ESP_FAIL;
+    }
+    if (!mqtt_string_field_is_valid(cfg.tenant_id, sizeof(cfg.tenant_id), false) ||
+        !mqtt_string_field_is_valid(cfg.site_id, sizeof(cfg.site_id), false) ||
+        !mqtt_string_field_is_valid(cfg.device_id, sizeof(cfg.device_id), false)){
+        cJSON_Delete(j);
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_topic_identity", "tenant_id, site_id e device_id non validi"), ESP_FAIL;
+    }
+    if (!mqtt_topic_field_is_valid(cfg.discovery_prefix, sizeof(cfg.discovery_prefix), false)){
+        cJSON_Delete(j);
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_discovery_prefix", "Discovery prefix non valido"), ESP_FAIL;
+    }
+
+    bool clear_password = cJSON_IsBool(jclear) && cJSON_IsTrue(jclear);
+    bool update_password = false;
+    char new_pass[sizeof(cfg.pass)] = {0};
+    if (cJSON_IsString(jpw) && jpw->valuestring && jpw->valuestring[0] != '\0'){
+        strlcpy(new_pass, jpw->valuestring, sizeof(new_pass));
+        update_password = true;
+        if (!mqtt_password_is_valid(new_pass)){
+            cJSON_Delete(j);
+            return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_password", MQTT_PASSWORD_POLICY_ERROR), ESP_FAIL;
+        }
+    }
+
+    snprintf(cfg.base_topic, sizeof(cfg.base_topic), "tenants/%s/sites/%s/devices/%s", cfg.tenant_id, cfg.site_id, cfg.device_id);
+    cJSON_Delete(j);
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open("sys", NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return json_mqtt_error_reply(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs_open_failed", "Impossibile aprire NVS"), ESP_FAIL;
+    if (err == ESP_OK) err = nvs_set_u8(nvs,"mq_enabled", cfg.enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(nvs,"mq_tls", cfg.tls_enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u8(nvs,"mq_disc", cfg.discovery_enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_str(nvs,"mq_uri", cfg.uri);
+    if (err == ESP_OK) err = nvs_set_str(nvs,"mq_cid", cfg.cid);
+    if (err == ESP_OK) err = nvs_set_str(nvs,"mq_user", cfg.user);
+    if (err == ESP_OK) err = nvs_set_u32(nvs,"mq_keep", cfg.keepalive);
+    if (err == ESP_OK) err = nvs_set_str(nvs,"mq_tenant", cfg.tenant_id);
+    if (err == ESP_OK) err = nvs_set_str(nvs,"mq_site", cfg.site_id);
+    if (err == ESP_OK) err = nvs_set_str(nvs,"mq_device", cfg.device_id);
+    if (err == ESP_OK) err = nvs_set_str(nvs,"mq_base", cfg.base_topic);
+    if (err == ESP_OK) err = nvs_set_str(nvs,"mq_disc_pref", cfg.discovery_prefix);
+    if (err == ESP_OK && clear_password) {
+        esp_err_t erase_err = nvs_erase_key(nvs, "mq_pass");
+        if (erase_err != ESP_OK && erase_err != ESP_ERR_NVS_NOT_FOUND) err = erase_err;
+    }
+    if (err == ESP_OK && update_password) err = nvs_set_str(nvs,"mq_pass", new_pass);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err != ESP_OK) return json_mqtt_error_reply(req, HTTPD_500_INTERNAL_SERVER_ERROR, "nvs_save_failed", "Salvataggio configurazione MQTT fallito"), ESP_FAIL;
+
+    provisioning_load_mqtt(&cfg);
     esp_err_t reload_err = mqtt_reload_config();
     if (reload_err != ESP_OK) {
         ESP_LOGE(TAG, "Riavvio MQTT fallito dopo aggiornamento configurazione: %s", esp_err_to_name(reload_err));
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "mqtt"), ESP_FAIL;
     }
 
-    return json_reply(req, "{\"ok\":true}");
+    cJSON* resp = cJSON_CreateObject();
+    if (!resp) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddStringToObject(resp, "message", reload_err == ESP_OK ? "Configurazione MQTT salvata" : "Configurazione MQTT salvata; riavvio client MQTT fallito");
+    cJSON* c = cJSON_AddObjectToObject(resp, "config");
+    if (!c) { cJSON_Delete(resp); return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL; }
+    mqtt_config_add_json(c, &cfg);
+    cJSON_AddBoolToObject(c, "connected", mqtt_is_connected());
+    return json_reply_cjson(req, resp);
 }
 
 #define MQTT_TEST_TIMEOUT_MS   5000
@@ -2497,19 +2708,27 @@ static esp_err_t sys_mqtt_test_post(httpd_req_t* req)
     const cJSON* juser = cJSON_GetObjectItemCaseSensitive(j, "user");
     const cJSON* jpass = cJSON_GetObjectItemCaseSensitive(j, "pass");
     const cJSON* jka   = cJSON_GetObjectItemCaseSensitive(j, "keepalive");
+    const cJSON* jtls  = cJSON_GetObjectItemCaseSensitive(j, "tls_enabled");
 
     char uri[128] = {0};
     char cid[80] = {0};
     char user[80] = {0};
     char pass[96] = {0};
 
+    bool tls_enabled = cJSON_IsBool(jtls) ? cJSON_IsTrue(jtls) :
+                       (cJSON_IsString(juri) && juri->valuestring && strncasecmp(juri->valuestring, "mqtts://", 8) == 0);
     if (cJSON_IsString(juri) && juri->valuestring){
-        strlcpy(uri, juri->valuestring, sizeof(uri));
+        const char* err_code = NULL;
+        const char* msg = NULL;
+        if (mqtt_normalize_and_validate_uri(juri->valuestring, tls_enabled, uri, sizeof(uri), &err_code, &msg) != ESP_OK){
+            cJSON_Delete(j);
+            return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, err_code, msg), ESP_FAIL;
+        }
     }
     trim_inplace(uri);
     if (!uri[0]){
         cJSON_Delete(j);
-        return httpd_resp_send_err(req,400,"uri"), ESP_FAIL;
+        return json_mqtt_error_reply(req, HTTPD_400_BAD_REQUEST, "invalid_broker_uri", "URI broker obbligatorio"), ESP_FAIL;
     }
     if (cJSON_IsString(jcid) && jcid->valuestring){
         strlcpy(cid, jcid->valuestring, sizeof(cid));
@@ -2564,17 +2783,19 @@ static esp_err_t sys_mqtt_test_post(httpd_req_t* req)
     cfg.credentials.username = user[0] ? user : NULL;
     cfg.credentials.authentication.password = pass[0] ? pass : NULL;
 
-    if (ca_len == 0) {
-        vEventGroupDelete(events);
-        cJSON* root = cJSON_CreateObject();
-        if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
-        cJSON_AddBoolToObject(root, "success", false);
-        cJSON_AddStringToObject(root, "error", "Certificato CA MQTT mancante nel firmware");
-        return json_reply_cjson(req, root);
+    bool test_tls_uri = (strncasecmp(uri, "mqtts://", 8) == 0) || (strncasecmp(uri, "wss://", 6) == 0);
+    if (test_tls_uri) {
+        if (ca_len == 0) {
+            vEventGroupDelete(events);
+            cJSON* root = cJSON_CreateObject();
+            if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+            cJSON_AddBoolToObject(root, "success", false);
+            cJSON_AddStringToObject(root, "error", "Certificato CA MQTT mancante nel firmware");
+            return json_reply_cjson(req, root);
+        }
+        cfg.broker.verification.certificate = (const char *)certs_broker_ca_pem_start;
+        cfg.broker.verification.certificate_len = ca_len;
     }
-
-    cfg.broker.verification.certificate = (const char *)certs_broker_ca_pem_start;
-    cfg.broker.verification.certificate_len = ca_len;
 
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&cfg);
     if (!client){

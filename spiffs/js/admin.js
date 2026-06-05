@@ -72,7 +72,21 @@
       __skipAuthRedirect: opts.skipAuthRedirect === true
     });
     if (r.status === 401) { needLogin(); throw new Error("401"); }
-    if (!r.ok) throw new Error(await r.text());
+    if (!r.ok) {
+      let detail = "";
+      try {
+        const ct = r.headers.get("content-type") || "";
+        if (ct.includes("application/json")){
+          const data = await r.json();
+          detail = data?.message || data?.error || JSON.stringify(data);
+        } else {
+          detail = await r.text();
+        }
+      } catch (err) {
+        detail = err?.message || `${r.status} ${r.statusText}`;
+      }
+      throw new Error(detail || `${r.status} ${r.statusText}`);
+    }
     try { return await r.json(); } catch { return {}; }
   }
 
@@ -2318,19 +2332,42 @@
     });
   }
 
+  function normalizeMqttUriForTls(uri, tlsEnabled){
+    let value = (uri || "").trim();
+    if (!value) return value;
+    const targetScheme = tlsEnabled ? "mqtts://" : "mqtt://";
+    value = value.replace(/^mqtts?:\/\//i, targetScheme);
+    try {
+      const parsed = new URL(value);
+      const defaultPort = tlsEnabled ? "8883" : "1883";
+      if (!parsed.port || parsed.port === (tlsEnabled ? "1883" : "8883")) parsed.port = defaultPort;
+      return parsed.toString().replace(/\/$/, "");
+    } catch {
+      const withoutScheme = value.replace(/^mqtts?:\/\//i, "");
+      const hasPort = /:\d+$/.test(withoutScheme);
+      return targetScheme + withoutScheme + (hasPort ? "" : (tlsEnabled ? ":8883" : ":1883"));
+    }
+  }
+
+  function syncMqttTlsUri(){
+    const tls = (($("#mq_tls")?.value || "0") === "1");
+    const uriEl = $("#mq_uri");
+    if (uriEl && uriEl.value.trim()) uriEl.value = normalizeMqttUriForTls(uriEl.value, tls);
+  }
+
   async function loadMqtt(){
     try{
       const c = await apiGet("/api/sys/mqtt");
-      $("#mq_enabled") && ($("#mq_enabled").value = c.enabled ? "1" : "0");
-      $("#mq_uri")  && ($("#mq_uri").value  = c.uri  || "");
+      $("#mq_enabled") && ($("#mq_enabled").value = (c.mqtt_enabled ?? c.enabled) ? "1" : "0");
+      $("#mq_uri")  && ($("#mq_uri").value  = c.broker_uri || c.uri  || "");
       $("#mq_tls") && ($("#mq_tls").value = c.tls_enabled ? "1" : "0");
-      $("#mq_cid")  && ($("#mq_cid").value  = c.cid  || "");
-      $("#mq_user") && ($("#mq_user").value = c.user || "");
+      $("#mq_cid")  && ($("#mq_cid").value  = c.client_id || c.cid  || "");
+      $("#mq_user") && ($("#mq_user").value = c.username || c.user || "");
       $("#mq_tenant") && ($("#mq_tenant").value = c.tenant_id || "default");
       $("#mq_site") && ($("#mq_site").value = c.site_id || "default");
       $("#mq_device") && ($("#mq_device").value = c.device_id || "");
       $("#mq_base") && ($("#mq_base").value = c.base_topic || "");
-      $("#mq_discovery") && ($("#mq_discovery").value = c.discovery_enabled ? "1" : "0");
+      $("#mq_discovery") && ($("#mq_discovery").value = (c.ha_discovery_enabled ?? c.discovery_enabled) ? "1" : "0");
       $("#mq_disc_prefix") && ($("#mq_disc_prefix").value = c.discovery_prefix || "homeassistant");
       $("#mq_status") && ($("#mq_status").value = c.connected ? "connesso" : "disconnesso");
       const hasSecret = (typeof c.has_pass === "boolean") ? c.has_pass : (typeof c.pass === "string" && c.pass.length > 0);
@@ -2338,21 +2375,39 @@
       $("#mq_keep") && ($("#mq_keep").value = (c.keepalive ?? 60));
     }catch(e){ toast("Errore caricando MQTT: " + e.message, false); }
     ensureMqttRevealButton();
-    $("#btnMqttRediscover")?.addEventListener("click", async () => { try{ await apiPost("/api/admin/mqtt/rediscover", {}); toast("Discovery ripubblicata"); } catch(e){ toast("Discovery MQTT: " + e.message, false); } });
+    const tlsSelect = $("#mq_tls");
+    if (tlsSelect && !tlsSelect._mqttTlsBound){
+      tlsSelect.addEventListener("change", syncMqttTlsUri);
+      tlsSelect._mqttTlsBound = true;
+    }
+    const rediscoverBtn = $("#btnMqttRediscover");
+    if (rediscoverBtn && !rediscoverBtn._mqttBound){
+      rediscoverBtn.addEventListener("click", async () => {
+        try{
+          await apiPost("/api/admin/mqtt/rediscover", {});
+          toast("Discovery ripubblicata");
+        } catch(e){
+          toast("Discovery MQTT: " + e.message, false);
+        }
+      });
+      rediscoverBtn._mqttBound = true;
+    }
     const saveBtn = $("#btnMqttSave");
     if (saveBtn && !saveBtn._mqttBound){
       saveBtn.addEventListener("click", async ()=>{
+        syncMqttTlsUri();
+        const tlsEnabled = ($("#mq_tls")?.value || "0") === "1";
         const body = {
-          enabled: ($("#mq_enabled")?.value || "1") === "1",
-          uri:  $("#mq_uri")?.value  || "",
-          tls_enabled: ($("#mq_tls")?.value || "0") === "1",
-          cid:  $("#mq_cid")?.value  || "",
-          user: $("#mq_user")?.value || "",
+          mqtt_enabled: ($("#mq_enabled")?.value || "1") === "1",
+          broker_uri: normalizeMqttUriForTls($("#mq_uri")?.value || "", tlsEnabled),
+          tls_enabled: tlsEnabled,
+          client_id:  $("#mq_cid")?.value  || "",
+          username: $("#mq_user")?.value || "",
           keepalive: parseInt($("#mq_keep")?.value || "60", 10) || 60,
           tenant_id: $("#mq_tenant")?.value || "default",
           site_id: $("#mq_site")?.value || "default",
           device_id: $("#mq_device")?.value || "",
-          discovery_enabled: ($("#mq_discovery")?.value || "1") === "1",
+          ha_discovery_enabled: ($("#mq_discovery")?.value || "1") === "1",
           discovery_prefix: $("#mq_disc_prefix")?.value || "homeassistant",
         };
         const passField = getMqttPassField();
@@ -2361,12 +2416,14 @@
           body.pass = passField?.value ?? "";
         }
         try{
-          await apiPost("/api/sys/mqtt", body);
+          const resp = await apiPost("/api/sys/mqtt", body);
+          if (resp && resp.ok === false) throw new Error(resp.message || resp.error || "Salvataggio MQTT fallito");
           if (passField){
             if (passEdited){ passField.dataset.hasSecret = body.pass ? "1" : "0"; }
             initMqttPasswordField(passField.dataset.hasSecret === "1");
           }
-          toast("MQTT salvato");
+          await loadMqtt();
+          toast(resp?.message || "MQTT salvato");
         }
         catch(e){ toast("Errore salvataggio MQTT: " + e.message, false); }
       });
