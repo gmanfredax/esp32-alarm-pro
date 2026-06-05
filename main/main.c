@@ -1378,6 +1378,61 @@ static void nvs_init_safe(void)
 
 static input_debounce_state_t s_can_input_filters[ALARM_MAX_ZONES];
 
+static notification_severity_t alarm_tamper_severity(void)
+{
+    alarm_state_t st = alarm_get_state();
+    if (st == ALARM_ARMED_HOME || st == ALARM_ARMED_AWAY ||
+        st == ALARM_ARMED_NIGHT || st == ALARM_ARMED_CUSTOM || st == ALARM_ALARM) {
+        return NOTIFY_SEVERITY_ALARM;
+    }
+    return NOTIFY_SEVERITY_TECHNICAL;
+}
+
+static void emit_zone_transition_events(const zone_mask_t *current, const zone_mask_t *previous, uint16_t zones_total)
+{
+    if (!current || !previous) return;
+    for (uint16_t i = 0; i < zones_total && i < ALARM_MAX_ZONES; ++i) {
+        bool now = zone_mask_test(current, i);
+        bool was = zone_mask_test(previous, i);
+        if (now == was) continue;
+        char title[40];
+        char message[96];
+        snprintf(title, sizeof(title), now ? "Zona %u aperta" : "Zona %u chiusa", (unsigned)(i + 1u));
+        snprintf(message, sizeof(message), now ? "Zona %u in allarme/aperta" : "Zona %u ripristinata", (unsigned)(i + 1u));
+        notification_events_emit_simple(now ? "zone_alarm_open" : "zone_alarm_closed",
+                                        now ? NOTIFY_SEVERITY_WARNING : NOTIFY_SEVERITY_INFO,
+                                        "zone", (int)(i + 1u), title, message, false);
+    }
+}
+
+static void emit_zone_tamper_transition_events(const zone_mask_t *current, const zone_mask_t *previous, uint16_t zones_total)
+{
+    if (!current || !previous) return;
+    for (uint16_t i = 0; i < zones_total && i < ALARM_MAX_ZONES; ++i) {
+        bool now = zone_mask_test(current, i);
+        bool was = zone_mask_test(previous, i);
+        if (now == was) continue;
+        char title[48];
+        char message[104];
+        snprintf(title, sizeof(title), now ? "Tamper zona %u" : "Tamper zona %u chiuso", (unsigned)(i + 1u));
+        snprintf(message, sizeof(message), now ? "Zona %u in tamper EOL/2EOL/3EOL" : "Tamper zona %u ripristinato", (unsigned)(i + 1u));
+        notification_events_emit_simple(now ? "zone_tamper_open" : "zone_tamper_closed",
+                                        now ? alarm_tamper_severity() : NOTIFY_SEVERITY_INFO,
+                                        "zone", (int)(i + 1u), title, message, false);
+    }
+}
+
+static void emit_global_tamper_transition_event(bool current, bool previous)
+{
+    if (current == previous) return;
+    notification_events_emit_simple(current ? "global_tamper_open" : "global_tamper_closed",
+                                    current ? alarm_tamper_severity() : NOTIFY_SEVERITY_INFO,
+                                    "system", -1,
+                                    current ? "Tamper generale aperto" : "Tamper generale chiuso",
+                                    current ? "Linea antimanomissione interrotta" : "Linea antimanomissione ripristinata",
+                                    current);
+}
+
 static void compose_zone_mask_core(uint16_t master_gpio, uint16_t zones_total, zone_mask_t *out_mask, bool *tamper_out)
 {
     if (!out_mask) {
@@ -1566,15 +1621,34 @@ static void system_main_task(void *arg)
     uint16_t last_zones_total = roster_effective_zones(inputs_master_zone_capacity());
     zone_mask_t last_mask;
     zone_mask_clear(&last_mask);
+    zone_mask_t last_zone_tamper_mask;
+    zone_mask_clear(&last_zone_tamper_mask);
+    bool last_global_tamper = false;
+    bool tamper_state_known = false;
     bool first_cycle = true;
     uint32_t last_filter_counter = inputs_filter_change_counter();
     if (inputs_read_all(&initial_gpio) == ESP_OK) {
         uint16_t zones_total = roster_effective_zones(inputs_master_zone_capacity());
         ESP_ERROR_CHECK(inputs_baseline_init(initial_gpio, zones_total));
         zone_mask_t init_mask;
-        compose_zone_mask(initial_gpio, zones_total, &init_mask, NULL);
+        bool init_global_tamper = false;
+        compose_zone_mask(initial_gpio, zones_total, &init_mask, &init_global_tamper);
         mqtt_publish_zones(&init_mask);
         zone_mask_copy(&last_mask, &init_mask);
+#if ADS1115_COUNT > 0
+        input_tamper_snapshot_t init_tamper_snapshot;
+        zone_mask_clear(&init_tamper_snapshot.zone_mask);
+        init_tamper_snapshot.global_tamper = init_global_tamper;
+        if (inputs_collect_tamper_snapshot(initial_gpio, pdMS_TO_TICKS(75), &init_tamper_snapshot) == ESP_OK) {
+            zone_mask_copy(&last_zone_tamper_mask, &init_tamper_snapshot.zone_mask);
+            last_global_tamper = init_tamper_snapshot.global_tamper;
+        } else
+#endif
+        {
+            zone_mask_clear(&last_zone_tamper_mask);
+            last_global_tamper = init_global_tamper;
+        }
+        tamper_state_known = true;
         last_zones_total = zones_total;
         first_cycle = false;
     }
@@ -1612,12 +1686,28 @@ static void system_main_task(void *arg)
 
         uint16_t zones_total = roster_effective_zones(inputs_master_zone_capacity());
         zone_mask_t zmask;
-        bool tamper = false;
-        compose_zone_mask(ab, zones_total, &zmask, &tamper);
+        bool global_tamper = false;
+        compose_zone_mask(ab, zones_total, &zmask, &global_tamper);
+
+        zone_mask_t zone_tamper_mask;
+        zone_mask_clear(&zone_tamper_mask);
+#if ADS1115_COUNT > 0
+        input_tamper_snapshot_t tamper_snapshot;
+        zone_mask_clear(&tamper_snapshot.zone_mask);
+        tamper_snapshot.global_tamper = global_tamper;
+        if (inputs_collect_tamper_snapshot(ab, pdMS_TO_TICKS(75), &tamper_snapshot) == ESP_OK) {
+            global_tamper = tamper_snapshot.global_tamper;
+            zone_mask_copy(&zone_tamper_mask, &tamper_snapshot.zone_mask);
+            zone_mask_limit(&zone_tamper_mask, zones_total);
+        }
+#endif
 
         uint32_t filter_counter = inputs_filter_change_counter();
         if (first_cycle || !zone_mask_equal(&zmask, &last_mask) ||
             zones_total != last_zones_total || filter_counter != last_filter_counter) {
+            if (!first_cycle && zones_total == last_zones_total) {
+                emit_zone_transition_events(&zmask, &last_mask, zones_total);
+            }
             mqtt_publish_zones(&zmask);
             zone_mask_copy(&last_mask, &zmask);
             last_zones_total = zones_total;
@@ -1625,7 +1715,20 @@ static void system_main_task(void *arg)
             first_cycle = false;
         }
 
-        alarm_tick(&zmask, tamper);
+        if (tamper_state_known) {
+            bool tamper_changed = (global_tamper != last_global_tamper) ||
+                                  !zone_mask_equal(&zone_tamper_mask, &last_zone_tamper_mask);
+            emit_global_tamper_transition_event(global_tamper, last_global_tamper);
+            emit_zone_tamper_transition_events(&zone_tamper_mask, &last_zone_tamper_mask, zones_total);
+            if (tamper_changed) {
+                mqtt_publish_state();
+            }
+        }
+        last_global_tamper = global_tamper;
+        zone_mask_copy(&last_zone_tamper_mask, &zone_tamper_mask);
+        tamper_state_known = true;
+
+        alarm_tick_ex(&zmask, global_tamper, &zone_tamper_mask);
 
         vTaskDelay(pdMS_TO_TICKS(100));
 

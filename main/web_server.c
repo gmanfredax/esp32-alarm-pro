@@ -4800,7 +4800,13 @@ static esp_err_t status_get(httpd_req_t* req){
 
     bool tamper = tamper_global || zone_mask_any(&tamper_mask);
     cJSON_AddBoolToObject(root, "tamper", tamper);
+    cJSON_AddBoolToObject(root, "system_tamper", tamper);
     cJSON_AddBoolToObject(root, "tamper_global", tamper_global);
+    cJSON_AddBoolToObject(root, "global_tamper", tamper_global);
+    cJSON_AddStringToObject(root, "alarm_cause", alarm_last_alarm_cause());
+    if (tamper_global) {
+        cJSON_AddStringToObject(root, "tamper_message", "Tamper generale aperto: serie antimanomissione interrotta");
+    }
     cJSON_AddNumberToObject(root, "tamper_zone_mask", (double)zone_mask_to_u32(&tamper_mask));
     cJSON_AddBoolToObject(root, "tamper_alarm", tamper_alarm);
     cJSON *tamper_sources = cJSON_CreateArray();
@@ -5562,6 +5568,7 @@ static esp_err_t zones_get(httpd_req_t* req){
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
         cJSON_AddBoolToObject(it, "analog", entry->analog);
         cJSON_AddBoolToObject(it, "tamper", entry->known ? entry->tamper : false);
+        cJSON_AddBoolToObject(it, "fault", entry->known ? false : true);
         input_zone_filtered_state_t diag = {0};
         if (inputs_get_filtered_zone_state((uint16_t)idx, &diag)) {
             cJSON_AddBoolToObject(it, "debouncing", diag.debouncing);
@@ -5578,17 +5585,20 @@ static esp_err_t zones_get(httpd_req_t* req){
             cJSON_AddBoolToObject(it, "analog_device_present", entry->analog_device_present);
             cJSON_AddBoolToObject(it, "analog_sample_valid", entry->analog_sample_valid);
             cJSON_AddNumberToObject(it, "analog_mode", (double)entry->analog_mode);
+            cJSON_AddBoolToObject(it, "supports_tamper", entry->analog_mode >= INPUT_ANALOG_EOL_2);
             cJSON_AddBoolToObject(it, "tamper_capable", entry->analog_mode >= INPUT_ANALOG_EOL_2);
             if (entry->known) {
                 cJSON_AddNumberToObject(it, "analog_value", entry->analog_value);
             }
         } else {
+            cJSON_AddBoolToObject(it, "supports_tamper", false);
             cJSON_AddBoolToObject(it, "tamper_capable", false);
         }
 #else
         if (entry->analog && entry->known) {
             cJSON_AddNumberToObject(it, "analog_value", entry->analog_value);
         }
+        cJSON_AddBoolToObject(it, "supports_tamper", false);
         cJSON_AddBoolToObject(it, "tamper_capable", false);
 #endif
         char board_label[sizeof(((roster_node_t *)0)->label)];
@@ -5838,6 +5848,8 @@ static esp_err_t zones_config_get(httpd_req_t* req){
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
         cJSON_AddBoolToObject(it, "board_online", entry->board_online);
         cJSON_AddBoolToObject(it, "analog", entry->analog);
+        cJSON_AddBoolToObject(it, "supports_tamper", entry->analog && entry->analog_mode >= INPUT_ANALOG_EOL_2);
+        cJSON_AddBoolToObject(it, "is_global_tamper_input", false);
 #if ADS1115_COUNT > 0
         if (entry->analog && entry->known) {
             cJSON_AddNumberToObject(it, "analog_value", entry->analog_value);

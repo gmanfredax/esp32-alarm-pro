@@ -70,6 +70,7 @@ void           alarm_begin_exit(uint32_t duration_ms);   // imposta exit-window 
 
 // Tick di valutazione (chiamalo ciclicamente; zmask: bit0→Z1,...; tamper: true se attivo)
 void           alarm_tick(const zone_mask_t *zmask, bool tamper);
+void           alarm_tick_ex(const zone_mask_t *zone_alarm_mask, bool global_tamper, const zone_mask_t *zone_tamper_mask);
 
 // Comandi
 void           alarm_arm_home(void);
@@ -85,6 +86,7 @@ void           alarm_set_led_maint(bool on);
 
 // Info diagnostica
 bool           alarm_last_alarm_was_tamper(void);
+const char*    alarm_last_alarm_cause(void);
 const char*    alarm_state_name(alarm_state_t st);
 
 #ifdef __cplusplus

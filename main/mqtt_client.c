@@ -71,6 +71,7 @@ static char                     s_topic_cmd_sub[MQTT_TOPIC_MAX_LEN];
 static char                     s_base_topic[MQTT_BASE_TOPIC_MAX_LEN];
 static char                     s_topic_alarm_state[MQTT_TOPIC_MAX_LEN];
 static char                     s_topic_alarm_attr[MQTT_TOPIC_MAX_LEN];
+static char                     s_topic_tamper_state[MQTT_TOPIC_MAX_LEN];
 static char                     s_topic_alarm_cmd[MQTT_TOPIC_MAX_LEN];
 static char                     s_topic_events[MQTT_TOPIC_MAX_LEN];
 static char                     s_topic_events_critical[MQTT_TOPIC_MAX_LEN];
@@ -130,6 +131,7 @@ static void build_topics(void)
     snprintf(s_topic_scenes, sizeof(s_topic_scenes), "%s/scenes", s_base_topic);
     snprintf(s_topic_alarm_state, sizeof(s_topic_alarm_state), "%s/alarm/state", s_base_topic);
     snprintf(s_topic_alarm_attr, sizeof(s_topic_alarm_attr), "%s/alarm/attributes", s_base_topic);
+    snprintf(s_topic_tamper_state, sizeof(s_topic_tamper_state), "%s/tamper/state", s_base_topic);
     snprintf(s_topic_alarm_cmd, sizeof(s_topic_alarm_cmd), "%s/alarm/command", s_base_topic);
     snprintf(s_topic_events, sizeof(s_topic_events), "%s/events", s_base_topic);
     snprintf(s_topic_events_critical, sizeof(s_topic_events_critical), "%s/events/critical", s_base_topic);
@@ -285,15 +287,20 @@ esp_err_t mqtt_publish_state(void)
     uint16_t gpioab = 0;
     inputs_read_all(&gpioab);
     input_debounce_state_t tamper_state = {0};
-    bool tamper = inputs_get_filtered_tamper(&tamper_state) ? tamper_state.stable_value : false;
+    bool global_tamper = inputs_get_filtered_tamper(&tamper_state) ? tamper_state.stable_value : false;
+    zone_mask_t zone_tamper_mask;
+    zone_mask_clear(&zone_tamper_mask);
 #if ADS1115_COUNT > 0
     input_tamper_snapshot_t tamper_snapshot;
     zone_mask_clear(&tamper_snapshot.zone_mask);
-    tamper_snapshot.global_tamper = tamper;
+    tamper_snapshot.global_tamper = global_tamper;
     if (inputs_collect_tamper_snapshot(gpioab, pdMS_TO_TICKS(75), &tamper_snapshot) == ESP_OK) {
-        tamper = tamper_snapshot.global_tamper || zone_mask_any(&tamper_snapshot.zone_mask);
+        global_tamper = tamper_snapshot.global_tamper;
+        zone_mask_copy(&zone_tamper_mask, &tamper_snapshot.zone_mask);
     }
 #endif
+    bool zone_tamper = zone_mask_any(&zone_tamper_mask);
+    bool system_tamper = global_tamper || zone_tamper;
     bool tamper_alarm = (alarm_last_alarm_was_tamper() && st == ALARM_ALARM);
 
     cJSON *root = cJSON_CreateObject();
@@ -309,13 +316,12 @@ esp_err_t mqtt_publish_state(void)
     cJSON_AddNumberToObject(root, "outputs_mask", (double)outputs_mask);
     cJSON_AddStringToObject(root, "bypass_mask", bypass_hex);
     cJSON_AddNumberToObject(root, "bypass_mask_legacy", (double)zone_mask_to_u32(&bypass_mask));
-    cJSON_AddItemToObject(root, "tamper", cJSON_CreateBool(tamper));
+    cJSON_AddItemToObject(root, "tamper", cJSON_CreateBool(system_tamper));
+    cJSON_AddItemToObject(root, "system_tamper", cJSON_CreateBool(system_tamper));
+    cJSON_AddItemToObject(root, "global_tamper", cJSON_CreateBool(global_tamper));
     cJSON_AddItemToObject(root, "tamper_alarm", cJSON_CreateBool(tamper_alarm));
-#if ADS1115_COUNT > 0
-    cJSON_AddNumberToObject(root, "tamper_zone_mask", (double)zone_mask_to_u32(&tamper_snapshot.zone_mask));
-#else
-    cJSON_AddNumberToObject(root, "tamper_zone_mask", 0.0);
-#endif
+    cJSON_AddStringToObject(root, "alarm_cause", alarm_last_alarm_cause());
+    cJSON_AddNumberToObject(root, "tamper_zone_mask", (double)zone_mask_to_u32(&zone_tamper_mask));
     cJSON_AddNumberToObject(root, "exit_pending_ms", (double)exit_ms);
     cJSON_AddNumberToObject(root, "entry_pending_ms", (double)entry_ms);
     cJSON_AddNumberToObject(root, "entry_zone", (double)entry_zone);
@@ -338,6 +344,7 @@ esp_err_t mqtt_publish_state(void)
     else if (st == ALARM_ARMED_CUSTOM) ha_state = "armed_custom";
     else if (st == ALARM_ALARM) ha_state = "triggered";
     publish_raw(s_topic_alarm_state, ha_state, CONFIG_APP_CLOUD_QOS_STATE, true);
+    publish_raw(s_topic_tamper_state, global_tamper ? "ON" : "OFF", CONFIG_APP_CLOUD_QOS_STATE, true);
     return err;
 }
 
@@ -546,6 +553,22 @@ esp_err_t mqtt_publish_discovery(void)
     if (!payload) return ESP_ERR_NO_MEM;
     esp_err_t err = publish_raw(topic, payload, 1, true);
     cJSON_free(payload);
+
+    snprintf(topic, sizeof(topic), "%s/binary_sensor/%s/global_tamper/config", s_discovery_prefix, s_device_id);
+    root = cJSON_CreateObject();
+    if (root) {
+        cJSON_AddStringToObject(root, "name", "Tamper generale");
+        char uid[96]; snprintf(uid, sizeof(uid), "%s_global_tamper", s_device_id);
+        cJSON_AddStringToObject(root, "unique_id", uid);
+        cJSON_AddStringToObject(root, "state_topic", s_topic_tamper_state);
+        cJSON_AddStringToObject(root, "payload_on", "ON");
+        cJSON_AddStringToObject(root, "payload_off", "OFF");
+        cJSON_AddStringToObject(root, "device_class", "tamper");
+        cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
+        dev = cJSON_AddObjectToObject(root, "device"); ids = cJSON_AddArrayToObject(dev, "identifiers"); cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
+        payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
+        if (payload) { publish_raw(topic, payload, 1, true); cJSON_free(payload); }
+    }
 
     uint16_t total = roster_effective_zones(inputs_master_zone_capacity());
     if (total > SCENES_MAX_ZONES) total = SCENES_MAX_ZONES;

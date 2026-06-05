@@ -20,6 +20,7 @@ static profile_t     profiles[7];
 // True se l'ultimo passaggio allo stato ALARM è stato causato dal tamper
 static bool          s_alarm_from_tamper = false;
 static bool          s_tamper_latched   = false;
+static char          s_last_alarm_cause[32] = "none";
 
 // Bypass dinamico valido per la singola sessione ARM (auto-exclude)
 static zone_mask_t   s_bypass_mask;
@@ -156,6 +157,7 @@ void alarm_init(void)
     s_entry_zone = -1;
     s_alarm_from_tamper = false;
     s_tamper_latched = false;
+    strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     zone_mask_clear(&s_exit_guard_mask);
     zone_mask_clear(&s_entry_zmask);
     memset(s_zone_opts, 0, sizeof(s_zone_opts));
@@ -183,6 +185,11 @@ void alarm_init(void)
 bool alarm_last_alarm_was_tamper(void)
 {
     return s_alarm_from_tamper;
+}
+
+const char* alarm_last_alarm_cause(void)
+{
+    return s_last_alarm_cause;
 }
 
 alarm_state_t alarm_get_state(void){ return s_state; }
@@ -264,6 +271,7 @@ void alarm_arm_home(void)
 {
     s_state = ALARM_ARMED_HOME;
     s_alarm_from_tamper = false;
+    strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_HOME");
     mqtt_publish_state();
@@ -273,6 +281,7 @@ void alarm_arm_away(void)
 {
     s_state = ALARM_ARMED_AWAY;
     s_alarm_from_tamper = false;
+    strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_AWAY");
     mqtt_publish_state();
@@ -282,6 +291,7 @@ void alarm_arm_night(void)
 {
     s_state = ALARM_ARMED_NIGHT;
     s_alarm_from_tamper = false;
+    strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_NIGHT");
     mqtt_publish_state();
@@ -291,6 +301,7 @@ void alarm_arm_custom(void)
 {
     s_state = ALARM_ARMED_CUSTOM;
     s_alarm_from_tamper = false;
+    strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_CUSTOM");
     mqtt_publish_state();
@@ -311,6 +322,7 @@ void alarm_disarm(void)
     s_entry_zone = -1;
     s_alarm_from_tamper = false;
     s_tamper_latched = false;
+    strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     zone_mask_clear(&s_exit_guard_mask);
     zone_mask_clear(&s_entry_zmask);
 
@@ -332,11 +344,27 @@ void alarm_set_led_maint(bool on)  { outputs_led_maint(on); }
 // ─────────────────────────────────────────────────────────────────────────────
 void alarm_tick(const zone_mask_t *zmask, bool tamper)
 {
+    alarm_tick_ex(zmask, tamper, NULL);
+}
+
+void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask_t *zone_tamper_mask)
+{
     if (!zmask) {
         return;
     }
-    // Tamper ha priorità (eccetto manutenzione)
-    if (tamper) {
+
+    zone_mask_t limited_zone_tamper;
+    zone_mask_clear(&limited_zone_tamper);
+    if (zone_tamper_mask) {
+        zone_mask_copy(&limited_zone_tamper, zone_tamper_mask);
+        zone_mask_limit(&limited_zone_tamper, ALARM_MAX_ZONES);
+    }
+    const bool zone_tamper = zone_mask_any(&limited_zone_tamper);
+    const bool any_tamper = global_tamper || zone_tamper;
+
+    // Tamper ha priorità (eccetto manutenzione), ma mantiene cause separate:
+    // linea AS generale != tamper zona EOL/2EOL/3EOL.
+    if (any_tamper) {
         if (!s_tamper_latched) {
             const char *prev_label = alarm_state_name(s_state);
             audit_tamper_alarm_event(prev_label);
@@ -346,9 +374,11 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
             if (s_state != ALARM_ALARM) {
                 s_state = ALARM_ALARM;
                 s_alarm_from_tamper = true;
+                strlcpy(s_last_alarm_cause, global_tamper ? "global_tamper" : "zone_tamper", sizeof(s_last_alarm_cause));
                 outputs_siren(true);
-                ESP_LOGW(TAG, "TAMPER -> ALARM");
+                strlcpy(s_last_alarm_cause, global_tamper ? "global_tamper" : "zone_tamper", sizeof(s_last_alarm_cause));
                 mqtt_publish_state();
+                audit_alarm_trigger_event(s_last_alarm_cause, zone_tamper ? &limited_zone_tamper : NULL, -1);
             }
         }
         return;
@@ -379,6 +409,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
                 if (s_state != ALARM_ALARM) {
                     s_state = ALARM_ALARM;
                     s_alarm_from_tamper = false;
+                    strlcpy(s_last_alarm_cause, "zone_alarm", sizeof(s_last_alarm_cause));
                     outputs_siren(true);
                     ESP_LOGW(TAG, "EXIT timeout (ritardo unico) con zona ancora aperta -> ALARM");
                     mqtt_publish_state();
@@ -406,6 +437,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
                 if (s_state != ALARM_ALARM) {
                     s_state = ALARM_ALARM;
                     s_alarm_from_tamper = false;
+                    strlcpy(s_last_alarm_cause, "zone_alarm", sizeof(s_last_alarm_cause));
                     outputs_siren(true);
                     ESP_LOGW(TAG, "ENTRY timeout -> ALARM (Z%d)", s_entry_zone >= 0 ? (s_entry_zone + 1) : -1);
                     mqtt_publish_state();
@@ -456,6 +488,7 @@ void alarm_tick(const zone_mask_t *zmask, bool tamper)
             if (s_state != ALARM_ALARM) {
                 s_state = ALARM_ALARM;
                 s_alarm_from_tamper = false;
+                strlcpy(s_last_alarm_cause, "zone_alarm", sizeof(s_last_alarm_cause));
                 outputs_siren(true);
                 ESP_LOGW(TAG, "ZONE instant -> ALARM");
                 mqtt_publish_state();

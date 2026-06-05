@@ -1310,8 +1310,6 @@ esp_err_t inputs_compose_debounced_mask(uint16_t gpioab, uint16_t zones_total, z
         input_analog_filter_state_t* filter = &s_analog_filters[idx];
         if (filter->stable_state == ANALOG_CANDIDATE_ALARM) {
             zone_mask_set(out_mask, zone_index);
-        } else if (filter->stable_state == ANALOG_CANDIDATE_TAMPER) {
-            tamper_detected = true;
         }
     }
 #endif

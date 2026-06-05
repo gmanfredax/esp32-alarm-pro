@@ -227,7 +227,12 @@ async function refreshStatus(){
     if (!wrap) return;
     const zonesActive = Array.isArray(data?.zones_active) ? data.zones_active.filter(Boolean).length : (data?.zones_active || 0);
     const zonesCount = data?.zones_count || (Array.isArray(data?.zones_active) ? data.zones_active.length : zonesActive);
-    const tamper = data?.tamper ? '<span class="tag">TAMPER</span>' : '<span class="tag ok">OK</span>';
+    const tamperLabel = data?.tamper_global || data?.global_tamper
+      ? 'Tamper generale aperto'
+      : (data?.tamper ? 'Tamper zona' : 'OK');
+    const tamper = data?.tamper
+      ? `<span class="tag">${escapeHtml(tamperLabel)}</span>`
+      : '<span class="tag ok">OK</span>';
     wrap.innerHTML = [
       kpiCard({ title: 'Stato', valueHTML: '<span id="kpi-state-val"></span>' }),
       kpiCard({ title: 'Tamper', valueHTML: tamper }),
