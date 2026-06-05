@@ -122,10 +122,10 @@
         <aside class="side">
           <h4>Sezioni</h4>
           <ul>
-            <li><button class="btn w-100 active" data-view="view-users">Utenti</button></li>
-            <li><button class="btn w-100" data-view="view-general">Generale</button></li>
+            <li><button class="btn w-100 active" data-view="view-system">Info di Sistema</button></li>
+            <li><button class="btn w-100" data-view="view-general">Generali</button></li>
+            <li><button class="btn w-100" data-view="view-users">Utenti</button></li>
             <li><button class="btn w-100" data-view="view-network">Rete</button></li>
-            <li><button class="btn w-100" data-view="view-system">Sistema</button></li>
             <li><button class="btn w-100" data-view="view-mqtt">MQTT / Home Assistant</button></li>
             <li><button class="btn w-100" data-view="view-notifications">Notifiche</button></li>
             <li><button class="btn w-100" data-view="view-websec">Sicurezza web</button></li>
@@ -135,25 +135,21 @@
         </aside>
 
         <section>
-          <!-- UTENTI -->
-          <section id="view-users" class="view active">
+
+          <!-- INFO DI SISTEMA -->
+          <section id="view-system" class="view active">
             <div class="card">
-              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem">
-                <h3>Utenti</h3>
-                <button class="btn" id="btnNewUser">+ Nuovo utente</button>
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap">
+                <h3>Informazioni di Sistema</h3>
+                <button class="btn" id="btnSystemReload" type="button">Aggiorna</button>
               </div>
-              <div class="table-wrap" style="margin-top:.5rem">
-                <table class="table">
-                  <thead>
-                    <tr><th>Username</th><th>Nome</th><th>Cognome</th><th>PIN</th><th>RFID</th><th>TOTP</th><th>Azioni</th></tr>
-                  </thead>
-                  <tbody id="usersTbody"><tr><td colspan="7">Caricamento…</td></tr></tbody>
-                </table>
-              </div>
+              <p class="muted">Dati tecnici firmware, runtime, scheda, rete, storage e periferiche. Nessun segreto viene esposto.</p>
+              <div id="systemInfoStatus" class="status-line muted">Caricamento…</div>
+              <div id="systemInfoGrid" class="info-grid"></div>
             </div>
           </section>
-
-          <!-- GENERALE -->
+          
+          <!-- GENERALI -->
           <section id="view-general" class="view">
             <div class="card">
               <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap;">
@@ -204,6 +200,24 @@
             </div>
           </section>
 
+          <!-- UTENTI -->
+          <section id="view-users" class="view">
+            <div class="card">
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem">
+                <h3>Utenti</h3>
+                <button class="btn" id="btnNewUser">+ Nuovo utente</button>
+              </div>
+              <div class="table-wrap" style="margin-top:.5rem">
+                <table class="table">
+                  <thead>
+                    <tr><th>Username</th><th>Nome</th><th>Cognome</th><th>PIN</th><th>RFID</th><th>TOTP</th><th>Azioni</th></tr>
+                  </thead>
+                  <tbody id="usersTbody"><tr><td colspan="7">Caricamento…</td></tr></tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+
           <!-- RETE -->
           <section id="view-network" class="view">
             <div class="card">
@@ -229,20 +243,7 @@
             </div>
           </section>
 
-
-          <!-- SISTEMA -->
-          <section id="view-system" class="view">
-            <div class="card">
-              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap">
-                <h3>Informazioni sistema</h3>
-                <button class="btn" id="btnSystemReload" type="button">Aggiorna</button>
-              </div>
-              <p class="muted">Dati tecnici firmware, runtime, scheda, rete, storage e periferiche. Nessun segreto viene esposto.</p>
-              <div id="systemInfoStatus" class="status-line muted">Caricamento…</div>
-              <div id="systemInfoGrid" class="info-grid"></div>
-            </div>
-          </section>
-          <!-- MQTT -->
+          <!-- MQTT / HOME ASSISTANT / EMQX -->
           <section id="view-mqtt" class="view">
             <div class="card">
               <h3>MQTT / Home Assistant / EMQX</h3>
@@ -278,7 +279,6 @@
             </div>
           </section>
 
-
           <!-- NOTIFICHE -->
           <section id="view-notifications" class="view">
             <div class="card">
@@ -299,6 +299,7 @@
               </form>
             </div>
           </section>
+
           <!-- SICUREZZA WEB -->
           <section id="view-websec" class="view">
             <div class="card">
@@ -322,6 +323,7 @@
               <div id="websecFeedback" class="muted" style="margin-top:.4rem;font-size:.85rem"></div>
             </div>
           </section>
+          
           <!-- ESPANSIONI CAN -->
           <section id="view-expansions" class="view">
             <div class="card">

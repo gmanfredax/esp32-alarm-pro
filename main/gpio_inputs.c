@@ -566,7 +566,7 @@ esp_err_t inputs_ads1115_get_summary(input_ads1115_summary_t* out_summary)
     ESP_RETURN_ON_FALSE(out_summary != NULL, ESP_ERR_INVALID_ARG, TAG, "ads summary null");
     memset(out_summary, 0, sizeof(*out_summary));
     out_summary->last_scan_ms = s_ads_last_scan_ms;
-    strlcpy(out_summary->bus_status, "configured", sizeof(out_summary->bus_status));
+    strlcpy(out_summary->bus_status, s_ads_module_count > 0 ? "configured" : "not_configured", sizeof(out_summary->bus_status));
     strlcpy(out_summary->last_error, s_ads_last_error, sizeof(out_summary->last_error));
     for (size_t i = 0; i < s_ads_module_count; ++i) {
         input_ads1115_module_t* mod = &s_ads_modules[i];
@@ -780,7 +780,22 @@ static bool analog_cfg_is_valid(const input_analog_zone_config_t* cfg)
 
 size_t inputs_analog_zone_count(void)
 {
-    return INPUT_ANALOG_ZONES_COUNT;
+    size_t zones = 0;
+    for (size_t i = 0; i < s_ads_module_count; ++i) {
+        if (!s_ads_modules[i].configured) {
+            continue;
+        }
+        size_t remaining = INPUT_ANALOG_ZONES_COUNT - zones;
+        size_t add = ADS1115_CHANNEL_COUNT;
+        if (add > remaining) {
+            add = remaining;
+        }
+        zones += add;
+        if (zones >= INPUT_ANALOG_ZONES_COUNT) {
+            break;
+        }
+    }
+    return zones;
 }
 
 void inputs_analog_load_defaults(void)
@@ -1025,7 +1040,7 @@ esp_err_t inputs_analog_supply_state(TickType_t timeout, input_supply_state_t* o
 uint16_t inputs_master_zone_capacity(void)
 {
 #if ADS1115_COUNT > 0
-    return (uint16_t)(INPUT_ZONES_COUNT + (ADS1115_COUNT * ADS1115_CHANNEL_COUNT));
+    return (uint16_t)(INPUT_ZONES_COUNT + inputs_analog_zone_count());
 #else
     return INPUT_ZONES_COUNT;
 #endif

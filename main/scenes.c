@@ -82,12 +82,15 @@ void scenes_mask_all(uint16_t zones_count, zone_mask_t *out_mask)
     zone_mask_fill(out_mask, zones_count);
 }
 
-static void ensure_default(zone_mask_t *mask)
+static bool ensure_default(zone_mask_t *mask)
 {
     if (!mask) {
-        return;
+        return false;
     }
+    zone_mask_t before;
+    zone_mask_copy(&before, mask);
     zone_mask_limit(mask, s_zones);
+    return !zone_mask_equal(&before, mask);
 }
 
 esp_err_t scenes_init(int zones_count)
@@ -107,9 +110,16 @@ esp_err_t scenes_init(int zones_count)
     if (nvs_get_mask(KEY_NIGHT, &s_night) != ESP_OK) { s_night  = def; nvs_set_mask(KEY_NIGHT,  &s_night); }
     if (nvs_get_mask(KEY_CUSTOM,&s_custom)!= ESP_OK) { s_custom = def; nvs_set_mask(KEY_CUSTOM, &s_custom); }
 
-    ensure_default(&s_home);
-    ensure_default(&s_night);
-    ensure_default(&s_custom);
+    bool cleaned = false;
+    cleaned |= ensure_default(&s_home);
+    cleaned |= ensure_default(&s_night);
+    cleaned |= ensure_default(&s_custom);
+    if (cleaned) {
+        ESP_LOGW(TAG, "cleanup riferimenti scenario orfani: limite zone valide=%u", (unsigned)s_zones);
+        nvs_set_mask(KEY_HOME, &s_home);
+        nvs_set_mask(KEY_NIGHT, &s_night);
+        nvs_set_mask(KEY_CUSTOM, &s_custom);
+    }
 
     s_active = def;
 

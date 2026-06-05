@@ -1047,7 +1047,9 @@
       const message = `Zone analogiche: ${analogCount}. ADS1115 rilevati ${detected}/${expected}.`;
       setAnalogStatus(message, variant);
     } else if (analogEolState.payload && analogEolState.payload.enabled === false) {
-      setAnalogStatus('Zone analogiche disabilitate.', null);
+      const msg = analogEolState.payload.message || 'Nessun modulo ADS1115 configurato';
+      const analogMsg = analogEolState.payload.analog_message || 'Nessuna zona analogica attiva';
+      setAnalogStatus(`${msg}. ${analogMsg}. ADS1115 rilevati 0/0.`, null);
     } else {
       setAnalogStatus('', null);
     }
@@ -1101,7 +1103,10 @@
 
     const showTable = enabled && zones.length > 0;
     if (tableWrap) tableWrap.classList.toggle('hidden', !showTable);
-    if (emptyEl) emptyEl.classList.toggle('hidden', showTable || analogEolState.error || analogEolState.loading);
+    if (emptyEl) {
+      emptyEl.textContent = analogEolState.payload?.analog_message || analogEolState.payload?.message || 'Nessuna zona analogica attiva.';
+      emptyEl.classList.toggle('hidden', showTable || analogEolState.error || analogEolState.loading);
+    }
 
     if (!showTable) {
       if (tbody) tbody.innerHTML = '';
@@ -2196,15 +2201,39 @@
 
 
   function formatValue(v){
-    if (v === null || v === undefined) return "—";
+    if (v === null || v === undefined || v === "") return "—";
     if (typeof v === "boolean") return v ? "sì" : "no";
-    if (typeof v === "object") return JSON.stringify(v);
+    if (typeof v === "number") return Number.isInteger(v) ? String(v) : String(Math.round(v * 100) / 100);
     return String(v);
   }
 
+  function formatInfoKey(key){
+    return String(key || '').replaceAll('_', ' ');
+  }
+
+  function renderInfoRows(obj, prefix = ''){
+    return Object.entries(obj || {}).map(([k, v]) => {
+      const label = prefix ? `${prefix} ${formatInfoKey(k)}` : formatInfoKey(k);
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        return renderInfoRows(v, label);
+      }
+      if (Array.isArray(v)) {
+        const text = v.length ? v.map(formatValue).join(', ') : '—';
+        return `<div class="info-row"><span>${escapeHtml(label)}</span><strong><code>${escapeHtml(text)}</code></strong></div>`;
+      }
+      return `<div class="info-row"><span>${escapeHtml(label)}</span><strong><code>${escapeHtml(formatValue(v))}</code></strong></div>`;
+    }).join("");
+  }
+
   function renderInfoObject(title, obj){
-    const rows = Object.entries(obj || {}).map(([k,v]) => `<div class="info-row"><span>${escapeHtml(k)}</span><strong><code>${escapeHtml(formatValue(v))}</code></strong></div>`).join("");
-    return `<div class="info-card"><h4>${escapeHtml(title)}</h4>${rows || '<p class="muted">N/D</p>'}</div>`;
+    let rows = renderInfoRows(obj || {});
+    if (title === 'peripherals' && obj?.ads1115?.configured === 0) {
+      rows += '<p class="muted">Nessun modulo ADS1115 configurato</p>';
+    }
+    if (title === 'diagnostics' && (!obj || obj.active === false)) {
+      rows = `<p class="muted">${escapeHtml(obj?.message || 'Nessuna diagnostica attiva')}</p>`;
+    }
+    return `<div class="info-card"><h4>${escapeHtml(title)}</h4>${rows || '<p class="muted">Nessuna diagnostica attiva</p>'}</div>`;
   }
 
   async function loadSystemInfo(){

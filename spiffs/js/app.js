@@ -1156,11 +1156,14 @@ async function openZonesConfig({ boardId = null } = {}){
   }
 }
 
-function renderSceneCard(name, mask, totalZones){
+function renderSceneCard(name, maskOrIds, totalZones){
   const checks = [];
+  const selectedIds = new Set(Array.isArray(maskOrIds) ? maskOrIds.map((id) => Number(id)) : []);
+  const numericMask = Number(maskOrIds) || 0;
   for (let i = 1; i <= totalZones; i += 1) {
-    const bit = 1 << (i - 1);
-    const checked = (mask & bit) !== 0 ? 'checked' : '';
+    const checkedByIds = selectedIds.has(i);
+    const checkedByMask = !selectedIds.size && i <= 31 && ((numericMask & (1 << (i - 1))) !== 0);
+    const checked = checkedByIds || checkedByMask ? 'checked' : '';
     checks.push(`<label class="chk"><input type="checkbox" data-scene="${name}" data-zone="${i}" ${checked}>Z${i}</label>`);
   }
   return `
@@ -1182,9 +1185,9 @@ async function refreshScenes(){
       return;
     }
     root.innerHTML = [
-      renderSceneCard('home', data?.home ?? 0, total),
-      renderSceneCard('night', data?.night ?? 0, total),
-      renderSceneCard('custom', data?.custom ?? 0, total)
+      renderSceneCard('home', data?.home_ids || data?.home || 0, total),
+      renderSceneCard('night', data?.night_ids || data?.night || 0, total),
+      renderSceneCard('custom', data?.custom_ids || data?.custom || 0, total)
     ].join('');
     root.querySelectorAll('button[data-save]').forEach((btn) => {
       btn.addEventListener('click', async () => {

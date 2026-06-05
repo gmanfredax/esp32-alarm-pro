@@ -95,6 +95,22 @@ uint32_t system_info_get_boot_count(void) { return s_boot_count; }
 const char *system_info_get_installed_at(void) { return s_installed_at; }
 const char *system_info_get_build_datetime(void) { return s_build_dt; }
 
+
+static void format_uptime(uint64_t uptime_s, char *out, size_t len)
+{
+    if (!out || len == 0) {
+        return;
+    }
+    uint64_t days = uptime_s / 86400ULL;
+    uint64_t rem = uptime_s % 86400ULL;
+    uint64_t hours = rem / 3600ULL;
+    rem %= 3600ULL;
+    uint64_t minutes = rem / 60ULL;
+    uint64_t seconds = rem % 60ULL;
+    snprintf(out, len, "%" PRIu64 "g %02" PRIu64 ":%02" PRIu64 ":%02" PRIu64,
+             days, hours, minutes, seconds);
+}
+
 static const char *reset_reason_name(esp_reset_reason_t r)
 {
     switch (r) {
@@ -135,7 +151,7 @@ esp_err_t system_info_append_json(cJSON *root)
 {
     if (!root) return ESP_ERR_INVALID_ARG;
     cJSON *fw = cJSON_AddObjectToObject(root, "firmware");
-    cJSON_AddStringToObject(fw, "project", "ESP32 Alarm Pro");
+    cJSON_AddStringToObject(fw, "project", "NS Alarm Pro");
     cJSON_AddStringToObject(fw, "version", FW_VERSION);
     cJSON_AddStringToObject(fw, "git_commit", GIT_COMMIT);
     cJSON_AddStringToObject(fw, "git_branch", GIT_BRANCH);
@@ -160,12 +176,17 @@ esp_err_t system_info_append_json(cJSON *root)
     cJSON_AddNumberToObject(hw, "cores", chip.cores);
     cJSON_AddNumberToObject(hw, "cpu_mhz", CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ);
     cJSON_AddNumberToObject(hw, "flash_size", flash_size);
+    cJSON_AddNumberToObject(hw, "flash_size_mb", flash_size / (1024.0 * 1024.0));
     cJSON_AddNumberToObject(hw, "free_heap", esp_get_free_heap_size());
     cJSON_AddNumberToObject(hw, "min_free_heap", esp_get_minimum_free_heap_size());
     cJSON_AddBoolToObject(hw, "psram", heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0);
 
     cJSON *rt = cJSON_AddObjectToObject(root, "runtime");
-    cJSON_AddNumberToObject(rt, "uptime_s", esp_timer_get_time() / 1000000ULL);
+    uint64_t uptime_s = esp_timer_get_time() / 1000000ULL;
+    char uptime_text[32];
+    format_uptime(uptime_s, uptime_text, sizeof(uptime_text));
+    cJSON_AddNumberToObject(rt, "uptime_s", uptime_s);
+    cJSON_AddStringToObject(rt, "uptime", uptime_text);
     cJSON_AddStringToObject(rt, "reset_reason", reset_reason_name(esp_reset_reason()));
     cJSON_AddNumberToObject(rt, "boot_count", s_boot_count);
     cJSON_AddStringToObject(rt, "alarm_state", alarm_state_name(alarm_get_state()));
@@ -200,6 +221,8 @@ esp_err_t system_info_append_json(cJSON *root)
 #else
     cJSON_AddStringToObject(p, "ads1115", "not_configured");
 #endif
-    cJSON_AddObjectToObject(root, "diagnostics");
+    cJSON *diag = cJSON_AddObjectToObject(root, "diagnostics");
+    cJSON_AddBoolToObject(diag, "active", false);
+    cJSON_AddStringToObject(diag, "message", "Nessuna diagnostica attiva");
     return ESP_OK;
 }

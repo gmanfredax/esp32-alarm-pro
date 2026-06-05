@@ -1407,15 +1407,15 @@ static void compose_zone_mask_core(uint16_t master_gpio, uint16_t zones_total, z
     }
 
     uint16_t analog_slots = 0;
+#if ADS1115_COUNT > 0
     if (zones_total > INPUT_ZONES_COUNT) {
         uint16_t available = (uint16_t)(zones_total - INPUT_ZONES_COUNT);
-        analog_slots = INPUT_ANALOG_ZONES_COUNT;
+        analog_slots = (uint16_t)inputs_analog_zone_count();
         if (analog_slots > available) {
             analog_slots = available;
         }
     }
 
-#if ADS1115_COUNT > 0
     for (uint16_t idx = 0; idx < analog_slots; ++idx) {
         input_analog_zone_state_t state;
         esp_err_t eval_err = inputs_analog_evaluate(idx, pdMS_TO_TICKS(75), &state);
@@ -1536,7 +1536,7 @@ static void system_main_task(void *arg)
 // [debug disattivato] loop dump link rimosso per build pulita
 
     ESP_ERROR_CHECK(inputs_init());
-    ESP_ERROR_CHECK(scenes_init(ALARM_MAX_ZONES));
+    ESP_ERROR_CHECK(scenes_init(inputs_master_zone_capacity()));
     ESP_ERROR_CHECK(outputs_init());
     ESP_ERROR_CHECK(pn532_init());
     ESP_ERROR_CHECK(ds18b20_init());

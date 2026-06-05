@@ -1,5 +1,5 @@
 # Colleziona tutti i .c nella cartella main (comodo se aggiungi file spesso)
-#file(GLOB MAIN_SRCS "system_info.c" "notification_events.c" "i2c_bus.c" "ads1115.c" "gpio_inputs.c" "main.c" "mqtt_client.c" "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
+#file(GLOB MAIN_SRCS "scenes.c" "system_info.c" "notification_events.c" "i2c_bus.c" "ads1115.c" "gpio_inputs.c" "main.c" "mqtt_client.c" "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
 file(GLOB MAIN_SRCS "*.c")
 
 #set(MAIN_EMBED_TXTFILES
@@ -13,27 +13,32 @@ set(MAIN_EMBED_TXTFILES)
 set(FW_VERSION "0.1.0" CACHE STRING "Firmware version")
 string(TIMESTAMP BUILD_DATE "%Y-%m-%d" UTC)
 string(TIMESTAMP BUILD_TIME "%H:%M:%S UTC" UTC)
-execute_process(COMMAND git rev-parse --short=12 HEAD
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
-execute_process(COMMAND git rev-parse --abbrev-ref HEAD
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_BRANCH
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET)
-execute_process(COMMAND git diff --quiet
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    RESULT_VARIABLE GIT_DIFF_RESULT
-    ERROR_QUIET)
+find_package(Git QUIET)
+if(GIT_FOUND)
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --short=12 HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    execute_process(COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_BRANCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+    execute_process(COMMAND ${GIT_EXECUTABLE} diff --quiet
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        RESULT_VARIABLE GIT_DIFF_RESULT
+        ERROR_QUIET)
+endif()
 if(NOT GIT_COMMIT)
     set(GIT_COMMIT "unknown")
 endif()
 if(NOT GIT_BRANCH)
     set(GIT_BRANCH "unknown")
 endif()
-if(GIT_DIFF_RESULT EQUAL 0)
+if(NOT GIT_FOUND OR NOT DEFINED GIT_DIFF_RESULT)
+    set(GIT_DIRTY "unknown")
+elseif(GIT_DIFF_RESULT EQUAL 0)
     set(GIT_DIRTY "false")
 else()
     set(GIT_DIRTY "true")
@@ -84,7 +89,15 @@ idf_component_register(
         ${MAIN_EMBED_TXTFILES}
 )
 
-target_compile_definitions(${COMPONENT_LIB} PRIVATE CAN_TEST_BROADCAST=1)
+target_compile_definitions(${COMPONENT_LIB} PRIVATE
+    CAN_TEST_BROADCAST=1
+    FW_VERSION="${FW_VERSION}"
+    BUILD_DATE="${BUILD_DATE}"
+    BUILD_TIME="${BUILD_TIME}"
+    GIT_COMMIT="${GIT_COMMIT}"
+    GIT_BRANCH="${GIT_BRANCH}"
+    GIT_DIRTY="${GIT_DIRTY}"
+)
 
 # Genera l’immagine SPIFFS dalla cartella spiffs/
 spiffs_create_partition_image(spiffs ${CMAKE_SOURCE_DIR}/spiffs FLASH_IN_PROJECT)

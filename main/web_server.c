@@ -3609,7 +3609,7 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
 #if ADS1115_COUNT > 0
     size_t ads_expected = inputs_ads1115_expected_devices();
     size_t ads_detected = inputs_ads1115_count();
-    uint16_t analog_slots = INPUT_ANALOG_ZONES_COUNT;
+    uint16_t analog_slots = (uint16_t)inputs_analog_zone_count();
     if (snap->total + analog_slots > ZONE_CONFIG_CAPACITY) {
         if (snap->total < ZONE_CONFIG_CAPACITY) {
             analog_slots = (uint16_t)(ZONE_CONFIG_CAPACITY - snap->total);
@@ -5253,15 +5253,19 @@ static esp_err_t api_admin_analog_eol_get(httpd_req_t* req)
     size_t expected = inputs_ads1115_expected_devices();
     size_t detected = inputs_ads1115_count();
 
-    cJSON_AddBoolToObject(root, "enabled", analog_count > 0);
+    cJSON_AddBoolToObject(root, "enabled", analog_count > 0 && expected > 0);
     cJSON_AddNumberToObject(root, "expected_devices", (double)expected);
     cJSON_AddNumberToObject(root, "detected_devices", (double)detected);
     cJSON_AddNumberToObject(root, "zones_offset", (double)INPUT_ZONES_COUNT);
-    cJSON_AddNumberToObject(root, "analog_count", (double)analog_count);
+    cJSON_AddNumberToObject(root, "analog_count", (double)((expected > 0) ? analog_count : 0));
+    if (expected == 0) {
+        cJSON_AddStringToObject(root, "message", "Nessun modulo ADS1115 configurato");
+        cJSON_AddStringToObject(root, "analog_message", "Nessuna zona analogica attiva");
+    }
 
     input_analog_zone_config_t cfg = {0};
     bool have_cfg = false;
-    if (analog_count > 0) {
+    if (analog_count > 0 && expected > 0) {
         esp_err_t cfg_err = inputs_analog_get_zone_config(0, &cfg);
         if (cfg_err == ESP_OK) {
             have_cfg = true;
@@ -5295,6 +5299,10 @@ static esp_err_t api_admin_analog_eol_get(httpd_req_t* req)
         return ESP_ERR_NO_MEM;
     }
     cJSON_AddItemToObject(root, "zones", zones);
+
+    if (expected == 0) {
+        analog_count = 0;
+    }
 
     for (size_t idx = 0; idx < analog_count; ++idx) {
         cJSON *item = cJSON_CreateObject();
@@ -5589,6 +5597,34 @@ static esp_err_t zones_get(httpd_req_t* req){
     return e;
 }
 
+static void zones_valid_mask(zone_mask_t *out_mask, uint16_t zone_limit)
+{
+    if (!out_mask) {
+        return;
+    }
+    zone_mask_fill(out_mask, zone_limit);
+}
+
+static bool scenes_filter_mask_to_valid(zone_mask_t *mask, uint16_t zone_limit, const char *label)
+{
+    static bool warned_once = false;
+    if (!mask) {
+        return false;
+    }
+    zone_mask_t before;
+    zone_mask_copy(&before, mask);
+    zone_mask_t valid;
+    zones_valid_mask(&valid, zone_limit);
+    zone_mask_and(mask, mask, &valid);
+    zone_mask_limit(mask, zone_limit);
+    bool changed = !zone_mask_equal(&before, mask);
+    if (changed && label && !warned_once) {
+        ESP_LOGW(TAG, "Scenario %s: rimossi riferimenti a zone non valide/orfane (limite=%u)", label, (unsigned)zone_limit);
+        warned_once = true;
+    }
+    return changed;
+}
+
 static esp_err_t scenes_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
     zone_mask_t h, n, c, a;
@@ -5610,10 +5646,10 @@ static esp_err_t scenes_get(httpd_req_t* req){
         return ESP_ERR_NO_MEM;
     }
 
-    zone_mask_limit(&h, (uint16_t)zones_total);
-    zone_mask_limit(&n, (uint16_t)zones_total);
-    zone_mask_limit(&c, (uint16_t)zones_total);
-    zone_mask_limit(&a, (uint16_t)zones_total);
+    scenes_filter_mask_to_valid(&h, (uint16_t)zones_total, "home");
+    scenes_filter_mask_to_valid(&n, (uint16_t)zones_total, "night");
+    scenes_filter_mask_to_valid(&c, (uint16_t)zones_total, "custom");
+    scenes_filter_mask_to_valid(&a, (uint16_t)zones_total, "active");
 
     char home_hex[ZONE_MASK_WORDS * 8u + 1u];
     char night_hex[ZONE_MASK_WORDS * 8u + 1u];
@@ -5738,7 +5774,7 @@ static esp_err_t scenes_post(httpd_req_t* req){
     }
     cJSON_Delete(json);
 
-    zone_mask_limit(&mask, (uint16_t)zones_total);
+    scenes_filter_mask_to_valid(&mask, (uint16_t)zones_total, jscene->valuestring);
 
     if (scenes_set_mask(s, &mask)!=ESP_OK){
         httpd_resp_send_err(req, 500, "nvs");
