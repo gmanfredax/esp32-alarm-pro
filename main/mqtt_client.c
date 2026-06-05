@@ -307,9 +307,22 @@ esp_err_t mqtt_publish_state(void)
     if (!root) return ESP_ERR_NO_MEM;
 
     uint16_t zones_total = roster_effective_zones(inputs_master_zone_capacity());
+    zone_mask_t violated_zone_mask;
+    zone_mask_t armed_zone_mask;
+    zone_mask_clear(&violated_zone_mask);
+    zone_mask_clear(&armed_zone_mask);
+    alarm_get_violated_zone_mask(&violated_zone_mask);
+    alarm_get_armed_zone_mask(&armed_zone_mask);
     zone_mask_limit(&bypass_mask, zones_total);
+    zone_mask_limit(&zone_tamper_mask, zones_total);
+    zone_mask_limit(&violated_zone_mask, zones_total);
+    zone_mask_limit(&armed_zone_mask, zones_total);
     char bypass_hex[ZONE_MASK_WORDS * 8u + 1u];
+    char violated_hex[ZONE_MASK_WORDS * 8u + 1u];
+    char armed_hex[ZONE_MASK_WORDS * 8u + 1u];
     zone_mask_to_hex(&bypass_mask, zones_total, bypass_hex, sizeof(bypass_hex));
+    zone_mask_to_hex(&violated_zone_mask, zones_total, violated_hex, sizeof(violated_hex));
+    zone_mask_to_hex(&armed_zone_mask, zones_total, armed_hex, sizeof(armed_hex));
 
     cJSON_AddStringToObject(root, "state", state_name);
     cJSON_AddNumberToObject(root, "zones_count", (double)zones_total);
@@ -321,6 +334,10 @@ esp_err_t mqtt_publish_state(void)
     cJSON_AddItemToObject(root, "global_tamper", cJSON_CreateBool(global_tamper));
     cJSON_AddItemToObject(root, "tamper_alarm", cJSON_CreateBool(tamper_alarm));
     cJSON_AddStringToObject(root, "alarm_cause", alarm_last_alarm_cause());
+    cJSON_AddStringToObject(root, "violated_zone_mask", violated_hex);
+    cJSON_AddNumberToObject(root, "violated_zone_mask_legacy", (double)zone_mask_to_u32(&violated_zone_mask));
+    cJSON_AddStringToObject(root, "armed_zone_mask", armed_hex);
+    cJSON_AddNumberToObject(root, "armed_zone_mask_legacy", (double)zone_mask_to_u32(&armed_zone_mask));
     cJSON_AddNumberToObject(root, "tamper_zone_mask", (double)zone_mask_to_u32(&zone_tamper_mask));
     cJSON_AddNumberToObject(root, "exit_pending_ms", (double)exit_ms);
     cJSON_AddNumberToObject(root, "entry_pending_ms", (double)entry_ms);

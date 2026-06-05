@@ -21,6 +21,9 @@ static profile_t     profiles[7];
 static bool          s_alarm_from_tamper = false;
 static bool          s_tamper_latched   = false;
 static char          s_last_alarm_cause[32] = "none";
+static zone_mask_t   s_violated_zone_mask;
+static zone_mask_t   s_zone_tamper_mask;
+static zone_mask_t   s_armed_zone_mask;
 
 // Bypass dinamico valido per la singola sessione ARM (auto-exclude)
 static zone_mask_t   s_bypass_mask;
@@ -158,6 +161,9 @@ void alarm_init(void)
     s_alarm_from_tamper = false;
     s_tamper_latched = false;
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
+    zone_mask_clear(&s_violated_zone_mask);
+    zone_mask_clear(&s_zone_tamper_mask);
+    zone_mask_clear(&s_armed_zone_mask);
     zone_mask_clear(&s_exit_guard_mask);
     zone_mask_clear(&s_entry_zmask);
     memset(s_zone_opts, 0, sizeof(s_zone_opts));
@@ -190,6 +196,24 @@ bool alarm_last_alarm_was_tamper(void)
 const char* alarm_last_alarm_cause(void)
 {
     return s_last_alarm_cause;
+}
+
+void alarm_get_violated_zone_mask(zone_mask_t *out_mask)
+{
+    if (!out_mask) return;
+    zone_mask_copy(out_mask, &s_violated_zone_mask);
+}
+
+void alarm_get_zone_tamper_mask(zone_mask_t *out_mask)
+{
+    if (!out_mask) return;
+    zone_mask_copy(out_mask, &s_zone_tamper_mask);
+}
+
+void alarm_get_armed_zone_mask(zone_mask_t *out_mask)
+{
+    if (!out_mask) return;
+    zone_mask_copy(out_mask, &s_armed_zone_mask);
 }
 
 alarm_state_t alarm_get_state(void){ return s_state; }
@@ -269,6 +293,9 @@ void alarm_set_exit_guard(const zone_mask_t *mask, bool use_unified)
 // ─────────────────────────────────────────────────────────────────────────────
 void alarm_arm_home(void)
 {
+    zone_mask_clear(&s_violated_zone_mask);
+    zone_mask_clear(&s_zone_tamper_mask);
+    zone_mask_clear(&s_armed_zone_mask);
     s_state = ALARM_ARMED_HOME;
     s_alarm_from_tamper = false;
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
@@ -279,6 +306,9 @@ void alarm_arm_home(void)
 
 void alarm_arm_away(void)
 {
+    zone_mask_clear(&s_violated_zone_mask);
+    zone_mask_clear(&s_zone_tamper_mask);
+    zone_mask_clear(&s_armed_zone_mask);
     s_state = ALARM_ARMED_AWAY;
     s_alarm_from_tamper = false;
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
@@ -289,6 +319,9 @@ void alarm_arm_away(void)
 
 void alarm_arm_night(void)
 {
+    zone_mask_clear(&s_violated_zone_mask);
+    zone_mask_clear(&s_zone_tamper_mask);
+    zone_mask_clear(&s_armed_zone_mask);
     s_state = ALARM_ARMED_NIGHT;
     s_alarm_from_tamper = false;
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
@@ -299,6 +332,9 @@ void alarm_arm_night(void)
 
 void alarm_arm_custom(void)
 {
+    zone_mask_clear(&s_violated_zone_mask);
+    zone_mask_clear(&s_zone_tamper_mask);
+    zone_mask_clear(&s_armed_zone_mask);
     s_state = ALARM_ARMED_CUSTOM;
     s_alarm_from_tamper = false;
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
@@ -323,6 +359,9 @@ void alarm_disarm(void)
     s_alarm_from_tamper = false;
     s_tamper_latched = false;
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
+    zone_mask_clear(&s_violated_zone_mask);
+    zone_mask_clear(&s_zone_tamper_mask);
+    zone_mask_clear(&s_armed_zone_mask);
     zone_mask_clear(&s_exit_guard_mask);
     zone_mask_clear(&s_entry_zmask);
 
@@ -359,8 +398,32 @@ void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask
         zone_mask_copy(&limited_zone_tamper, zone_tamper_mask);
         zone_mask_limit(&limited_zone_tamper, ALARM_MAX_ZONES);
     }
+    zone_mask_copy(&s_zone_tamper_mask, &limited_zone_tamper);
     const bool zone_tamper = zone_mask_any(&limited_zone_tamper);
     const bool any_tamper = global_tamper || zone_tamper;
+
+    zone_mask_t eff_mask_for_snapshot;
+    zone_mask_clear(&eff_mask_for_snapshot);
+    if (s_state == ALARM_ARMED_HOME || s_state == ALARM_ARMED_AWAY ||
+        s_state == ALARM_ARMED_NIGHT || s_state == ALARM_ARMED_CUSTOM) {
+        const profile_t p = profiles[s_state];
+        zone_mask_copy(&eff_mask_for_snapshot, &p.active_mask);
+        zone_mask_t scene_mask;
+        scenes_get_active_mask(&scene_mask);
+        zone_mask_and(&eff_mask_for_snapshot, &eff_mask_for_snapshot, &scene_mask);
+        zone_mask_andnot(&eff_mask_for_snapshot, &eff_mask_for_snapshot, &s_bypass_mask);
+        zone_mask_limit(&eff_mask_for_snapshot, ALARM_MAX_ZONES);
+        zone_mask_copy(&s_armed_zone_mask, &eff_mask_for_snapshot);
+
+        // Snapshot diagnostico/violazioni: la linea AS non modifica mai queste maschere.
+        zone_mask_t currently_violated;
+        zone_mask_and(&currently_violated, zmask, &eff_mask_for_snapshot);
+        zone_mask_limit(&currently_violated, ALARM_MAX_ZONES);
+        if (zone_mask_any(&currently_violated)) {
+            zone_mask_or(&s_violated_zone_mask, &s_violated_zone_mask, &currently_violated);
+            zone_mask_limit(&s_violated_zone_mask, ALARM_MAX_ZONES);
+        }
+    }
 
     // Tamper ha priorità (eccetto manutenzione), ma mantiene cause separate:
     // linea AS generale != tamper zona EOL/2EOL/3EOL.

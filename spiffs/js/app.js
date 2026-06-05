@@ -571,6 +571,11 @@ function computeAlarmZoneIds(status, {
   knownFlags = null
 } = {}){
   if (!status || status.state !== 'ALARM') return [];
+  if (Array.isArray(status.violated_zones)) {
+    return status.violated_zones
+      .map((id) => Number.parseInt(id, 10))
+      .filter((id) => Number.isInteger(id) && id > 0);
+  }
   if (!Array.isArray(status.zones_active)) return [];
 
   const flags = status.zones_active;
@@ -594,7 +599,7 @@ function computeAlarmZoneIds(status, {
 
 function renderAlarmZoneList(ids){
   if (!Array.isArray(ids) || !ids.length) {
-    return '<span class="alarm-zone-empty">Nessuna zona segnalata.</span>';
+    return '<span class="alarm-zone-empty">Nessuna zona violata.</span>';
   }
   return `<div class="alarm-zone-list">${ids
     .map((id) => `<span class="alarm-zone-pill">${escapeHtml(getZoneLabel(id))}</span>`)
@@ -683,7 +688,6 @@ async function refreshStatus(){
     const data = await apiGet('/api/status');
     setRuntimeConnection(true);
     const prevStateName = state.status?.state || '';
-    const prevAlarmZoneIds = Array.isArray(state.alarmZoneIds) ? [...state.alarmZoneIds] : [];
     state.status = data;
     updateHardwareNotice(data);
     const stateName = typeof data?.state === 'string' ? data.state : '';
@@ -716,8 +720,6 @@ async function refreshStatus(){
     });
     if (!isAlarmState) {
       computedAlarmZoneIds = [];
-    } else if (tamperAlarmActive && !computedAlarmZoneIds.length && prevAlarmZoneIds.length) {
-      computedAlarmZoneIds = prevAlarmZoneIds;
     }
     state.alarmZoneIds = computedAlarmZoneIds;
     state.tamperAlarm = tamperAlarmActive;
@@ -725,7 +727,11 @@ async function refreshStatus(){
     setDisarmVisibility(isAlarmState || isArmedState || isPendingState);
     const wrap = $('#statusCards');
     if (!wrap) return;
-    const zonesActive = Array.isArray(data?.zones_active) ? data.zones_active.filter(Boolean).length : (data?.zones_active || 0);
+    const zonesActive = Array.isArray(data?.open_zones)
+      ? data.open_zones.length
+      : (Number.isFinite(Number(data?.open_zone_count))
+        ? Number(data.open_zone_count)
+        : (Array.isArray(data?.zones_active) ? data.zones_active.filter(Boolean).length : (data?.zones_active || 0)));
     const zonesCount = data?.zones_count || (Array.isArray(data?.zones_active) ? data.zones_active.length : zonesActive);
     const tamperLabel = data?.tamper_global || data?.global_tamper
       ? 'Tamper generale aperto'

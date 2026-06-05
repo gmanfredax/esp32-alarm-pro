@@ -4719,6 +4719,35 @@ static esp_err_t logs_delete_post(httpd_req_t* req){
     return httpd_resp_send(req, NULL, 0);
 }
 
+
+static cJSON *json_create_zone_id_array_from_mask(const zone_mask_t *mask, uint16_t zone_limit)
+{
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) {
+        return NULL;
+    }
+    for (uint16_t idx = 0; idx < zone_limit; ++idx) {
+        if (zone_mask_test(mask, idx)) {
+            cJSON_AddItemToArray(arr, cJSON_CreateNumber((double)(idx + 1u)));
+        }
+    }
+    return arr;
+}
+
+static uint16_t zone_mask_count_limited(const zone_mask_t *mask, uint16_t zone_limit)
+{
+    uint16_t count = 0;
+    if (!mask) {
+        return 0;
+    }
+    for (uint16_t idx = 0; idx < zone_limit; ++idx) {
+        if (zone_mask_test(mask, idx)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 static esp_err_t status_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
 
@@ -4762,6 +4791,18 @@ static esp_err_t status_get(httpd_req_t* req){
     zones_snapshot_t snapshot;
     zones_snapshot_build(&snapshot);
     const int zones_total = zones_snapshot_total(&snapshot);
+    const uint16_t zone_limit = (zones_total < 0) ? 0 : (uint16_t)zones_total;
+    zone_mask_t open_zone_mask;
+    zone_mask_t zone_tamper_mask;
+    zone_mask_t violated_zone_mask;
+    zone_mask_t armed_zone_mask;
+    zone_mask_clear(&open_zone_mask);
+    zone_mask_clear(&zone_tamper_mask);
+    zone_mask_clear(&violated_zone_mask);
+    zone_mask_clear(&armed_zone_mask);
+    alarm_get_violated_zone_mask(&violated_zone_mask);
+    alarm_get_zone_tamper_mask(&zone_tamper_mask);
+    alarm_get_armed_zone_mask(&armed_zone_mask);
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
@@ -4785,8 +4826,12 @@ static esp_err_t status_get(httpd_req_t* req){
             const zone_state_entry_t *entry = &snapshot.entries[idx];
             cJSON_AddItemToArray(zones, cJSON_CreateBool(entry->active));
             cJSON_AddItemToArray(zones_known, cJSON_CreateBool(entry->known));
+            if (entry->known && entry->active) {
+                zone_mask_set(&open_zone_mask, (uint16_t)idx);
+            }
             if (entry->known && entry->tamper) {
                 zone_mask_set(&tamper_mask, (uint16_t)idx);
+                zone_mask_set(&zone_tamper_mask, (uint16_t)idx);
             }
         }
         cJSON_AddItemToObject(root, "zones_active", zones);
@@ -4798,16 +4843,33 @@ static esp_err_t status_get(httpd_req_t* req){
         cJSON_AddNullToObject(root, "zones_known");
     }
 
+    zone_mask_limit(&open_zone_mask, zone_limit);
+    zone_mask_limit(&zone_tamper_mask, zone_limit);
+    zone_mask_limit(&violated_zone_mask, zone_limit);
+    zone_mask_limit(&armed_zone_mask, zone_limit);
     bool tamper = tamper_global || zone_mask_any(&tamper_mask);
     cJSON_AddBoolToObject(root, "tamper", tamper);
     cJSON_AddBoolToObject(root, "system_tamper", tamper);
     cJSON_AddBoolToObject(root, "tamper_global", tamper_global);
     cJSON_AddBoolToObject(root, "global_tamper", tamper_global);
+    cJSON_AddStringToObject(root, "alarm_state", state);
     cJSON_AddStringToObject(root, "alarm_cause", alarm_last_alarm_cause());
+    cJSON_AddNumberToObject(root, "open_zone_count", (double)zone_mask_count_limited(&open_zone_mask, zone_limit));
+    cJSON_AddNumberToObject(root, "open_zone_mask", (double)zone_mask_to_u32(&open_zone_mask));
+    cJSON_AddNumberToObject(root, "violated_zone_mask", (double)zone_mask_to_u32(&violated_zone_mask));
+    cJSON_AddNumberToObject(root, "armed_zone_mask", (double)zone_mask_to_u32(&armed_zone_mask));
+    cJSON *open_zones = json_create_zone_id_array_from_mask(&open_zone_mask, zone_limit);
+    cJSON *violated_zones = json_create_zone_id_array_from_mask(&violated_zone_mask, zone_limit);
+    cJSON *zone_tampers = json_create_zone_id_array_from_mask(&zone_tamper_mask, zone_limit);
+    cJSON *zone_faults = cJSON_CreateArray();
+    if (open_zones) cJSON_AddItemToObject(root, "open_zones", open_zones); else cJSON_AddNullToObject(root, "open_zones");
+    if (violated_zones) cJSON_AddItemToObject(root, "violated_zones", violated_zones); else cJSON_AddNullToObject(root, "violated_zones");
+    if (zone_tampers) cJSON_AddItemToObject(root, "zone_tampers", zone_tampers); else cJSON_AddNullToObject(root, "zone_tampers");
+    if (zone_faults) cJSON_AddItemToObject(root, "zone_faults", zone_faults); else cJSON_AddNullToObject(root, "zone_faults");
     if (tamper_global) {
         cJSON_AddStringToObject(root, "tamper_message", "Tamper generale aperto: serie antimanomissione interrotta");
     }
-    cJSON_AddNumberToObject(root, "tamper_zone_mask", (double)zone_mask_to_u32(&tamper_mask));
+    cJSON_AddNumberToObject(root, "tamper_zone_mask", (double)zone_mask_to_u32(&zone_tamper_mask));
     cJSON_AddBoolToObject(root, "tamper_alarm", tamper_alarm);
     cJSON *tamper_sources = cJSON_CreateArray();
     if (tamper_sources) {
