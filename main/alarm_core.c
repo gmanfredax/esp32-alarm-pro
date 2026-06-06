@@ -216,6 +216,16 @@ void alarm_get_armed_zone_mask(zone_mask_t *out_mask)
     zone_mask_copy(out_mask, &s_armed_zone_mask);
 }
 
+void alarm_set_current_armed_zone_mask(const zone_mask_t *mask)
+{
+    if (!mask) {
+        zone_mask_clear(&s_armed_zone_mask);
+        return;
+    }
+    zone_mask_copy(&s_armed_zone_mask, mask);
+    zone_mask_limit(&s_armed_zone_mask, ALARM_MAX_ZONES);
+}
+
 alarm_state_t alarm_get_state(void){ return s_state; }
 void alarm_set_profile(alarm_state_t st, profile_t p){ profiles[st]=p; }
 profile_t alarm_get_profile(alarm_state_t st){ return profiles[st]; }
@@ -301,7 +311,7 @@ void alarm_arm_home(void)
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_HOME");
-    mqtt_publish_state();
+    mqtt_publish_state_async();
 }
 
 void alarm_arm_away(void)
@@ -314,7 +324,7 @@ void alarm_arm_away(void)
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_AWAY");
-    mqtt_publish_state();
+    mqtt_publish_state_async();
 }
 
 void alarm_arm_night(void)
@@ -327,7 +337,7 @@ void alarm_arm_night(void)
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_NIGHT");
-    mqtt_publish_state();
+    mqtt_publish_state_async();
 }
 
 void alarm_arm_custom(void)
@@ -340,7 +350,7 @@ void alarm_arm_custom(void)
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
     ESP_LOGI(TAG, "ARMED_CUSTOM");
-    mqtt_publish_state();
+    mqtt_publish_state_async();
 }
 
 void alarm_disarm(void)
@@ -366,7 +376,7 @@ void alarm_disarm(void)
     zone_mask_clear(&s_entry_zmask);
 
     ESP_LOGI(TAG, "DISARMED");
-    mqtt_publish_state();
+    mqtt_publish_state_async();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -440,7 +450,7 @@ void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask
                 strlcpy(s_last_alarm_cause, global_tamper ? "global_tamper" : "zone_tamper", sizeof(s_last_alarm_cause));
                 outputs_siren(true);
                 strlcpy(s_last_alarm_cause, global_tamper ? "global_tamper" : "zone_tamper", sizeof(s_last_alarm_cause));
-                mqtt_publish_state();
+                mqtt_publish_state_async();
                 audit_alarm_trigger_event(s_last_alarm_cause, zone_tamper ? &limited_zone_tamper : NULL, -1);
             }
         }
@@ -475,7 +485,7 @@ void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask
                     strlcpy(s_last_alarm_cause, "zone_alarm", sizeof(s_last_alarm_cause));
                     outputs_siren(true);
                     ESP_LOGW(TAG, "EXIT timeout (ritardo unico) con zona ancora aperta -> ALARM");
-                    mqtt_publish_state();
+                    mqtt_publish_state_async();
                     zone_mask_t triggered;
                     zone_mask_and(&triggered, zmask, &s_exit_guard_mask);
                     audit_alarm_trigger_event("exit", &triggered, -1);
@@ -503,7 +513,7 @@ void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask
                     strlcpy(s_last_alarm_cause, "zone_alarm", sizeof(s_last_alarm_cause));
                     outputs_siren(true);
                     ESP_LOGW(TAG, "ENTRY timeout -> ALARM (Z%d)", s_entry_zone >= 0 ? (s_entry_zone + 1) : -1);
-                    mqtt_publish_state();
+                    mqtt_publish_state_async();
                     audit_alarm_trigger_event("entry_timeout", &s_entry_zmask, s_entry_zone);
                 }
                 s_entry_pending     = false;
@@ -554,7 +564,7 @@ void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask
                 strlcpy(s_last_alarm_cause, "zone_alarm", sizeof(s_last_alarm_cause));
                 outputs_siren(true);
                 ESP_LOGW(TAG, "ZONE instant -> ALARM");
-                mqtt_publish_state();
+                mqtt_publish_state_async();
                 audit_alarm_trigger_event("instant", &trig, -1);
             }
             return;

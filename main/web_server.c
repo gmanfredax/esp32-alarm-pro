@@ -3898,8 +3898,9 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
     }
 #endif
 
-    roster_node_inputs_t nodes[32];
-    size_t node_count = roster_collect_nodes(nodes, sizeof(nodes) / sizeof(nodes[0]));
+    const size_t nodes_cap = 32;
+    roster_node_inputs_t *nodes = calloc(nodes_cap, sizeof(*nodes));
+    size_t node_count = nodes ? roster_collect_nodes(nodes, nodes_cap) : 0;
     for (size_t idx = 0; idx < node_count; ++idx) {
         const roster_node_inputs_t *node = &nodes[idx];
         if (node->inputs_count == 0) {
@@ -3928,6 +3929,7 @@ static void zones_snapshot_build(zones_snapshot_t *snap)
             break;
         }
     }
+    free(nodes);
 
     for (int i = snap->total; i < ZONE_CONFIG_CAPACITY; ++i) {
         s_zone_board_map[i] = 0;
@@ -5925,6 +5927,9 @@ static void zones_valid_mask(zone_mask_t *out_mask, uint16_t zone_limit)
     if (!out_mask) {
         return;
     }
+    // Nel modello attuale le zone armabili sono quelle comprese nel totale
+    // effettivo calcolato da roster/input locali. I riferimenti oltre questo
+    // limite sono considerati eliminati/orfani/non configurati.
     zone_mask_fill(out_mask, zone_limit);
 }
 
@@ -6595,55 +6600,92 @@ static void web_server_restart_async(void){
 
 static esp_err_t arm_post(httpd_req_t* req)
 {
+    const UBaseType_t stack_before = uxTaskGetStackHighWaterMark(NULL);
+    const uint32_t heap_before = esp_get_free_heap_size();
+    ESP_LOGI(TAG, "POST /api/arm heap=%" PRIu32 " stack_hwm=%u",
+             heap_before, (unsigned)stack_before);
+
     if(!check_bearer(req)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     char user[32]={0};
     user_info_t info;
     if (!auth_check_bearer(req, &info)) return httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"), ESP_FAIL;
     strncpy(user, info.username, sizeof(user)-1); user[sizeof(user)-1]=0;
 
-
-    char body[WEB_MAX_BODY_LEN]; size_t blen = 0;
-    if(read_body_to_buf(req, body, sizeof(body), &blen)!=ESP_OK) return httpd_resp_send_err(req, 400, "body"), ESP_FAIL;
-    cJSON* root = cJSON_Parse(body);
-    if(!root) return httpd_resp_send_err(req, 400, "json"), ESP_FAIL;
+    char body[256]; size_t blen = 0;
+    if(read_body_to_buf(req, body, sizeof(body), &blen)!=ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "body"), ESP_FAIL;
+    }
+    cJSON* root = cJSON_ParseWithLength(body, blen);
+    if(!root) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "json"), ESP_FAIL;
 
     char mode[16]={0}, pin[16]={0};
     const cJSON* jmode = cJSON_GetObjectItemCaseSensitive(root, "mode");
     const cJSON* jpin  = cJSON_GetObjectItemCaseSensitive(root, "pin");
-    if (cJSON_IsString(jmode) && jmode->valuestring) strncpy(mode, jmode->valuestring, sizeof(mode)-1);
-    if (cJSON_IsString(jpin)  && jpin->valuestring)  strncpy(pin,  jpin->valuestring,  sizeof(pin)-1);
+    if (cJSON_IsString(jmode) && jmode->valuestring) strlcpy(mode, jmode->valuestring, sizeof(mode));
+    if (cJSON_IsString(jpin)  && jpin->valuestring)  strlcpy(pin,  jpin->valuestring,  sizeof(pin));
     cJSON_Delete(root);
 
-    if(!mode[0] || !pin[0]) return httpd_resp_send_err(req, 400, "mode/pin"), ESP_FAIL;
-    if(!auth_verify_pin(user, pin)) return httpd_resp_send_err(req, 401, "bad pin"), ESP_FAIL;
+    if(!mode[0] || !pin[0]) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return json_reply(req, "{\"ok\":false,\"error\":\"missing_fields\",\"message\":\"mode e PIN richiesti\"}");
+    }
+
+    const bool pin_ok = auth_verify_pin(user, pin);
+    ESP_LOGI(TAG, "POST /api/arm mode=%s pin_ok=%s heap=%" PRIu32 " stack_hwm=%u",
+             mode, pin_ok ? "yes" : "no", esp_get_free_heap_size(),
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+    if(!pin_ok) {
+        httpd_resp_set_status(req, "403 Forbidden");
+        return json_reply(req, "{\"ok\":false,\"error\":\"invalid_pin\",\"message\":\"PIN non valido\"}");
+    }
 
     // 1) Determina stato target e maschera scena
     alarm_state_t target = ALARM_DISARMED;
+    const char *mode_norm = NULL;
     int zones_total = zones_effective_total();
+    if (zones_total < 0) {
+        zones_total = 0;
+    }
     if (zones_total > SCENES_MAX_ZONES) {
         zones_total = SCENES_MAX_ZONES;
     }
 
     zone_mask_t scene_mask;
-    bool mode_ok = true;
-    if      (strcasecmp(mode, "away")  == 0) { target = ALARM_ARMED_AWAY;   scenes_mask_all((uint16_t)zones_total, &scene_mask); }
-    else if (strcasecmp(mode, "home")  == 0) { target = ALARM_ARMED_HOME;   scenes_get_mask(SCENE_HOME,  &scene_mask); }
-    else if (strcasecmp(mode, "night") == 0) { target = ALARM_ARMED_NIGHT;  scenes_get_mask(SCENE_NIGHT, &scene_mask); }
-    else if (strcasecmp(mode, "custom")== 0) { target = ALARM_ARMED_CUSTOM; scenes_get_mask(SCENE_CUSTOM,&scene_mask); }
-    else { mode_ok = false; }
-    if (!mode_ok) return httpd_resp_send_err(req, 400, "bad mode"), ESP_FAIL;
-    zone_mask_limit(&scene_mask, (uint16_t)zones_total);
+    zone_mask_clear(&scene_mask);
+    if      (strcasecmp(mode, "away")  == 0) { target = ALARM_ARMED_AWAY;   mode_norm = "away";   zones_valid_mask(&scene_mask, (uint16_t)zones_total); }
+    else if (strcasecmp(mode, "home")  == 0) { target = ALARM_ARMED_HOME;   mode_norm = "home";   scenes_get_mask(SCENE_HOME,  &scene_mask); }
+    else if (strcasecmp(mode, "night") == 0) { target = ALARM_ARMED_NIGHT;  mode_norm = "night";  scenes_get_mask(SCENE_NIGHT, &scene_mask); }
+    else if (strcasecmp(mode, "custom")== 0) { target = ALARM_ARMED_CUSTOM; mode_norm = "custom"; scenes_get_mask(SCENE_CUSTOM,&scene_mask); }
+    else {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return json_reply(req, "{\"ok\":false,\"error\":\"invalid_mode\",\"message\":\"Modalità non valida\"}");
+    }
+    scenes_filter_mask_to_valid(&scene_mask, (uint16_t)zones_total, mode_norm);
 
-    // 2) Calcola effettiva maschera attiva (profilo ∧ scena)
     profile_t prof = alarm_get_profile(target);
-    zone_mask_t eff_mask = prof.active_mask;
+    zone_mask_t eff_mask;
+    zone_mask_copy(&eff_mask, &prof.active_mask);
     zone_mask_limit(&eff_mask, (uint16_t)zones_total);
     zone_mask_and(&eff_mask, &eff_mask, &scene_mask);
+    const uint16_t included_zones = zone_mask_count_limited(&eff_mask, (uint16_t)zones_total);
 
-    // 3) Costruisci elenco zone aperte e bypass automatico (auto_exclude)
-    zones_snapshot_t snapshot;
-    zones_snapshot_build(&snapshot);
-    int snapshot_total = zones_snapshot_total(&snapshot);
+    char eff_hex[ZONE_MASK_WORDS * 8u + 1u];
+    zone_mask_to_hex(&eff_mask, (uint16_t)zones_total, eff_hex, sizeof(eff_hex));
+    ESP_LOGI(TAG, "arm request mode=%s zones=%u mask=%s heap=%" PRIu32 " stack_hwm=%u",
+             mode_norm, (unsigned)included_zones, eff_hex, esp_get_free_heap_size(),
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
+    if (included_zones == 0) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return json_reply(req, "{\"ok\":false,\"error\":\"empty_mode\",\"message\":\"Nessuna zona valida associata alla modalità\"}");
+    }
+
+    zones_snapshot_t *snapshot = calloc(1, sizeof(*snapshot));
+    if (!snapshot) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom"), ESP_FAIL;
+    }
+    zones_snapshot_build(snapshot);
+    int snapshot_total = zones_snapshot_total(snapshot);
     if (snapshot_total > zones_total) {
         snapshot_total = zones_total;
     }
@@ -6651,9 +6693,10 @@ static esp_err_t arm_post(httpd_req_t* req)
     zone_mask_t open_mask;
     zone_mask_clear(&open_mask);
     for (int idx = 0; idx < snapshot_total; ++idx){
-        const zone_state_entry_t *entry = &snapshot.entries[idx];
+        const zone_state_entry_t *entry = &snapshot->entries[idx];
         if (entry->known && entry->active) zone_mask_set(&open_mask, (uint16_t)idx);
     }
+    free(snapshot);
     zone_mask_limit(&open_mask, (uint16_t)zones_total);
 
     zone_mask_t blocking;
@@ -6664,7 +6707,7 @@ static esp_err_t arm_post(httpd_req_t* req)
         if (zone_mask_test(&eff_mask, (uint16_t)i) && zone_mask_test(&open_mask, (uint16_t)i)){
             bool has_delay = (s_zone_cfg[i].zone_delay && s_zone_cfg[i].zone_time > 0);
             if (has_delay){
-                continue;  // né blocking, né bypass
+                continue;
             }
             if (s_zone_cfg[i].auto_exclude) zone_mask_set(&bypass_mask, (uint16_t)i);
             else                            zone_mask_set(&blocking, (uint16_t)i);
@@ -6672,38 +6715,24 @@ static esp_err_t arm_post(httpd_req_t* req)
     }
 
     if (zone_mask_any(&blocking)){
-        // Ritorna 409 + lista zone bloccanti con id+name
-        char buf[512]; size_t off=0;
-        off += snprintf(buf+off,sizeof(buf)-off,"{\"open_blocking\":[");
-        bool first=true;
-        for (int i=0;i<zones_total;i++){
-            if (zone_mask_test(&blocking, (uint16_t)i)){
-                zone_cfg_t *c=&s_zone_cfg[i];
-                off += snprintf(buf+off,sizeof(buf)-off, "%s{\"id\":%d", first?"":",", i+1);
-                if (c->name[0]) off += snprintf(buf+off,sizeof(buf)-off, ",\"name\":\"%s\"", c->name);
-                off += snprintf(buf+off,sizeof(buf)-off, "}");
-                first=false;
-            }
-        }
-        off += snprintf(buf+off,sizeof(buf)-off,"]}");
+        char blocking_hex[ZONE_MASK_WORDS * 8u + 1u];
+        zone_mask_to_hex(&blocking, (uint16_t)zones_total, blocking_hex, sizeof(blocking_hex));
+        char buf[256];
+        snprintf(buf, sizeof(buf), "{\"ok\":false,\"error\":\"open_zones\",\"message\":\"Zone aperte non bypassabili\",\"open_zone_mask\":\"%s\"}", blocking_hex);
         httpd_resp_set_status(req, "409 Conflict");
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
-        return ESP_OK;
+        return json_reply(req, buf);
     }
 
-    // 4) Applica scena attiva e bypass
     scenes_set_active_mask(&scene_mask);
     alarm_set_bypass_mask(&bypass_mask);
 
-    // 5) ARM vero e proprio
     if      (target == ALARM_ARMED_AWAY)   alarm_arm_away();
     else if (target == ALARM_ARMED_HOME)   alarm_arm_home();
     else if (target == ALARM_ARMED_NIGHT)  alarm_arm_night();
     else if (target == ALARM_ARMED_CUSTOM) alarm_arm_custom();
+    alarm_set_current_armed_zone_mask(&eff_mask);
+    (void)mqtt_publish_state_async();
 
-    // 6) Avvia exit delay (ritardo unico: se al momento dell'ARM ci sono zone ritardate aperte,
-    //    usa il MIN dei loro zone_time come durata di uscita; altrimenti usa il profilo)
     prof = alarm_get_profile(target);
     uint32_t exit_ms = prof.exit_delay_ms;
     {
@@ -6722,35 +6751,18 @@ static esp_err_t arm_post(httpd_req_t* req)
     char scene_desc[48];
     zone_mask_format_brief(&scene_mask, (uint16_t)zones_total, 4, scene_desc, sizeof(scene_desc));
     char note[64];
-    size_t avail = sizeof(note);
-    if (avail > 0) {
-        const size_t prefix = 12; // strlen("mode=") + strlen(" scene=")
-        if (avail > 1) {
-            avail -= 1;
-        }
-        if (avail > prefix) {
-            avail -= prefix;
-        } else {
-            avail = 0;
-        }
-    }
-    size_t mode_len = strnlen(mode, sizeof(mode) - 1);
-    if (mode_len > avail) {
-        mode_len = avail;
-    }
-    size_t scene_len = 0;
-    if (avail > mode_len) {
-        size_t scene_avail = avail - mode_len;
-        size_t scene_cap = sizeof(scene_desc) - 1;
-        if (scene_avail < scene_cap) {
-            scene_cap = scene_avail;
-        }
-        scene_len = strnlen(scene_desc, scene_cap);
-    }
-    snprintf(note, sizeof(note), "mode=%.*s scene=%.*s", (int)mode_len, mode, (int)scene_len, scene_desc);
+    snprintf(note, sizeof(note), "mode=%s zones=%u", mode_norm, (unsigned)included_zones);
     audit_append("alarm_arm", user, 1, note);
 
-    return json_reply(req, "{\"ok\":true}");
+    ESP_LOGI(TAG, "arm complete mode=%s zones=%u scene=%s heap=%" PRIu32 " stack_hwm=%u",
+             mode_norm, (unsigned)included_zones, scene_desc, esp_get_free_heap_size(),
+             (unsigned)uxTaskGetStackHighWaterMark(NULL));
+
+    char resp[160];
+    snprintf(resp, sizeof(resp),
+             "{\"ok\":true,\"message\":\"Armamento attivato\",\"alarm_state\":\"armed\",\"active_mode\":\"%s\"}",
+             mode_norm);
+    return json_reply(req, resp);
 }
 
 static esp_err_t tamper_reset_post(httpd_req_t* req)

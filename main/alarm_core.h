@@ -90,6 +90,7 @@ const char*    alarm_last_alarm_cause(void);
 void           alarm_get_violated_zone_mask(zone_mask_t *out_mask);
 void           alarm_get_zone_tamper_mask(zone_mask_t *out_mask);
 void           alarm_get_armed_zone_mask(zone_mask_t *out_mask);
+void           alarm_set_current_armed_zone_mask(const zone_mask_t *mask);
 const char*    alarm_state_name(alarm_state_t st);
 
 #ifdef __cplusplus

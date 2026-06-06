@@ -1200,10 +1200,11 @@ async function refreshScenes(){
     if (!root) return;
     const total = Number.isInteger(data?.zones) ? data.zones : 0;
     if (!total) {
-      root.innerHTML = '<div class="log-empty">Configura almeno una zona per gestire gli scenari.</div>';
+      root.innerHTML = '<div class="log-empty">Configura almeno una zona per gestire gli scenari. AWAY è una modalità built-in di armamento totale e include automaticamente tutte le zone valide.</div>';
       return;
     }
     root.innerHTML = [
+      '<div class="log-empty">AWAY è una modalità built-in di armamento totale e include automaticamente tutte le zone valide.</div>',
       renderSceneCard('home', data?.home_ids || data?.home || 0, total),
       renderSceneCard('night', data?.night_ids || data?.night || 0, total),
       renderSceneCard('custom', data?.custom_ids || data?.custom || 0, total)
@@ -1616,10 +1617,13 @@ function setupCommands(){
       } catch (err) {
         console.error('arm', err);
         if (err instanceof HttpError) {
-          if (err.status === 401) {
-            showNotice('PIN errato.', 'error');
-          } else if (err.status === 409) {
-            showNotice('Impossibile attivare: zone aperte.', 'error');
+          const code = err.data?.error;
+          if (code === 'invalid_pin' || err.status === 401 || err.status === 403) {
+            showNotice(err.message || 'PIN errato.', 'error');
+          } else if (code === 'empty_mode') {
+            showNotice(err.message || 'Nessuna zona valida associata alla modalità.', 'error');
+          } else if (code === 'open_zones' || err.status === 409) {
+            showNotice(err.message || 'Impossibile attivare: zone aperte.', 'error');
           } else {
             showNotice(err.message || 'Errore durante l’invio del comando.', 'error');
           }

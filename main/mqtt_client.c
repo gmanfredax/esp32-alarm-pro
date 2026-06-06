@@ -15,6 +15,9 @@
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
 #include "esp_eth.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -87,6 +90,66 @@ static size_t                   s_cmd_base_len = 0;
 static zone_mask_t              s_last_zone_mask;
 static int                      s_last_zone_count = -1;
 static bool                     s_secret_ready = false;
+
+typedef enum {
+    MQTT_ASYNC_PUBLISH_STATE = 1,
+} mqtt_async_job_t;
+
+static QueueHandle_t            s_publish_queue = NULL;
+static TaskHandle_t             s_publish_task = NULL;
+
+static void mqtt_publish_worker(void *arg)
+{
+    (void)arg;
+    mqtt_async_job_t job;
+    for (;;) {
+        if (xQueueReceive(s_publish_queue, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        switch (job) {
+        case MQTT_ASYNC_PUBLISH_STATE:
+            (void)mqtt_publish_state();
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+static esp_err_t mqtt_async_ensure_worker(void)
+{
+    if (!s_publish_queue) {
+        s_publish_queue = xQueueCreate(4, sizeof(mqtt_async_job_t));
+        if (!s_publish_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (!s_publish_task) {
+        BaseType_t ok = xTaskCreate(mqtt_publish_worker, "mqtt_pub", 8192, NULL, tskIDLE_PRIORITY + 2, &s_publish_task);
+        if (ok != pdPASS) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t mqtt_publish_state_async(void)
+{
+    if (!s_enabled || !s_client) {
+        return ESP_OK;
+    }
+    esp_err_t err = mqtt_async_ensure_worker();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "publish state async unavailable: %s", esp_err_to_name(err));
+        return err;
+    }
+    mqtt_async_job_t job = MQTT_ASYNC_PUBLISH_STATE;
+    if (xQueueSend(s_publish_queue, &job, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "publish state async queue full");
+        return ESP_ERR_TIMEOUT;
+    }
+    return ESP_OK;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
