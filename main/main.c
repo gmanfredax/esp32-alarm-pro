@@ -26,6 +26,7 @@
 
 // Header del progetto
 #include "ethernet.h"
+#include "network_manager.h"
 #include "storage.h"
 #include "auth.h"
 #include "app_mqtt.h"
@@ -1555,9 +1556,9 @@ static void system_main_task(void *arg)
              device_secret[0],device_secret[1],device_secret[2],device_secret[3],
              device_secret[4],device_secret[5],device_secret[6],device_secret[7]);
     
-    esp_err_t eth_ret = eth_start();
-    if (eth_ret != ESP_OK) {
-        ESP_LOGW(TAG, "Ethernet not available. Continuing without it...");
+    esp_err_t net_ret = network_manager_start();
+    if (net_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Network manager not available (%s). Continuing without network...", esp_err_to_name(net_ret));
     }
     ESP_ERROR_CHECK(auth_init());
 // [debug disattivato] loop dump link rimosso per build pulita
@@ -1582,28 +1583,28 @@ static void system_main_task(void *arg)
 
     // reset_buttons_init();
     // ESP_LOGI(TAG, "Pulsanti HW reset su GPIO %d e %d", PIN_HW_RESET_BTN_A, PIN_HW_RESET_BTN_B);
-    bool eth_ready_for_time = false;
-    if (eth_ret == ESP_OK) {
+    bool network_ready_for_time = false;
+    if (net_ret == ESP_OK) {
         const TickType_t wait_timeout = pdMS_TO_TICKS(15000);
-        esp_err_t wait_res = eth_wait_for_ip(wait_timeout);
+        esp_err_t wait_res = network_wait_for_active_ip(wait_timeout);
         if (wait_res == ESP_OK) {
-            eth_ready_for_time = true;
-            ESP_LOGI(TAG, "Ethernet ready, starting SNTP");
+            network_ready_for_time = true;
+            ESP_LOGI(TAG, "Network ready, starting SNTP");
             // esp_err_t mdns_err = mdns_service_start();
             // if (mdns_err != ESP_OK) {
             //     ESP_LOGW(TAG, "mDNS start failed: %s", esp_err_to_name(mdns_err));
             // }
         } else if (wait_res == ESP_ERR_TIMEOUT) {
-            ESP_LOGW(TAG, "Timeout waiting for Ethernet IP (%lu ms)",
+            ESP_LOGW(TAG, "Timeout waiting for active network IP (%lu ms)",
                      (unsigned long)(wait_timeout * portTICK_PERIOD_MS));
         } else {
-            ESP_LOGW(TAG, "Failed waiting for Ethernet IP: %s", esp_err_to_name(wait_res));
+            ESP_LOGW(TAG, "Failed waiting for network IP: %s", esp_err_to_name(wait_res));
         }
     }
-    if (eth_ready_for_time) {
+    if (network_ready_for_time) {
         sntp_start_and_wait();
     } else {
-        ESP_LOGW(TAG, "Skipping SNTP start because Ethernet is not ready");
+        ESP_LOGW(TAG, "Skipping SNTP start because network is not ready");
     }
     ESP_ERROR_CHECK(system_info_init());
     ESP_ERROR_CHECK(notification_events_init());

@@ -24,16 +24,10 @@
 #include "esp_eth_mac_esp.h"
 #include "esp_eth_phy.h"
 #include "esp_eth_netif_glue.h"   // per esp_eth_new_netif_glue()
+#include "pins.h"
 
 static const char *TAG = "eth";
 
-// Pin PHY / RMII (adatta se diverso sul tuo HW)
-#define ETH_MDC_GPIO         GPIO_NUM_23
-#define ETH_MDIO_GPIO        GPIO_NUM_18
-#define ETH_POWER_GPIO       GPIO_NUM_17
-#define ETH_PHY_ADDR         1
-// RMII clock esterno a 50MHz su GPIO0
-#define ETH_RMII_CLK_IN_GPIO GPIO_NUM_0
 
 static esp_eth_handle_t s_eth = NULL;
 static esp_netif_t *s_eth_netif = NULL;
@@ -48,15 +42,15 @@ static EventGroupHandle_t s_eth_event_group = NULL;
 static void rmii_pins_release(void)
 {
     const gpio_num_t rmii_pins[] = {
-        GPIO_NUM_0,  // REF_CLK (50MHz in)
-        GPIO_NUM_18, // MDIO
-        GPIO_NUM_19, // TXD0
-        GPIO_NUM_21, // TX_EN
-        GPIO_NUM_22, // TXD1
-        GPIO_NUM_23, // MDC
-        GPIO_NUM_25, // RXD0
-        GPIO_NUM_26, // RXD1
-        GPIO_NUM_27, // CRS_DV
+        ETH_RMII_REF_CLK_GPIO,  // REF_CLK (50MHz in)
+        ETH_MDIO_GPIO, // MDIO
+        ETH_RMII_TXD0_GPIO, // TXD0
+        ETH_RMII_TX_EN_GPIO, // TX_EN
+        ETH_RMII_TXD1_GPIO, // TXD1
+        ETH_MDC_GPIO, // MDC
+        ETH_RMII_RXD0_GPIO, // RXD0
+        ETH_RMII_RXD1_GPIO, // RXD1
+        ETH_RMII_CRS_DV_GPIO // CRS_DV
     };
     for (size_t i = 0; i < sizeof(rmii_pins)/sizeof(rmii_pins[0]); ++i) {
         gpio_pullup_dis(rmii_pins[i]);
@@ -122,7 +116,7 @@ esp_err_t eth_start(void)
 
     // Alimentazione PHY (power pin)
     gpio_config_t pwr = {
-        .pin_bit_mask = 1ULL << ETH_POWER_GPIO,
+        .pin_bit_mask = 1ULL << ETH_PHY_POWER_GPIO,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = 0,
         .pull_down_en = 0,
@@ -130,9 +124,9 @@ esp_err_t eth_start(void)
     };
     ESP_RETURN_ON_ERROR(gpio_config(&pwr), TAG, "gpio_config(power)");
     // power cycle breve
-    gpio_set_level(ETH_POWER_GPIO, 0);
+    gpio_set_level(ETH_PHY_POWER_GPIO, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level(ETH_POWER_GPIO, 1);
+    gpio_set_level(ETH_PHY_POWER_GPIO, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 
     // Init stack di rete e loop eventi (idempotente)
@@ -159,7 +153,7 @@ esp_err_t eth_start(void)
 
     // RMII clock: external 50MHz IN su GPIO0
     esp32_cfg.clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
-    esp32_cfg.clock_config.rmii.clock_gpio = ETH_RMII_CLK_IN_GPIO;
+    esp32_cfg.clock_config.rmii.clock_gpio = ETH_RMII_REF_CLK_GPIO;
 
     esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&esp32_cfg, &mac_cfg);
     if (!mac) {
@@ -170,7 +164,7 @@ esp_err_t eth_start(void)
     // --- PHY config ---
     eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
     phy_cfg.phy_addr       = ETH_PHY_ADDR;
-    phy_cfg.reset_gpio_num = GPIO_NUM_NC; // nessun GPIO di reset dedicato
+    phy_cfg.reset_gpio_num = ETH_PHY_RST_GPIO; // -1/GPIO_NUM_NC se non cablato
 
     // LAN8720/87xx
     esp_eth_phy_t *phy = esp_eth_phy_new_lan87xx(&phy_cfg);
@@ -208,7 +202,7 @@ esp_err_t eth_start(void)
     ESP_RETURN_ON_ERROR(esp_eth_start(s_eth), TAG, "esp_eth_start");
 
     ESP_LOGI(TAG, "Ethernet start: LAN8720 @ addr %d, MDC=%d MDIO=%d, CLK_IN=GPIO%d",
-             ETH_PHY_ADDR, ETH_MDC_GPIO, ETH_MDIO_GPIO, ETH_RMII_CLK_IN_GPIO);
+             ETH_PHY_ADDR, ETH_MDC_GPIO, ETH_MDIO_GPIO, ETH_RMII_REF_CLK_GPIO);
     return ESP_OK;
 }
 
@@ -228,7 +222,7 @@ void eth_stop(void)
         esp_eth_driver_uninstall(s_eth);
         s_eth = NULL;
     }
-    gpio_set_level(ETH_POWER_GPIO, 0);
+    gpio_set_level(ETH_PHY_POWER_GPIO, 0);
     s_eth_link_up = false;
     if (s_eth_event_group) {
         xEventGroupClearBits(s_eth_event_group, ETH_EVENT_BIT_GOT_IP);
@@ -280,4 +274,8 @@ esp_err_t eth_wait_for_ip(TickType_t timeout)
         return ESP_OK;
     }
     return ESP_ERR_TIMEOUT;
+}
+bool eth_link_is_up(void)
+{
+    return s_eth_link_up;
 }

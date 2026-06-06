@@ -1,5 +1,5 @@
 # Colleziona tutti i .c nella cartella main (comodo se aggiungi file spesso)
-#file(GLOB MAIN_SRCS "scenes.c" "system_info.c" "notification_events.c" "i2c_bus.c" "ads1115.c" "gpio_inputs.c" "main.c" "mqtt_client.c" "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
+#file(GLOB MAIN_SRCS "network_manager.c" "ethernet.c" "scenes.c" "system_info.c" "notification_events.c" "i2c_bus.c" "ads1115.c" "gpio_inputs.c" "main.c" "mqtt_client.c" "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
 file(GLOB MAIN_SRCS "*.c")
 
 #set(MAIN_EMBED_TXTFILES
@@ -70,6 +70,7 @@ idf_component_register(
         esp_event
         esp_netif
         esp_eth
+        esp_wifi
         esp_driver_i2c
         esp_driver_spi
         esp_driver_gpio

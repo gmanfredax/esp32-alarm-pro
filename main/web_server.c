@@ -62,6 +62,7 @@
 #include "can_bus_protocol.h"
 #include "system_info.h"
 #include "notification_events.h"
+#include "network_manager.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -2068,11 +2069,18 @@ static void mqtt_config_add_json(cJSON* root, const provisioning_mqtt_config_t* 
 
 static esp_netif_t* provisioning_get_primary_netif(void)
 {
+    network_status_t st;
+    if (network_get_status(&st) == ESP_OK && st.active_if == NETWORK_IF_WIFI) {
+        esp_netif_t *wifi = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+        if (wifi) return wifi;
+    }
     esp_netif_t* netif = eth_get_netif();
     if (netif) return netif;
     netif = esp_netif_get_handle_from_ifkey("ETH_DEF");
     if (netif) return netif;
-    return esp_netif_get_handle_from_ifkey("ETH");
+    netif = esp_netif_get_handle_from_ifkey("ETH");
+    if (netif) return netif;
+    return esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
 }
 
 static bool provisioning_ip4_from_str(const char* str, esp_ip4_addr_t* out)
@@ -2360,6 +2368,109 @@ static esp_err_t api_admin_notifications_test_post(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
     notification_events_emit_simple("test_notification", NOTIFY_SEVERITY_INFO, "web", -1, "Test notifica", "Evento di test generato dalla UI admin", false);
     return json_reply(req, "{\"ok\":true}");
+}
+
+
+static esp_err_t network_json_error(httpd_req_t *req, int status, const char *error, const char *message)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    cJSON_AddBoolToObject(root, "ok", false);
+    cJSON_AddStringToObject(root, "error", error ? error : "network_error");
+    cJSON_AddStringToObject(root, "message", message ? message : "Errore configurazione rete");
+    httpd_resp_set_status(req, status == HTTPD_400_BAD_REQUEST ? "400 Bad Request" : "500 Internal Server Error");
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_admin_network_get(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    network_status_append_json(root);
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_admin_network_restart_post(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    esp_err_t err = network_manager_restart();
+    if (err != ESP_OK) return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "restart_failed", "Riavvio rete fallito");
+    return json_reply(req, "{\"ok\":true,\"message\":\"Riavvio rete avviato\"}");
+}
+
+static esp_err_t api_admin_network_wifi_test_post(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char body[512]; size_t bl=0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
+    cJSON* j = cJSON_ParseWithLength(body, bl);
+    if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
+    const cJSON *jssid = cJSON_GetObjectItemCaseSensitive(j, "ssid");
+    const cJSON *jpass = cJSON_GetObjectItemCaseSensitive(j, "password");
+    const char *ssid = (cJSON_IsString(jssid) && jssid->valuestring) ? jssid->valuestring : "";
+    const char *pass = (cJSON_IsString(jpass) && jpass->valuestring) ? jpass->valuestring : "";
+    if (!ssid[0]) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "missing_wifi_ssid", "SSID Wi-Fi obbligatorio per il test"); }
+    if (strlen(ssid) > NETWORK_WIFI_SSID_MAX) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_ssid_too_long", "SSID Wi-Fi massimo 32 caratteri"); }
+    network_config_t saved; network_config_load(&saved);
+    bool use_saved = !pass[0];
+    if (use_saved && (!saved.wifi_password_set || strcmp(saved.wifi_ssid, ssid))) {
+        cJSON_Delete(j);
+        return network_json_error(req, HTTPD_400_BAD_REQUEST, "missing_wifi_password", "Password Wi-Fi obbligatoria per testare nuove credenziali");
+    }
+    if (pass[0] && strlen(pass) > NETWORK_WIFI_PASSWORD_MAX) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_password_too_long", "Password Wi-Fi massimo 64 caratteri"); }
+    esp_err_t err = network_wifi_test(ssid, pass, use_saved, 15000);
+    cJSON_Delete(j);
+    if (err != ESP_OK) return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_test_failed", "Connessione Wi-Fi fallita o IP non ottenuto");
+    return json_reply(req, "{\"ok\":true,\"message\":\"Test Wi-Fi riuscito\"}");
+}
+
+static esp_err_t api_admin_network_post(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char body[1024]; size_t bl=0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
+    cJSON* j = cJSON_ParseWithLength(body, bl);
+    if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
+
+    network_config_t cfg; network_config_load(&cfg);
+    const cJSON *jmode = cJSON_GetObjectItemCaseSensitive(j, "network_mode");
+    const cJSON *jhost = cJSON_GetObjectItemCaseSensitive(j, "hostname");
+    const cJSON *jwifi = cJSON_GetObjectItemCaseSensitive(j, "wifi");
+    const cJSON *jssid = jwifi ? cJSON_GetObjectItemCaseSensitive(jwifi, "ssid") : cJSON_GetObjectItemCaseSensitive(j, "wifi_ssid");
+    const cJSON *jpass = jwifi ? cJSON_GetObjectItemCaseSensitive(jwifi, "password") : cJSON_GetObjectItemCaseSensitive(j, "wifi_password");
+
+    if (cJSON_IsString(jmode)) {
+        network_mode_t mode;
+        if (!network_mode_from_str(jmode->valuestring, &mode)) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "invalid_network_mode", "Modalità rete non valida"); }
+        cfg.mode = mode;
+    }
+    if (cJSON_IsString(jhost) && jhost->valuestring) {
+        if (strlen(jhost->valuestring) > NETWORK_HOSTNAME_MAX) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "hostname_too_long", "Hostname massimo 63 caratteri"); }
+        strlcpy(cfg.hostname, jhost->valuestring, sizeof(cfg.hostname));
+    }
+    if (cJSON_IsString(jssid) && jssid->valuestring) {
+        if (strlen(jssid->valuestring) > NETWORK_WIFI_SSID_MAX) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_ssid_too_long", "SSID Wi-Fi massimo 32 caratteri"); }
+        strlcpy(cfg.wifi_ssid, jssid->valuestring, sizeof(cfg.wifi_ssid));
+    }
+    if (cJSON_IsString(jpass) && jpass->valuestring && jpass->valuestring[0]) {
+        if (strlen(jpass->valuestring) > NETWORK_WIFI_PASSWORD_MAX) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_password_too_long", "Password Wi-Fi massimo 64 caratteri"); }
+        strlcpy(cfg.wifi_password, jpass->valuestring, sizeof(cfg.wifi_password));
+        cfg.wifi_password_set = true;
+    }
+    if (network_mode_requires_wifi(cfg.mode)) {
+        if (!cfg.wifi_ssid[0]) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "missing_wifi_ssid", "SSID Wi-Fi obbligatorio per la modalità selezionata"); }
+        if (!cfg.wifi_password_set) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "missing_wifi_password", "Password Wi-Fi obbligatoria; reti aperte non abilitate"); }
+    }
+    if (cfg.mode == NETWORK_MODE_WIFI_ONLY && !network_wifi_test_recent_ok(cfg.wifi_ssid, cfg.wifi_password)) {
+        cJSON_Delete(j);
+        return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_test_required", "Per passare a Solo Wi-Fi eseguire prima un Test Wi-Fi riuscito");
+    }
+    esp_err_t err = network_config_save(&cfg);
+    cJSON_Delete(j);
+    if (err != ESP_OK) return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "save_failed", "Salvataggio configurazione rete fallito");
+    network_manager_restart();
+    return json_reply(req, "{\"ok\":true,\"message\":\"Configurazione rete salvata\"}");
 }
 
 // ---- /api/sys/net GET/POST ----
@@ -6552,6 +6663,10 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/me",           .method = HTTP_GET,     .handler = api_me_get },
     { .uri = "/api/admin/secret", .method = HTTP_GET,     .handler = api_admin_only_get },
     { .uri = "/api/admin/system", .method = HTTP_GET, .handler = api_admin_system_get },
+    { .uri = "/api/admin/network", .method = HTTP_GET, .handler = api_admin_network_get },
+    { .uri = "/api/admin/network", .method = HTTP_POST, .handler = api_admin_network_post },
+    { .uri = "/api/admin/network/restart", .method = HTTP_POST, .handler = api_admin_network_restart_post },
+    { .uri = "/api/admin/network/wifi/test", .method = HTTP_POST, .handler = api_admin_network_wifi_test_post },
     { .uri = "/api/admin/mqtt", .method = HTTP_GET, .handler = sys_mqtt_get },
     { .uri = "/api/admin/mqtt", .method = HTTP_POST, .handler = sys_mqtt_post },
     { .uri = "/api/admin/mqtt/rediscover", .method = HTTP_POST, .handler = api_admin_mqtt_rediscover_post },

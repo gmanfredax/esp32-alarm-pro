@@ -2298,36 +2298,68 @@
     });
   }
 
-  // ========== RETE / MQTT (placeholder salva)
+  // ========== RETE / MQTT
+  function netLabel(value){
+    return ({ ethernet_only:"Solo Ethernet", wifi_only:"Solo Wi-Fi", ethernet_preferred:"Ethernet preferita", wifi_preferred:"Wi-Fi preferito", ethernet:"Ethernet", wifi:"Wi-Fi", none:"Nessuna" })[value] || value || "—";
+  }
+
+  function renderNetworkStatus(c){
+    const box = $("#netStatus");
+    if (!box) return;
+    const wifi = c.wifi || {};
+    const eth = c.ethernet || {};
+    const items = [
+      ["Interfaccia attiva", netLabel(c.active_interface)],
+      ["Modalità", netLabel(c.network_mode)],
+      ["Hostname", c.hostname || "—"],
+      ["Ethernet", eth.link_up ? "link up" : "link down"],
+      ["IP Ethernet", eth.ip || "0.0.0.0"],
+      ["MAC Ethernet", eth.mac || "—"],
+      ["Wi-Fi", wifi.connected ? "connesso" : "disconnesso"],
+      ["SSID Wi-Fi", wifi.ssid || "—"],
+      ["RSSI Wi-Fi", wifi.rssi ? `${wifi.rssi} dBm` : "—"],
+      ["IP Wi-Fi", wifi.ip || "0.0.0.0"],
+      ["MAC Wi-Fi", wifi.mac || "—"],
+      ["Password Wi-Fi", wifi.password_set ? "configurata" : "non configurata"],
+      ["Ultimo errore", c.last_error || "—"],
+    ];
+    box.innerHTML = items.map(([k,v]) => `<div><span>${k}</span><strong>${v}</strong></div>`).join("");
+  }
+
   async function loadNetwork(){
-    const updateStaticVisibility = () => {
-      const select = $("#net_dhcp");
-      const row = $("#net_static");
-      if (!row) return;
-      const show = (select?.value || "1") === "0";
-      row.style.display = show ? "flex" : "none";
-    };
     try{
-      const c = await apiGet("/api/sys/net");
+      const c = await apiGet("/api/admin/network");
+      renderNetworkStatus(c);
+      $("#net_mode") && ($("#net_mode").value = c.network_mode || "ethernet_only");
       $("#net_host") && ($("#net_host").value = c.hostname || "");
-      $("#net_dhcp") && ($("#net_dhcp").value = c.dhcp ? "1" : "0");
-      updateStaticVisibility();
-      $("#net_ip")   && ($("#net_ip").value   = c.ip   || "");
-      $("#net_gw")   && ($("#net_gw").value   = c.gw   || "");
-      $("#net_mask") && ($("#net_mask").value = c.mask || "");
-      $("#net_dns")  && ($("#net_dns").value  = c.dns  || "");
+      $("#net_wifi_ssid") && ($("#net_wifi_ssid").value = c.wifi?.ssid || "");
+      $("#net_wifi_password") && ($("#net_wifi_password").value = "");
     }catch(e){ toast("Errore caricando rete: " + e.message, false); }
-    $("#net_dhcp")?.addEventListener("change", updateStaticVisibility);
+
+    $("#btnNetWifiTest")?.addEventListener("click", async ()=>{
+      const ssid = ($("#net_wifi_ssid")?.value || "").trim();
+      const password = $("#net_wifi_password")?.value || "";
+      if (!ssid) return toast("SSID Wi-Fi obbligatorio", false);
+      try{
+        await apiPost("/api/admin/network/wifi/test", { ssid, password });
+        toast("Test Wi-Fi riuscito");
+        await loadNetwork();
+      }catch(e){ toast("Test Wi-Fi fallito: " + e.message, false); }
+    });
+
+    $("#btnNetRestart")?.addEventListener("click", async ()=>{
+      try{ await apiPost("/api/admin/network/restart", {}); toast("Riavvio rete avviato"); setTimeout(loadNetwork, 1500); }
+      catch(e){ toast("Riavvio rete: " + e.message, false); }
+    });
+
     $("#btnNetSave")?.addEventListener("click", async ()=>{
-      const body = {
-        hostname: $("#net_host")?.value || "",
-        dhcp: ($("#net_dhcp")?.value || "1") === "1",
-        ip:   $("#net_ip")?.value || "",
-        gw:   $("#net_gw")?.value || "",
-        mask: $("#net_mask")?.value || "",
-        dns:  $("#net_dns")?.value || "",
-      };
-      try{ await apiPost("/api/sys/net", body); toast("Rete salvata"); }
+      const mode = $("#net_mode")?.value || "ethernet_only";
+      const ssid = ($("#net_wifi_ssid")?.value || "").trim();
+      const password = $("#net_wifi_password")?.value || "";
+      if ((mode === "wifi_only" || mode === "ethernet_preferred" || mode === "wifi_preferred") && !ssid) return toast("SSID Wi-Fi obbligatorio per la modalità scelta", false);
+      const body = { network_mode: mode, hostname: ($("#net_host")?.value || "").trim(), wifi: { ssid } };
+      if (password) body.wifi.password = password;
+      try{ await apiPost("/api/admin/network", body); toast("Configurazione rete salvata"); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); await loadNetwork(); }
       catch(e){ toast("Errore salvataggio rete: " + e.message, false); }
     });
   }

@@ -39,6 +39,9 @@
 #ifndef ETH_PHY_RST_GPIO
   #define ETH_PHY_RST_GPIO      -1          // -1 se non cablato a GPIO
 #endif
+#ifndef ETH_PHY_POWER_GPIO
+  #define ETH_PHY_POWER_GPIO    GPIO_NUM_17
+#endif
 #ifndef ETH_USE_EXT_REF_CLK
   #define ETH_USE_EXT_REF_CLK   1           // 1 = 50 MHz dal PHY su GPIO0; 0 = APLL interno
 #endif

@@ -25,6 +25,7 @@
 #include "gpio_inputs.h"
 #include "outputs.h"
 #include "roster.h"
+#include "network_manager.h"
 
 #ifndef FW_VERSION
 #define FW_VERSION "unknown"
@@ -131,20 +132,26 @@ static const char *reset_reason_name(esp_reset_reason_t r)
 static void add_net(cJSON *root)
 {
     cJSON *net = cJSON_AddObjectToObject(root, "network");
-    char macs[18] = "";
-    uint8_t mac[6];
-    if (esp_read_mac(mac, ESP_MAC_ETH) == ESP_OK) snprintf(macs, sizeof(macs), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-    cJSON_AddStringToObject(net, "mac", macs);
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("ETH_DEF");
-    if (!netif) netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-    const char *hn = NULL;
-    if (netif) esp_netif_get_hostname(netif, &hn);
-    cJSON_AddStringToObject(net, "hostname", hn ? hn : "unknown");
-    esp_netif_ip_info_t ip = {0};
-    char ipbuf[16] = "0.0.0.0";
-    if (netif && esp_netif_get_ip_info(netif, &ip) == ESP_OK) ip4addr_ntoa_r((const ip4_addr_t*)&ip.ip, ipbuf, sizeof(ipbuf));
-    cJSON_AddStringToObject(net, "ip", ipbuf);
-    cJSON_AddStringToObject(net, "status", ip.ip.addr ? "connected" : "disconnected");
+    if (!net) return;
+    if (network_status_append_json(net) != ESP_OK) {
+        cJSON_AddStringToObject(net, "status", "unknown");
+        return;
+    }
+    cJSON *eth = cJSON_GetObjectItemCaseSensitive(net, "ethernet");
+    cJSON *wifi = cJSON_GetObjectItemCaseSensitive(net, "wifi");
+    const char *active = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(net, "active_interface"));
+    const char *ip = "0.0.0.0";
+    const char *mac = "";
+    if (active && !strcmp(active, "ethernet") && eth) {
+        ip = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(eth, "ip"));
+        mac = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(eth, "mac"));
+    } else if (active && !strcmp(active, "wifi") && wifi) {
+        ip = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(wifi, "ip"));
+        mac = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(wifi, "mac"));
+    }
+    cJSON_AddStringToObject(net, "ip", ip ? ip : "0.0.0.0");
+    cJSON_AddStringToObject(net, "mac", mac ? mac : "");
+    cJSON_AddStringToObject(net, "status", (active && strcmp(active, "none")) ? "connected" : "disconnected");
 }
 
 esp_err_t system_info_append_json(cJSON *root)
