@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #include "notification_events.h"
 
@@ -84,9 +85,202 @@ typedef struct {
 static input_debounce_state_t s_digital_filters[INPUT_ZONES_COUNT];
 static input_debounce_state_t s_tamper_filter;
 static uint32_t s_filter_change_counter = 0;
+static input_digital_filter_config_t s_digital_filter_cfg = {
+    .fast_ms = INPUT_DIGITAL_FILTER_FAST_DEFAULT_MS,
+    .standard_ms = INPUT_DIGITAL_FILTER_STANDARD_DEFAULT_MS,
+    .protected_ms = INPUT_DIGITAL_FILTER_PROTECTED_DEFAULT_MS,
+};
+static zone_filter_profile_t s_zone_filter_profiles[INPUT_ZONES_COUNT];
+
+#define INPUT_DIGITAL_FILTERS_NVS_NS  "digfilter"
+#define INPUT_DIGITAL_FILTERS_NVS_KEY "cfg"
+#define INPUT_DIGITAL_FILTERS_VERSION 1u
+
+typedef struct {
+    uint32_t version;
+    input_digital_filter_config_t cfg;
+    uint8_t zone_profiles[INPUT_ZONES_COUNT];
+} input_digital_filters_nvs_t;
+
 #if ADS1115_COUNT > 0
 static input_analog_filter_state_t s_analog_filters[INPUT_ANALOG_ZONES_COUNT];
 #endif
+
+
+static bool input_digital_filter_profile_valid(zone_filter_profile_t profile)
+{
+    return profile == ZONE_FILTER_FAST || profile == ZONE_FILTER_STANDARD || profile == ZONE_FILTER_PROTECTED;
+}
+
+static input_digital_filter_config_t input_digital_filters_sanitized(input_digital_filter_config_t cfg)
+{
+    if (cfg.fast_ms < 10u || cfg.fast_ms > 1000u) {
+        cfg.fast_ms = INPUT_DIGITAL_FILTER_FAST_DEFAULT_MS;
+    }
+    if (cfg.standard_ms < 20u || cfg.standard_ms > 1000u) {
+        cfg.standard_ms = INPUT_DIGITAL_FILTER_STANDARD_DEFAULT_MS;
+    }
+    if (cfg.protected_ms < 50u || cfg.protected_ms > 1000u) {
+        cfg.protected_ms = INPUT_DIGITAL_FILTER_PROTECTED_DEFAULT_MS;
+    }
+    if (!(cfg.fast_ms <= cfg.standard_ms && cfg.standard_ms <= cfg.protected_ms)) {
+        cfg.fast_ms = INPUT_DIGITAL_FILTER_FAST_DEFAULT_MS;
+        cfg.standard_ms = INPUT_DIGITAL_FILTER_STANDARD_DEFAULT_MS;
+        cfg.protected_ms = INPUT_DIGITAL_FILTER_PROTECTED_DEFAULT_MS;
+    }
+    return cfg;
+}
+
+void inputs_digital_filters_load_defaults(void)
+{
+    s_digital_filter_cfg = (input_digital_filter_config_t) {
+        .fast_ms = INPUT_DIGITAL_FILTER_FAST_DEFAULT_MS,
+        .standard_ms = INPUT_DIGITAL_FILTER_STANDARD_DEFAULT_MS,
+        .protected_ms = INPUT_DIGITAL_FILTER_PROTECTED_DEFAULT_MS,
+    };
+    for (uint16_t i = 0; i < INPUT_ZONES_COUNT; ++i) {
+        s_zone_filter_profiles[i] = ZONE_FILTER_STANDARD;
+    }
+}
+
+esp_err_t inputs_digital_filters_load(void)
+{
+    inputs_digital_filters_load_defaults();
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(INPUT_DIGITAL_FILTERS_NVS_NS, NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    input_digital_filters_nvs_t stored = {0};
+    size_t len = sizeof(stored);
+    err = nvs_get_blob(h, INPUT_DIGITAL_FILTERS_NVS_KEY, &stored, &len);
+    nvs_close(h);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (len >= offsetof(input_digital_filters_nvs_t, zone_profiles)) {
+        s_digital_filter_cfg = input_digital_filters_sanitized(stored.cfg);
+    }
+    if (len >= sizeof(stored)) {
+        for (uint16_t i = 0; i < INPUT_ZONES_COUNT; ++i) {
+            zone_filter_profile_t profile = (zone_filter_profile_t)stored.zone_profiles[i];
+            s_zone_filter_profiles[i] = input_digital_filter_profile_valid(profile) ? profile : ZONE_FILTER_STANDARD;
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t inputs_digital_filters_save(void)
+{
+    input_digital_filters_nvs_t stored = {0};
+    stored.version = INPUT_DIGITAL_FILTERS_VERSION;
+    stored.cfg = input_digital_filters_sanitized(s_digital_filter_cfg);
+    for (uint16_t i = 0; i < INPUT_ZONES_COUNT; ++i) {
+        stored.zone_profiles[i] = (uint8_t)(input_digital_filter_profile_valid(s_zone_filter_profiles[i]) ?
+                                           s_zone_filter_profiles[i] : ZONE_FILTER_STANDARD);
+    }
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(INPUT_DIGITAL_FILTERS_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_blob(h, INPUT_DIGITAL_FILTERS_NVS_KEY, &stored, sizeof(stored));
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    return err;
+}
+
+input_digital_filter_config_t inputs_digital_filters_get_config(void)
+{
+    return input_digital_filters_sanitized(s_digital_filter_cfg);
+}
+
+esp_err_t inputs_digital_filters_set_config(const input_digital_filter_config_t* cfg, bool persist)
+{
+    if (!cfg) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    input_digital_filter_config_t checked = input_digital_filters_sanitized(*cfg);
+    if (checked.fast_ms != cfg->fast_ms || checked.standard_ms != cfg->standard_ms || checked.protected_ms != cfg->protected_ms) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_digital_filter_cfg = checked;
+    return persist ? inputs_digital_filters_save() : ESP_OK;
+}
+
+zone_filter_profile_t inputs_zone_filter_get(uint16_t zero_based_index)
+{
+    if (zero_based_index >= INPUT_ZONES_COUNT) {
+        return ZONE_FILTER_STANDARD;
+    }
+    zone_filter_profile_t profile = s_zone_filter_profiles[zero_based_index];
+    return input_digital_filter_profile_valid(profile) ? profile : ZONE_FILTER_STANDARD;
+}
+
+esp_err_t inputs_zone_filter_set(uint16_t zero_based_index, zone_filter_profile_t profile, bool persist)
+{
+    if (zero_based_index >= INPUT_ZONES_COUNT || !input_digital_filter_profile_valid(profile)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_zone_filter_profiles[zero_based_index] = profile;
+    return persist ? inputs_digital_filters_save() : ESP_OK;
+}
+
+uint32_t inputs_zone_filter_effective_ms(uint16_t zero_based_index)
+{
+    input_digital_filter_config_t cfg = inputs_digital_filters_get_config();
+    switch (inputs_zone_filter_get(zero_based_index)) {
+    case ZONE_FILTER_FAST:
+        return cfg.fast_ms;
+    case ZONE_FILTER_PROTECTED:
+        return cfg.protected_ms;
+    case ZONE_FILTER_STANDARD:
+    default:
+        return cfg.standard_ms;
+    }
+}
+
+const char* inputs_zone_filter_profile_name(zone_filter_profile_t profile)
+{
+    switch (profile) {
+    case ZONE_FILTER_FAST: return "fast";
+    case ZONE_FILTER_PROTECTED: return "protected";
+    case ZONE_FILTER_STANDARD:
+    default: return "standard";
+    }
+}
+
+bool inputs_zone_filter_profile_from_name(const char* name, zone_filter_profile_t* out_profile)
+{
+    if (!name || !out_profile) {
+        return false;
+    }
+    if (strcmp(name, "fast") == 0) {
+        *out_profile = ZONE_FILTER_FAST;
+        return true;
+    }
+    if (strcmp(name, "standard") == 0) {
+        *out_profile = ZONE_FILTER_STANDARD;
+        return true;
+    }
+    if (strcmp(name, "protected") == 0) {
+        *out_profile = ZONE_FILTER_PROTECTED;
+        return true;
+    }
+    return false;
+}
 
 static uint64_t input_now_ms(void)
 {
@@ -436,6 +630,11 @@ static esp_err_t read_ads_slot_channel_voltage(size_t slot,
 
 esp_err_t inputs_init(void)
 {
+    esp_err_t filter_err = inputs_digital_filters_load();
+    if (filter_err != ESP_OK) {
+        ESP_LOGW(TAG, "Digital filter config load failed: %s", esp_err_to_name(filter_err));
+    }
+
     esp_err_t e = mcp23017_init();
     if (e != ESP_OK) {
         ESP_LOGE(TAG, "MCP23017 init failed: %s", esp_err_to_name(e));
@@ -1251,7 +1450,7 @@ esp_err_t inputs_baseline_init(uint16_t gpioab, uint16_t zones_total)
     }
     for (uint16_t i = 0; i < INPUT_ZONES_COUNT; ++i) {
         bool raw = (i < limit) ? inputs_zone_bit(gpioab, (int)i + 1) : false;
-        input_filter_seed(&s_digital_filters[i], raw, INPUT_DIGITAL_DEBOUNCE_MS, now_ms);
+        input_filter_seed(&s_digital_filters[i], raw, inputs_zone_filter_effective_ms(i), now_ms);
     }
     input_filter_seed(&s_tamper_filter, inputs_tamper(gpioab), INPUT_TAMPER_DEBOUNCE_MS, now_ms);
 #if ADS1115_COUNT > 0
@@ -1279,7 +1478,7 @@ esp_err_t inputs_compose_debounced_mask(uint16_t gpioab, uint16_t zones_total, z
 
     for (uint16_t i = 0; i < master_limit; ++i) {
         bool raw = inputs_zone_bit(gpioab, (int)i + 1);
-        inputs_debounce_bool(&s_digital_filters[i], raw, false, INPUT_DIGITAL_DEBOUNCE_MS, now_ms);
+        inputs_debounce_bool(&s_digital_filters[i], raw, false, inputs_zone_filter_effective_ms(i), now_ms);
         if (s_digital_filters[i].stable_value) {
             zone_mask_set(out_mask, i);
         }
@@ -1414,7 +1613,7 @@ esp_err_t inputs_baseline_init(uint16_t gpioab, uint16_t zones_total)
     uint16_t limit = zones_total > INPUT_ZONES_COUNT ? INPUT_ZONES_COUNT : zones_total;
     for (uint16_t i = 0; i < INPUT_ZONES_COUNT; ++i) {
         bool raw = (i < limit) ? inputs_zone_bit(gpioab, (int)i + 1) : false;
-        input_filter_seed(&s_digital_filters[i], raw, INPUT_DIGITAL_DEBOUNCE_MS, now_ms);
+        input_filter_seed(&s_digital_filters[i], raw, inputs_zone_filter_effective_ms(i), now_ms);
     }
     input_filter_seed(&s_tamper_filter, inputs_tamper(gpioab), INPUT_TAMPER_DEBOUNCE_MS, now_ms);
     ESP_LOGI(TAG, "input baseline initialized (zones=%u, boot_settle_ms=%u)",
@@ -1433,7 +1632,7 @@ esp_err_t inputs_compose_debounced_mask(uint16_t gpioab, uint16_t zones_total, z
     zone_mask_clear(out_mask);
     uint16_t master_limit = zones_total > INPUT_ZONES_COUNT ? INPUT_ZONES_COUNT : zones_total;
     for (uint16_t i = 0; i < master_limit; ++i) {
-        inputs_debounce_bool(&s_digital_filters[i], inputs_zone_bit(gpioab, (int)i + 1), false, INPUT_DIGITAL_DEBOUNCE_MS, now_ms);
+        inputs_debounce_bool(&s_digital_filters[i], inputs_zone_bit(gpioab, (int)i + 1), false, inputs_zone_filter_effective_ms(i), now_ms);
         if (s_digital_filters[i].stable_value) zone_mask_set(out_mask, i);
     }
     inputs_debounce_bool(&s_tamper_filter, inputs_tamper(gpioab), false, INPUT_TAMPER_DEBOUNCE_MS, now_ms);

@@ -797,6 +797,28 @@ function buildZoneBadge(zone){
 }
 
 
+
+function isDigitalNormalZone(zone){
+  return zone && !zone.analog && !zone.is_global_tamper_input && (Number(zone.board) || 0) === 0;
+}
+
+function renderZoneFilterSelect(zone, filters = {}){
+  if (!isDigitalNormalZone(zone)) return '';
+  const selected = ['fast', 'standard', 'protected'].includes(zone?.filter_profile) ? zone.filter_profile : 'standard';
+  const ms = { fast: Number(filters.fast_ms) || 40, standard: Number(filters.standard_ms) || 80, protected: Number(filters.protected_ms) || 180 };
+  const opt = (value, label) => `<option value="${value}" ${selected === value ? 'selected' : ''}>${label} — ${ms[value]} ms</option>`;
+  return `
+      <label class="field" title="Rapido: per tapparelle o sensori interni; Standard: bilanciamento generico; Protetto: per cancelli esterni esposti al vento">
+        <span>Filtro anti-rimbalzo</span>
+        <select data-field="filter_profile">
+          ${opt('fast', 'Rapido')}
+          ${opt('standard', 'Standard')}
+          ${opt('protected', 'Protetto')}
+        </select>
+        <small class="muted">Rapido: tapparelle/interni · Standard: generico · Protetto: cancelli esposti</small>
+      </label>`;
+}
+
 function zoneRuntimeText(zone, offline = false){
   if (offline) return 'Offline';
   if (!zone) return '—';
@@ -854,7 +876,8 @@ function readZoneConfigFromModal(modal, fallbackBoard = 0){
     const delayInput = $('[data-field="zone_delay"]', card);
     const timeInput = $('[data-field="zone_time"]', card);
     const autoInput = $('[data-field="auto_exclude"]', card);
-    return {
+    const filterInput = $('[data-field="filter_profile"]', card);
+    const item = {
       id,
       name: nameInput?.value?.trim() || '',
       zone_delay: !!(delayInput && delayInput.checked),
@@ -862,6 +885,8 @@ function readZoneConfigFromModal(modal, fallbackBoard = 0){
       auto_exclude: !!(autoInput && autoInput.checked),
       board: Number.isFinite(cardBoardId) ? cardBoardId : fallbackBoard
     };
+    if (filterInput) item.filter_profile = filterInput.value || 'standard';
+    return item;
   }).filter(Boolean);
 }
 
@@ -877,10 +902,12 @@ function applyZoneConfigSnapshot(modal, snapshot){
     const delayInput = $('[data-field="zone_delay"]', card);
     const timeInput = $('[data-field="zone_time"]', card);
     const autoInput = $('[data-field="auto_exclude"]', card);
+    const filterInput = $('[data-field="filter_profile"]', card);
     if (nameInput) nameInput.value = item.name || '';
     if (delayInput) delayInput.checked = !!item.zone_delay;
     if (timeInput) timeInput.value = String(Math.max(0, Number.parseInt(item.zone_time ?? '0', 10) || 0));
     if (autoInput) autoInput.checked = !!item.auto_exclude;
+    if (filterInput) filterInput.value = item.filter_profile || 'standard';
   });
 }
 
@@ -1007,7 +1034,7 @@ async function refreshZones(){
   }
 }
 
-function renderZoneConfigCard(zone){
+function renderZoneConfigCard(zone, filters = {}){
   const id = Number(zone?.id);
   const boardId = Number(zone?.board);
   const nameValue = zone?.name ? escapeHtml(zone.name) : '';
@@ -1029,6 +1056,7 @@ function renderZoneConfigCard(zone){
         <label class="chk compact"><input type="checkbox" data-field="auto_exclude" ${autoChecked}> Autoesclusione se aperta</label>
       </div>
       <label class="field"><span>Tempo ritardo (s)</span><input type="number" min="0" max="600" step="1" data-field="zone_time" value="${safeTime}"></label>
+      ${renderZoneFilterSelect(zone, filters)}
     </div>
   `;
 }
@@ -1066,7 +1094,7 @@ async function openZonesConfig({ boardId = null } = {}){
     const zoneCount = escapeHtml(formatZoneCount(boardItems.length));
 
     const bodyHtml = boardItems.length
-      ? `<div class="zone-config-grid">${boardItems.map((zone) => renderZoneConfigCard(zone)).join('')}</div>`
+      ? `<div class="zone-config-grid">${boardItems.map((zone) => renderZoneConfigCard(zone, payload?.debounce_filters || {})).join('')}</div>`
       : '<div class="log-empty small">Nessuna zona configurabile per questa scheda.</div>';
 
     let closeModal = () => { clearModals(); };
@@ -1107,7 +1135,8 @@ async function openZonesConfig({ boardId = null } = {}){
       zone_delay: !!item?.zone_delay,
       zone_time: Math.max(0, Number.parseInt(item?.zone_time ?? '0', 10) || 0),
       auto_exclude: !!item?.auto_exclude,
-      board: Number.isFinite(Number(item?.board)) ? Number(item.board) : parsedBoard
+      board: Number.isFinite(Number(item?.board)) ? Number(item.board) : parsedBoard,
+      filter_profile: item?.filter_profile || 'standard'
     })).filter((item) => Number.isFinite(item.id));
     state.zonesConfigSnapshot = parsedItems;
     setZonesConfigDirty(false, modal);

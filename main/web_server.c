@@ -3764,6 +3764,22 @@ static void zone_board_label_copy(uint8_t board_id, char *out, size_t cap)
     }
 }
 
+
+static bool zone_entry_is_local_digital_normal(int idx, const zone_state_entry_t *entry)
+{
+    return idx >= 0 && idx < INPUT_ZONES_COUNT && entry && !entry->analog && entry->board == 0;
+}
+
+static void zone_add_filter_fields(cJSON *it, int idx, const zone_state_entry_t *entry)
+{
+    if (!it || !zone_entry_is_local_digital_normal(idx, entry)) {
+        return;
+    }
+    zone_filter_profile_t profile = inputs_zone_filter_get((uint16_t)idx);
+    cJSON_AddStringToObject(it, "filter_profile", inputs_zone_filter_profile_name(profile));
+    cJSON_AddNumberToObject(it, "debounce_ms", (double)inputs_zone_filter_effective_ms((uint16_t)idx));
+}
+
 static const char* zone_entry_display_name(int zone_index, const zone_state_entry_t *entry, char *out, size_t cap)
 {
     if (!out || cap == 0) {
@@ -5833,6 +5849,89 @@ static esp_err_t api_admin_analog_eol_post(httpd_req_t* req)
 }
 #endif
 
+
+static esp_err_t api_admin_filters_get(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+    input_digital_filter_config_t cfg = inputs_digital_filters_get_config();
+    cJSON *root = cJSON_CreateObject();
+    cJSON *filters = cJSON_CreateObject();
+    if (!root || !filters) {
+        if (root) cJSON_Delete(root);
+        if (filters) cJSON_Delete(filters);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "oom");
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddItemToObject(root, "debounce_filters", filters);
+    cJSON_AddNumberToObject(filters, "fast_ms", (double)cfg.fast_ms);
+    cJSON_AddNumberToObject(filters, "standard_ms", (double)cfg.standard_ms);
+    cJSON_AddNumberToObject(filters, "protected_ms", (double)cfg.protected_ms);
+    return json_reply_cjson(req, root);
+}
+
+static bool json_positive_u32(cJSON *obj, const char *name, uint32_t *out)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, name);
+    if (!cJSON_IsNumber(item) || item->valuedouble <= 0 || item->valuedouble > 1000 ||
+        item->valuedouble != (double)((uint32_t)item->valuedouble)) {
+        return false;
+    }
+    *out = (uint32_t)item->valuedouble;
+    return true;
+}
+
+static esp_err_t api_admin_filters_post(httpd_req_t* req)
+{
+    if (!check_bearer(req) || !is_admin_user(req)) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+        return ESP_FAIL;
+    }
+    char body[512];
+    size_t blen = 0;
+    if (read_body_to_buf(req, body, sizeof(body), &blen) != ESP_OK) {
+        httpd_resp_send_err(req, 400, "body");
+        return ESP_FAIL;
+    }
+    cJSON *json = cJSON_ParseWithLength(body, blen);
+    if (!json) {
+        httpd_resp_send_err(req, 400, "json");
+        return ESP_FAIL;
+    }
+    cJSON *filters = cJSON_GetObjectItemCaseSensitive(json, "debounce_filters");
+    if (!cJSON_IsObject(filters)) {
+        filters = json;
+    }
+
+    input_digital_filter_config_t cfg = {0};
+    if (!json_positive_u32(filters, "fast_ms", &cfg.fast_ms) ||
+        !json_positive_u32(filters, "standard_ms", &cfg.standard_ms) ||
+        !json_positive_u32(filters, "protected_ms", &cfg.protected_ms)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, 400, "numeric range 1..1000 required");
+        return ESP_FAIL;
+    }
+    if (cfg.fast_ms < 10u || cfg.standard_ms < 20u || cfg.protected_ms < 50u) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, 400, "minimums: fast 10, standard 20, protected 50");
+        return ESP_FAIL;
+    }
+    if (!(cfg.fast_ms <= cfg.standard_ms && cfg.standard_ms <= cfg.protected_ms)) {
+        cJSON_Delete(json);
+        httpd_resp_send_err(req, 400, "fast <= standard <= protected required");
+        return ESP_FAIL;
+    }
+    esp_err_t err = inputs_digital_filters_set_config(&cfg, true);
+    cJSON_Delete(json);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, 500, "nvs");
+        return ESP_FAIL;
+    }
+    return json_bool(req, true);
+}
+
 static esp_err_t zones_get(httpd_req_t* req){
     if(!check_bearer(req)) { httpd_resp_send_err(req, HTTPD_401_UNAUTHORIZED, "token"); return ESP_FAIL; }
     zones_snapshot_t snapshot;
@@ -5871,6 +5970,7 @@ static esp_err_t zones_get(httpd_req_t* req){
         cJSON_AddNumberToObject(it, "board", (double)entry->board);
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
         cJSON_AddBoolToObject(it, "analog", entry->analog);
+        zone_add_filter_fields(it, idx, entry);
         cJSON_AddBoolToObject(it, "tamper", entry->known ? entry->tamper : false);
         cJSON_AddBoolToObject(it, "fault", entry->known ? false : true);
         input_zone_filtered_state_t diag = {0};
@@ -6137,6 +6237,14 @@ static esp_err_t zones_config_get(httpd_req_t* req){
         return ESP_ERR_NO_MEM;
     }
     cJSON_AddItemToObject(root, "items", items);
+    input_digital_filter_config_t filter_cfg = inputs_digital_filters_get_config();
+    cJSON *filters = cJSON_CreateObject();
+    if (filters) {
+        cJSON_AddNumberToObject(filters, "fast_ms", (double)filter_cfg.fast_ms);
+        cJSON_AddNumberToObject(filters, "standard_ms", (double)filter_cfg.standard_ms);
+        cJSON_AddNumberToObject(filters, "protected_ms", (double)filter_cfg.protected_ms);
+        cJSON_AddItemToObject(root, "debounce_filters", filters);
+    }
 
     for (int idx = 0; idx < total; ++idx) {
         const int zone_id = idx + 1;
@@ -6155,6 +6263,7 @@ static esp_err_t zones_config_get(httpd_req_t* req){
         cJSON_AddNumberToObject(it, "board_input", (double)(entry->board_input + 1u));
         cJSON_AddBoolToObject(it, "board_online", entry->board_online);
         cJSON_AddBoolToObject(it, "analog", entry->analog);
+        zone_add_filter_fields(it, idx, entry);
         cJSON_AddBoolToObject(it, "supports_tamper", entry->analog && entry->analog_mode >= INPUT_ANALOG_EOL_2);
         cJSON_AddBoolToObject(it, "is_global_tamper_input", false);
 #if ADS1115_COUNT > 0
@@ -6186,6 +6295,10 @@ static esp_err_t zones_config_post(httpd_req_t* req){
     if(!json){ httpd_resp_send_err(req, 400, "json"); return ESP_FAIL; }
     cJSON *items = cJSON_GetObjectItemCaseSensitive(json, "items");
     if(!cJSON_IsArray(items)){ cJSON_Delete(json); httpd_resp_send_err(req, 400, "items"); return ESP_FAIL; }
+    zones_snapshot_t snapshot;
+    zones_snapshot_build(&snapshot);
+    const int snapshot_total = zones_snapshot_total(&snapshot);
+
     cJSON *it = NULL;
     cJSON_ArrayForEach(it, items){
         cJSON *jid = cJSON_GetObjectItemCaseSensitive(it, "id");
@@ -6245,10 +6358,40 @@ static esp_err_t zones_config_post(httpd_req_t* req){
 
         c->zone_delay = z_delay;
         c->zone_time  = z_time;
+
+        jn = cJSON_GetObjectItemCaseSensitive(it, "filter_profile");
+        if (jn) {
+            const int idx = id - 1;
+            bool digital_normal = idx >= 0 && idx < snapshot_total &&
+                                  zone_entry_is_local_digital_normal(idx, &snapshot.entries[idx]);
+            if (!digital_normal) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, 400, "filter_profile not allowed for this zone");
+                return ESP_FAIL;
+            }
+            if (!cJSON_IsString(jn)) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, 400, "filter_profile");
+                return ESP_FAIL;
+            }
+            zone_filter_profile_t profile = ZONE_FILTER_STANDARD;
+            if (!inputs_zone_filter_profile_from_name(jn->valuestring, &profile)) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, 400, "filter_profile");
+                return ESP_FAIL;
+            }
+            if (inputs_zone_filter_set((uint16_t)idx, profile, false) != ESP_OK) {
+                cJSON_Delete(json);
+                httpd_resp_send_err(req, 400, "filter_profile");
+                return ESP_FAIL;
+            }
+        }
+
         s_zone_board_map[id-1] = board;
     }
     cJSON_Delete(json);
     zones_save_to_nvs();
+    inputs_digital_filters_save();
     return json_bool(req, true);
 }
 
@@ -6415,6 +6558,8 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/admin/notifications", .method = HTTP_GET, .handler = api_admin_notifications_get },
     { .uri = "/api/admin/notifications", .method = HTTP_POST, .handler = api_admin_notifications_post },
     { .uri = "/api/admin/notifications/test", .method = HTTP_POST, .handler = api_admin_notifications_test_post },
+    { .uri = "/api/admin/filters", .method = HTTP_GET, .handler = api_admin_filters_get },
+    { .uri = "/api/admin/filters", .method = HTTP_POST, .handler = api_admin_filters_post },
     { .uri = "/api/admin/ads1115", .method = HTTP_GET, .handler = api_admin_ads1115_get },
     { .uri = "/api/admin/ads1115", .method = HTTP_POST, .handler = api_admin_ads1115_post },
     { .uri = "/api/admin/ads1115/scan", .method = HTTP_POST, .handler = api_admin_ads1115_scan_post },

@@ -151,6 +151,25 @@
           
           <!-- GENERALI -->
           <section id="view-general" class="view">
+
+            <div class="card">
+              <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap;">
+                <h3>Filtri anti-rimbalzo zone digitali</h3>
+                <div class="row" style="gap:.5rem;flex-wrap:wrap;">
+                  <button class="btn secondary" id="digitalFiltersReloadBtn" type="button">Aggiorna</button>
+                  <button class="btn primary" id="digitalFiltersSaveBtn" type="button">Salva filtri</button>
+                </div>
+              </div>
+              <p class="muted">Valori globali usati solo dalle zone digitali locali normali. Analogico, EOL e tamper generale mantengono la logica dedicata.</p>
+              <div class="row" style="gap:1rem;flex-wrap:wrap;align-items:flex-start;">
+                <label class="field"><span>Filtro rapido ms</span><input id="filterFastMs" type="number" min="10" max="1000" step="1" placeholder="40" /></label>
+                <label class="field"><span>Filtro standard ms</span><input id="filterStandardMs" type="number" min="20" max="1000" step="1" placeholder="80" /></label>
+                <label class="field"><span>Filtro protetto ms</span><input id="filterProtectedMs" type="number" min="50" max="1000" step="1" placeholder="180" /></label>
+              </div>
+              <small class="muted">Consigliato: rapido ≤ standard ≤ protetto. Default: Rapido 40 ms, Standard 80 ms, Protetto 180 ms.</small>
+              <div id="digitalFiltersStatus" class="status-line muted">Caricamento…</div>
+            </div>
+            
             <div class="card">
               <div class="row" style="justify-content:space-between;align-items:center;gap:.5rem;flex-wrap:wrap;">
                 <h3>Impostazioni ingressi analogici</h3>

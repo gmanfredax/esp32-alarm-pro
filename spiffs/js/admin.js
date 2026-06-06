@@ -289,7 +289,7 @@
         }
         if (id !== "view-mqtt") maskMqttPassword();
         if (id === "view-diagnostics") maybeAutoRefreshAdsDiag();
-        if (id === "view-general") loadAnalogEolConfig();
+        if (id === "view-general") { loadAnalogEolConfig(); loadDigitalFilters().catch(()=>{}); }
       });
     });
   }
@@ -2431,6 +2431,75 @@
     }
   }
 
+
+  function digitalFiltersStatus(text, isError = false){
+    const el = $("#digitalFiltersStatus");
+    if (!el) return;
+    el.textContent = text || "";
+    el.classList.toggle("error", !!isError);
+    el.classList.toggle("muted", !isError);
+  }
+
+  function readDigitalFiltersForm(){
+    const fast = Number.parseInt($("#filterFastMs")?.value ?? "", 10);
+    const standard = Number.parseInt($("#filterStandardMs")?.value ?? "", 10);
+    const protectedMs = Number.parseInt($("#filterProtectedMs")?.value ?? "", 10);
+    if (!Number.isFinite(fast) || !Number.isFinite(standard) || !Number.isFinite(protectedMs)) {
+      throw new Error("Inserisci valori numerici interi per tutti i filtri.");
+    }
+    if (fast < 10 || standard < 20 || protectedMs < 50) {
+      throw new Error("Minimi: rapido 10 ms, standard 20 ms, protetto 50 ms.");
+    }
+    if (fast > 1000 || standard > 1000 || protectedMs > 1000) {
+      throw new Error("Il massimo consigliato/accettato è 1000 ms.");
+    }
+    if (!(fast <= standard && standard <= protectedMs)) {
+      throw new Error("Rispetta l'ordine rapido ≤ standard ≤ protetto.");
+    }
+    return { fast_ms: fast, standard_ms: standard, protected_ms: protectedMs };
+  }
+
+  function fillDigitalFiltersForm(filters){
+    if ($("#filterFastMs")) $("#filterFastMs").value = String(filters?.fast_ms ?? 40);
+    if ($("#filterStandardMs")) $("#filterStandardMs").value = String(filters?.standard_ms ?? 80);
+    if ($("#filterProtectedMs")) $("#filterProtectedMs").value = String(filters?.protected_ms ?? 180);
+  }
+
+  async function loadDigitalFilters(){
+    try{
+      digitalFiltersStatus("Caricamento…");
+      const data = await apiGet("/api/admin/filters");
+      fillDigitalFiltersForm(data?.debounce_filters || data || {});
+      digitalFiltersStatus("Filtri caricati.");
+      return data;
+    }catch(err){
+      digitalFiltersStatus("Errore caricando filtri: " + err.message, true);
+      throw err;
+    }
+  }
+
+  function setupDigitalFiltersSection(){
+    const reloadBtn = $("#digitalFiltersReloadBtn");
+    const saveBtn = $("#digitalFiltersSaveBtn");
+    reloadBtn?.addEventListener("click", () => { loadDigitalFilters().catch(()=>{}); });
+    saveBtn?.addEventListener("click", async () => {
+      try{
+        const filters = readDigitalFiltersForm();
+        saveBtn.disabled = true;
+        digitalFiltersStatus("Salvataggio…");
+        await apiPost("/api/admin/filters", { debounce_filters: filters });
+        digitalFiltersStatus("Filtri salvati.");
+        toast("Filtri digitali salvati");
+      }catch(err){
+        digitalFiltersStatus(err.message || "Errore durante il salvataggio filtri.", true);
+        toast(err.message || "Errore filtri", false);
+      }finally{
+        saveBtn.disabled = false;
+      }
+    });
+    return loadDigitalFilters().catch(()=>{});
+  }
+
   // ---- Wrapper come da tua init() originale
   async function setupNetMqttForms(){
     await Promise.all([loadNetwork(), loadMqtt()]);
@@ -2554,6 +2623,7 @@
     const setupPromises = [
       setupAdsDiagnostics(),
       setupAnalogGeneralSection(),
+      setupDigitalFiltersSection(),
       setupSystemSection(),
       setupNetMqttForms(),
       setupNotificationsSection(),

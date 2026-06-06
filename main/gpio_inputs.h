@@ -55,6 +55,23 @@
 #ifndef INPUT_ANALOG_HYSTERESIS_MV
 #define INPUT_ANALOG_HYSTERESIS_MV 75u
 #endif
+
+#define INPUT_DIGITAL_FILTER_FAST_DEFAULT_MS      40u
+#define INPUT_DIGITAL_FILTER_STANDARD_DEFAULT_MS  80u
+#define INPUT_DIGITAL_FILTER_PROTECTED_DEFAULT_MS 180u
+
+typedef enum {
+    ZONE_FILTER_FAST = 0,
+    ZONE_FILTER_STANDARD = 1,
+    ZONE_FILTER_PROTECTED = 2,
+} zone_filter_profile_t;
+
+typedef struct {
+    uint32_t fast_ms;
+    uint32_t standard_ms;
+    uint32_t protected_ms;
+} input_digital_filter_config_t;
+
 #ifndef INPUT_BOOT_SETTLE_MS
 #define INPUT_BOOT_SETTLE_MS 1000u
 #endif
@@ -95,6 +112,17 @@ esp_err_t inputs_compose_debounced_mask(uint16_t gpioab, uint16_t zones_total, z
 bool inputs_get_filtered_zone_state(uint16_t zero_based_index, input_zone_filtered_state_t* out_state);
 bool inputs_get_filtered_tamper(input_debounce_state_t* out_state);
 uint32_t inputs_filter_change_counter(void);
+
+void inputs_digital_filters_load_defaults(void);
+esp_err_t inputs_digital_filters_load(void);
+esp_err_t inputs_digital_filters_save(void);
+input_digital_filter_config_t inputs_digital_filters_get_config(void);
+esp_err_t inputs_digital_filters_set_config(const input_digital_filter_config_t* cfg, bool persist);
+zone_filter_profile_t inputs_zone_filter_get(uint16_t zero_based_index);
+esp_err_t inputs_zone_filter_set(uint16_t zero_based_index, zone_filter_profile_t profile, bool persist);
+uint32_t inputs_zone_filter_effective_ms(uint16_t zero_based_index);
+const char* inputs_zone_filter_profile_name(zone_filter_profile_t profile);
+bool inputs_zone_filter_profile_from_name(const char* name, zone_filter_profile_t* out_profile);
 
 
 /**
