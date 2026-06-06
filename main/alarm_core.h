@@ -57,6 +57,7 @@ alarm_state_t  alarm_get_state(void);
 
 // Stato temporaneo (ritardi in corso)
 bool           alarm_exit_pending(uint32_t* remain_ms);     // true se finestra uscita attiva
+uint32_t       alarm_exit_duration_ms(void);                // durata configurata della finestra uscita attiva
 bool           alarm_entry_pending(int* zone_1_based, uint32_t* remain_ms); // true se ritardo ingresso attivo
 
 void           alarm_set_profile(alarm_state_t st, profile_t p);

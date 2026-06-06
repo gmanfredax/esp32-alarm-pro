@@ -5146,6 +5146,11 @@ static esp_err_t status_get(httpd_req_t* req){
     zone_mask_to_hex(&bypass_mask, (uint16_t)zones_total, bypass_hex, sizeof(bypass_hex));
     cJSON_AddNumberToObject(root, "bypass_mask", (double)zone_mask_to_u32(&bypass_mask));
     cJSON_AddStringToObject(root, "bypass_mask_hex", bypass_hex);
+    cJSON_AddBoolToObject(root, "arming", exit_p);
+    cJSON_AddStringToObject(root, "active_mode", alarm_active_mode());
+    cJSON_AddStringToObject(root, "target_mode", exit_p ? alarm_active_mode() : "");
+    cJSON_AddNumberToObject(root, "exit_delay_s", (double)((alarm_exit_duration_ms() + 999u) / 1000u));
+    cJSON_AddNumberToObject(root, "exit_delay_remaining_s", (double)((exit_ms + 999u) / 1000u));
     cJSON_AddNumberToObject(root, "exit_pending_ms", (unsigned)exit_ms);
     cJSON_AddNumberToObject(root, "entry_pending_ms", (unsigned)entry_ms);
     cJSON_AddNumberToObject(root, "entry_zone", entry_zone);

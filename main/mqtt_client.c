@@ -512,7 +512,9 @@ esp_err_t mqtt_publish_state(void)
     const char *active_scenario_id = active_mode_to_scenario_id(active_mode);
     const char *alarm_cause = alarm_last_alarm_cause();
     bool arming = exit_pending;
-    uint32_t exit_delay_s = (exit_ms + 999u) / 1000u;
+    uint32_t exit_total_ms = alarm_exit_duration_ms();
+    uint32_t exit_delay_s = (exit_total_ms + 999u) / 1000u;
+    uint32_t exit_remaining_s = (exit_ms + 999u) / 1000u;
     uint32_t entry_delay_s = (entry_ms + 999u) / 1000u;
     char ts[32];
     iso_timestamp_now(ts, sizeof(ts));
@@ -520,10 +522,12 @@ esp_err_t mqtt_publish_state(void)
     cJSON_AddStringToObject(root, "state", ha_state);
     cJSON_AddStringToObject(root, "core_state", state_name);
     cJSON_AddStringToObject(root, "active_mode", active_mode);
+    cJSON_AddStringToObject(root, "target_mode", arming ? active_mode : "");
     cJSON_AddStringToObject(root, "active_scenario", active_mode);
     cJSON_AddStringToObject(root, "active_scenario_id", active_scenario_id);
     cJSON_AddBoolToObject(root, "arming", arming);
     cJSON_AddNumberToObject(root, "exit_delay_s", (double)exit_delay_s);
+    cJSON_AddNumberToObject(root, "exit_delay_remaining_s", (double)exit_remaining_s);
     cJSON_AddNumberToObject(root, "entry_delay_s", (double)entry_delay_s);
     cJSON_AddStringToObject(root, "alarm_cause", alarm_cause ? alarm_cause : "none");
     cJSON_AddBoolToObject(root, "global_tamper", global_tamper);
@@ -814,7 +818,7 @@ esp_err_t mqtt_publish_discovery(void)
     snprintf(topic, sizeof(topic), "%s/alarm_control_panel/%s/panel/config", s_discovery_prefix, s_device_id);
     cJSON *root = cJSON_CreateObject();
     if (!root) return ESP_ERR_NO_MEM;
-    cJSON_AddStringToObject(root, "name", "NS Alarm Pro");
+    cJSON_AddStringToObject(root, "name", "Stato");
     cJSON_AddStringToObject(root, "unique_id", s_device_id);
     cJSON_AddStringToObject(root, "state_topic", s_topic_alarm_state);
     cJSON_AddStringToObject(root, "command_topic", s_topic_alarm_cmd);

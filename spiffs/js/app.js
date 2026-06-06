@@ -649,6 +649,11 @@ function renderAlarmState(el, status, { iconHTML = '' } = {}){
   if (stateName === 'PRE_DISARM' && Number.isInteger(status.entry_zone)) {
     label += ` (Z${status.entry_zone})`;
   }
+  const exitRemain = Number(status.exit_delay_remaining_s || Math.ceil((Number(status.exit_pending_ms) || 0) / 1000));
+  if (stateName === 'PRE_ARM' && exitRemain > 0) {
+    const target = status.target_mode || status.active_mode || '';
+    label += ` ${target ? target + ' ' : ''}(${exitRemain}s)`;
+  }
   if (!isPre) {
     el.innerHTML = `${iconHTML} ${escapeHtml(label)}`;
     return;

@@ -147,6 +147,7 @@ static void audit_tamper_alarm_event(const char *prev_state_label)
 
 static uint64_t      s_entry_deadline_us = 0;
 static int           s_entry_zone        = -1;   // indice 0-based di una zona coinvolta
+static uint32_t      s_exit_duration_ms  = 0;    // durata configurata dell'ultima finestra di uscita
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Inizializzazione e profili
@@ -157,6 +158,7 @@ void alarm_init(void)
     s_active_mode = ALARM_DISARMED;
     zone_mask_clear(&s_bypass_mask);
     s_exit_deadline_us = 0;
+    s_exit_duration_ms = 0;
     s_entry_pending = false;
     s_entry_deadline_us = 0;
     s_entry_zone = -1;
@@ -178,7 +180,7 @@ void alarm_init(void)
     profiles[ALARM_ARMED_AWAY]  = (profile_t){ .active_mask = ALL,  .entry_delay_ms = 30000, .exit_delay_ms = 30000 };
     profiles[ALARM_ARMED_HOME]  = (profile_t){ .active_mask = ALL,  .entry_delay_ms =  1500, .exit_delay_ms =  1500 };
     profiles[ALARM_ARMED_NIGHT] = (profile_t){ .active_mask = ALL,  .entry_delay_ms =  1500, .exit_delay_ms =  1500 };
-    profiles[ALARM_ARMED_CUSTOM]= (profile_t){ .active_mask = ALL,  .entry_delay_ms =     0, .exit_delay_ms =     0 };
+    profiles[ALARM_ARMED_CUSTOM]= (profile_t){ .active_mask = ALL,  .entry_delay_ms =  1500, .exit_delay_ms =  1500 };
 
     profiles[ALARM_DISARMED]    = (profile_t){ .active_mask = NONE, .entry_delay_ms =     0, .exit_delay_ms =     0 };
     profiles[ALARM_ALARM]       = (profile_t){ .active_mask = NONE, .entry_delay_ms =     0, .exit_delay_ms =     0 };
@@ -252,6 +254,13 @@ bool alarm_exit_pending(uint32_t* remain_ms){
     if (remain_ms) *remain_ms = ms;
     return true;
 }
+uint32_t alarm_exit_duration_ms(void)
+{
+    if (s_exit_deadline_us == 0) return 0;
+    if ((uint64_t)esp_timer_get_time() >= s_exit_deadline_us) return 0;
+    return s_exit_duration_ms;
+}
+
 bool alarm_entry_pending(int* zone_1_based, uint32_t* remain_ms){
     if (!s_entry_pending){ if (remain_ms) *remain_ms = 0; if(zone_1_based) *zone_1_based=-1; return false; }
     uint64_t now = esp_timer_get_time();
@@ -294,10 +303,12 @@ void alarm_begin_exit(uint32_t duration_ms)
 {
     if (duration_ms == 0) {
         s_exit_deadline_us = 0;
+        s_exit_duration_ms = 0;
         return;
     }
     const uint64_t now = esp_timer_get_time();
     s_exit_deadline_us = now + ((uint64_t)duration_ms) * 1000ULL;
+    s_exit_duration_ms = duration_ms;
     ESP_LOGI(TAG, "Exit delay avviato: %u ms", (unsigned)duration_ms);
     mqtt_publish_state_async();
 }
@@ -382,6 +393,7 @@ void alarm_disarm(void)
     // Reset stato dinamico della sessione
     zone_mask_clear(&s_bypass_mask);
     s_exit_deadline_us = 0;
+    s_exit_duration_ms = 0;
     s_entry_pending = false;
     s_entry_deadline_us = 0;
     s_entry_zone = -1;
@@ -496,6 +508,7 @@ void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask
         const bool in_exit = (exit_was_active && now < s_exit_deadline_us);
         if (exit_was_active && !in_exit && !s_exit_unified) {
             s_exit_deadline_us = 0;
+            s_exit_duration_ms = 0;
             ESP_LOGI(TAG, "Exit delay terminato: stato armato finale pubblicato");
             mqtt_publish_state_async();
         }
@@ -525,6 +538,7 @@ void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask
                 // tutte richiuse prima della scadenza: fine exit e pubblicazione stato finale.
                 s_exit_unified = false;
                 s_exit_deadline_us = 0;
+                s_exit_duration_ms = 0;
                 zone_mask_clear(&s_exit_guard_mask);
                 mqtt_publish_state_async();
                 // prosegui (stato rimane armato)
