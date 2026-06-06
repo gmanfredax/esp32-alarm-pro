@@ -336,7 +336,8 @@ static esp_err_t setup_ap_start_locked(const char *reason)
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
     if (!has_real_link_locked()) set_active_locked(NETWORK_IF_SETUP_AP);
     if (!already) {
-        ESP_LOGW(TAG, "AP fallback attivo: SSID=%s IP=%s motivo=%s", s_net.setup_ap_ssid, s_net.setup_ap_ip, reason ? reason : "fallback");
+        ESP_LOGW(TAG, "Fallback AP attivo: SSID=%s IP=%s motivo=%s", s_net.setup_ap_ssid, s_net.setup_ap_ip, reason ? reason : "fallback");
+        ESP_LOGW(TAG, "MQTT sospeso: AP setup senza connettività broker");
     }
     return ESP_OK;
 }
@@ -429,12 +430,14 @@ static void network_eth_event_handler(void *arg, esp_event_base_t base, int32_t 
 {
     (void)arg; (void)base; (void)data;
     if (!s_net.lock) return;
+    bool stop_mqtt = false;
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
     if (id == ETHERNET_EVENT_CONNECTED) {
         s_net.eth_link_up = true;
         ESP_LOGI(TAG, "Ethernet link up");
         set_error_locked("");
     } else if (id == ETHERNET_EVENT_DISCONNECTED || id == ETHERNET_EVENT_STOP) {
+        bool was_active = s_net.active_if == NETWORK_IF_ETHERNET || s_net.eth_has_ip;
         s_net.eth_link_up = false;
         s_net.eth_has_ip = false;
         s_net.eth_ip[0] = '\0';
@@ -443,14 +446,20 @@ static void network_eth_event_handler(void *arg, esp_event_base_t base, int32_t 
             s_net.wifi_runtime_desired = true;
         }
         if (s_net.active_if == NETWORK_IF_ETHERNET) set_active_locked(NETWORK_IF_NONE);
+        stop_mqtt = was_active && !has_real_link_locked();
     }
     xSemaphoreGive(s_net.lock);
+    if (stop_mqtt) {
+        ESP_LOGW(TAG, "MQTT sospeso: connettività IP persa");
+        mqtt_stop();
+    }
 }
 
 static void network_ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base;
     if (!s_net.lock || !data) return;
+    bool start_mqtt = false;
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
     if (id == IP_EVENT_ETH_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
@@ -463,6 +472,7 @@ static void network_ip_event_handler(void *arg, esp_event_base_t base, int32_t i
             set_active_locked(NETWORK_IF_ETHERNET);
             if (s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED && s_net.wifi_sta_started) wifi_stop_sta_locked();
         }
+        start_mqtt = has_real_link_locked();
     } else if (id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         s_net.wifi_has_ip = true;
@@ -478,14 +488,20 @@ static void network_ip_event_handler(void *arg, esp_event_base_t base, int32_t i
             (s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED && !s_net.eth_has_ip)) {
             set_active_locked(NETWORK_IF_WIFI);
         }
+        start_mqtt = has_real_link_locked();
     }
     xSemaphoreGive(s_net.lock);
+    if (start_mqtt) {
+        esp_err_t err = mqtt_reload_config();
+        if (err != ESP_OK) ESP_LOGW(TAG, "MQTT non avviato dopo IP: %s", esp_err_to_name(err));
+    }
 }
 
 static void network_wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)data;
     if (!s_net.lock) return;
+    bool stop_mqtt = false;
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
     if (id == WIFI_EVENT_STA_START) {
         s_net.wifi_sta_started = true;
@@ -493,6 +509,7 @@ static void network_wifi_event_handler(void *arg, esp_event_base_t base, int32_t
         s_net.wifi_connected = true;
         set_error_locked("");
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        bool was_active = s_net.active_if == NETWORK_IF_WIFI || s_net.wifi_has_ip;
         s_net.wifi_failures++;
         ESP_LOGW(TAG, "Wi-Fi disconnesso (tentativo fallito %lu/%u)", (unsigned long)s_net.wifi_failures, NETWORK_WIFI_MAX_ATTEMPTS);
         s_net.wifi_connected = false;
@@ -500,12 +517,19 @@ static void network_wifi_event_handler(void *arg, esp_event_base_t base, int32_t
         s_net.wifi_ip[0] = '\0';
         set_error_locked("wifi_disconnected");
         if (s_net.active_if == NETWORK_IF_WIFI) set_active_locked(NETWORK_IF_NONE);
+        stop_mqtt = was_active && !has_real_link_locked();
     } else if (id == WIFI_EVENT_STA_STOP) {
+        bool was_active = s_net.active_if == NETWORK_IF_WIFI || s_net.wifi_has_ip;
         s_net.wifi_sta_started = false;
         s_net.wifi_connected = false;
         s_net.wifi_has_ip = false;
+        stop_mqtt = was_active && !has_real_link_locked();
     }
     xSemaphoreGive(s_net.lock);
+    if (stop_mqtt) {
+        ESP_LOGW(TAG, "MQTT sospeso: connettività IP persa");
+        mqtt_stop();
+    }
 }
 
 static void manager_loop(void *arg)
@@ -726,6 +750,24 @@ esp_err_t network_status_append_json(cJSON *root)
     cJSON_AddStringToObject(ap, "ssid", st.setup_ap_ssid);
     cJSON_AddStringToObject(ap, "ip", st.setup_ap_ip);
     cJSON_AddBoolToObject(ap, "password_set", st.fallback_ap_password_set);
+
+    cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
+    bool real_connectivity = st.ethernet_has_ip || st.wifi_has_ip ||
+                             st.active_if == NETWORK_IF_ETHERNET || st.active_if == NETWORK_IF_WIFI;
+    cJSON_AddBoolToObject(mqtt, "connected", mqtt_is_connected());
+    if (mqtt_is_connected()) {
+        cJSON_AddStringToObject(mqtt, "status", "connected");
+        cJSON_AddStringToObject(mqtt, "reason", "broker_connected");
+    } else if (!real_connectivity && st.setup_ap_active) {
+        cJSON_AddStringToObject(mqtt, "status", "suspended");
+        cJSON_AddStringToObject(mqtt, "reason", "ap_setup_no_broker_connectivity");
+    } else if (!real_connectivity) {
+        cJSON_AddStringToObject(mqtt, "status", "suspended");
+        cJSON_AddStringToObject(mqtt, "reason", "network_not_ready");
+    } else {
+        cJSON_AddStringToObject(mqtt, "status", "disconnected");
+        cJSON_AddStringToObject(mqtt, "reason", "broker_disconnected_or_retrying");
+    }
     return ESP_OK;
 }
 

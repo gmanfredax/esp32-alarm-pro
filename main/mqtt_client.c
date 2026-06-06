@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "esp_eth.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "mqtt_client.h"
@@ -1316,6 +1317,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 // ─────────────────────────────────────────────────────────────────────────────
 esp_err_t mqtt_start(void)
 {
+    static int64_t s_last_deferred_log_us = 0;
     if (s_client) return ESP_OK;
 
     if (!s_config_initialized) {
@@ -1326,7 +1328,11 @@ esp_err_t mqtt_start(void)
         return ESP_OK;
     }
     if (!network_has_real_connectivity()) {
-        ESP_LOGW(TAG, "MQTT sospeso: nessuna connettività reale (eventuale solo AP setup)");
+        int64_t now = esp_timer_get_time();
+        if (s_last_deferred_log_us == 0 || (now - s_last_deferred_log_us) >= 30000000LL) {
+            ESP_LOGW(TAG, "MQTT sospeso: nessuna connettività reale (eventuale solo AP setup)");
+            s_last_deferred_log_us = now;
+        }
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -1369,10 +1375,22 @@ esp_err_t mqtt_start(void)
     s_client = esp_mqtt_client_init(&cfg);
     ESP_RETURN_ON_FALSE(s_client != NULL, ESP_ERR_NO_MEM, TAG, "mqtt init");
 
-    ESP_RETURN_ON_ERROR(esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL),
-                        TAG, "register evt");
+    esp_err_t err = esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT register evt failed: %s", esp_err_to_name(err));
+        esp_mqtt_client_destroy(s_client);
+        s_client = NULL;
+        return err;
+    }
 
-    ESP_RETURN_ON_ERROR(esp_mqtt_client_start(s_client), TAG, "start");
+    err = esp_mqtt_client_start(s_client);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "MQTT start failed: %s", esp_err_to_name(err));
+        esp_mqtt_client_destroy(s_client);
+        s_client = NULL;
+        s_connected = false;
+        return err;
+    }
     ESP_LOGI(TAG, "MQTT client started (device_id=%s)", s_device_id);
 
     return ESP_OK;

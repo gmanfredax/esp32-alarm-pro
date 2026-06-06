@@ -20,6 +20,7 @@
 #include "esp_netif.h"
 #include "esp_intr_alloc.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 // #include "driver/twai.h"
@@ -1608,10 +1609,13 @@ static void system_main_task(void *arg)
     }
     ESP_ERROR_CHECK(system_info_init());
     ESP_ERROR_CHECK(notification_events_init());
-    ESP_ERROR_CHECK(mqtt_start());
     esp_err_t mqtt_err = mqtt_start();
-    if (mqtt_err != ESP_OK) {
-        ESP_LOGW(TAG, "MQTT non avviato ora: %s", esp_err_to_name(mqtt_err));
+    if (mqtt_err == ESP_OK) {
+        ESP_LOGI(TAG, "MQTT avviato o inizializzazione differita completata");
+    } else if (mqtt_err == ESP_ERR_INVALID_STATE || mqtt_err == ESP_ERR_TIMEOUT || mqtt_err == ESP_ERR_WIFI_NOT_CONNECT) {
+        ESP_LOGW(TAG, "MQTT non avviato: rete non pronta o solo AP setup");
+    } else {
+        ESP_LOGW(TAG, "MQTT non avviato: %s", esp_err_to_name(mqtt_err));
     }
     notification_events_emit_simple("system_boot", NOTIFY_SEVERITY_INFO, "system", -1, "Avvio sistema", "Firmware avviato", false);
 
