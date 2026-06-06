@@ -1,5 +1,5 @@
 # Colleziona tutti i .c nella cartella main (comodo se aggiungi file spesso)
-#file(GLOB MAIN_SRCS "network_manager.c" "ethernet.c" "scenes.c" "system_info.c" "notification_events.c" "i2c_bus.c" "ads1115.c" "gpio_inputs.c" "main.c" "mqtt_client.c" "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
+#file(GLOB MAIN_SRCS "system_time.c" "network_manager.c" "ethernet.c" "scenes.c" "system_info.c" "notification_events.c" "i2c_bus.c" "ads1115.c" "gpio_inputs.c" "main.c" "mqtt_client.c" "userdb.c" "totp.c" "pn532_spi.c" "auth.c" "alarm_core.c" "web_server.c" "*.c")
 file(GLOB MAIN_SRCS "*.c")
 
 #set(MAIN_EMBED_TXTFILES

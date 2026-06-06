@@ -19,11 +19,19 @@ const passInput = document.getElementById('password');
 const otpField = document.getElementById('otpField');
 const otpInput = document.getElementById('otp');
 const submitBtn = document.getElementById('loginSubmit');
+const recoveryField = document.getElementById('recoveryField');
+const recoveryInput = document.getElementById('recoveryCode');
+const fallbackActions = document.getElementById('fallbackActions');
+const btnSetupLimited = document.getElementById('btnSetupLimited');
+const btnBrowserTime = document.getElementById('btnBrowserTime');
+const btnUseRecovery = document.getElementById('btnUseRecovery');
 const messageEl = document.getElementById('loginMessage');
 const footYear = document.getElementById('footYear');
 
 let otpRequired = false;
 let pendingRequest = false;
+let recoveryMode = false;
+let setupLimitedMode = false;
 let lanSystemLocked = false;
 
 if (footYear) footYear.textContent = String(new Date().getFullYear());
@@ -149,7 +157,7 @@ function setMessage(text, type = 'error'){
 }
 
 function setDisabled(disabled){
-  [userInput, passInput, otpInput, submitBtn].forEach((el) => {
+  [userInput, passInput, otpInput, recoveryInput, submitBtn, btnSetupLimited, btnBrowserTime, btnUseRecovery].forEach((el) => {
     if (el) el.disabled = disabled;
   });
   if (systemInput) {
@@ -161,6 +169,28 @@ function setDisabled(disabled){
   if (submitBtn) submitBtn.textContent = disabled ? 'Attendere…' : 'Accedi';
 }
 
+function hideFallbackChoices(){
+  if (fallbackActions) fallbackActions.classList.add('hidden');
+}
+
+function showRecoveryField(){
+  recoveryMode = true;
+  setupLimitedMode = false;
+  if (recoveryField) recoveryField.classList.remove('hidden');
+  if (recoveryInput) { recoveryInput.required = true; recoveryInput.focus(); }
+  if (otpField) otpField.classList.add('hidden');
+  setMessage('Inserisci un codice di recupero monouso.');
+}
+
+function showTimeInvalidFallback(message){
+  otpRequired = false;
+  recoveryMode = false;
+  setupLimitedMode = false;
+  if (otpField) otpField.classList.add('hidden');
+  if (fallbackActions) fallbackActions.classList.remove('hidden');
+  setMessage(message || 'La centrale non ha un orario valido. Puoi configurare la rete, sincronizzare l\'ora da questo dispositivo o usare un codice di recupero.');
+}
+
 function showOtpField(){
   otpRequired = true;
   if (otpField) otpField.classList.remove('hidden');
@@ -168,6 +198,9 @@ function showOtpField(){
     otpInput.required = true;
     otpInput.focus();
   }
+  hideFallbackChoices();
+  if (recoveryField) recoveryField.classList.add('hidden');
+  if (recoveryInput) recoveryInput.required = false;
   setMessage('Inserisci il codice OTP generato dalla tua app.');
 }
 
@@ -186,6 +219,7 @@ form?.addEventListener('submit', async (event) => {
   const user = userInput?.value.trim() || '';
   const pass = passInput?.value || '';
   const otp = otpInput?.value.trim() || '';
+  const recoveryCode = recoveryInput?.value.trim() || '';
 
   if (!suffix) {
     setMessage('Inserisci un ID sistema valido.');
@@ -203,6 +237,11 @@ form?.addEventListener('submit', async (event) => {
     markInvalid(passInput);
     return;
   }
+  if (recoveryMode && !recoveryCode) {
+    setMessage('Inserisci il codice di recupero.');
+    markInvalid(recoveryInput);
+    return;
+  }
   if (otpRequired && !otp) {
     setMessage('Inserisci il codice OTP.');
     markInvalid(otpInput);
@@ -216,9 +255,9 @@ form?.addEventListener('submit', async (event) => {
   try {
     setSystemId(suffix);
     const payload = { user, pass, system_id: formatSystemId(suffix) };
-    if (otpRequired) {
-      payload.otp = otp;
-    }
+    if (otpRequired) payload.otp = otp;
+    if (recoveryMode) payload.recovery_code = recoveryCode;
+    if (setupLimitedMode) payload.setup_limited = true;
     const response = await apiRequest('/api/login', { method: 'POST', body: payload, auth: false });
     if (response && typeof response === 'object' && response.otp_required && !response.token) {
       showOtpField();
@@ -229,11 +268,13 @@ form?.addEventListener('submit', async (event) => {
       throw new HttpError('Token non ricevuto dal server', { status: 500 });
     }
     setToken(token);
-    setMessage('Autenticazione riuscita.', 'success');
-    window.location.replace('./index.html');
+    setMessage(response.message || 'Autenticazione riuscita.', 'success');
+    window.location.replace(response.redirect || './index.html');
   } catch (err) {
     if (err instanceof HttpError) {
-      if (err.status === 401 && err.data && err.data.otp_required) {
+      if (err.status === 401 && err.data && err.data.requires_setup_limited) {
+        showTimeInvalidFallback(err.data.message);
+      } else if (err.status === 401 && err.data && err.data.otp_required) {
         showOtpField();
       } else if (err.status === 401 || err.status === 403) {
         setMessage('Credenziali non valide.');
@@ -247,5 +288,20 @@ form?.addEventListener('submit', async (event) => {
   } finally {
     pendingRequest = false;
     setDisabled(false);
+  }
+});
+
+btnUseRecovery?.addEventListener('click', () => showRecoveryField());
+btnSetupLimited?.addEventListener('click', () => { setupLimitedMode = true; recoveryMode = false; otpRequired = false; form?.requestSubmit(); });
+btnBrowserTime?.addEventListener('click', async () => {
+  try {
+    const unix_time = Math.floor(Date.now() / 1000);
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'browser';
+    await apiRequest('/api/setup/time', { method: 'POST', body: { unix_time, timezone }, auth: true });
+    hideFallbackChoices();
+    showOtpField();
+    setMessage('Ora sincronizzata da browser. Inserisci OTP per completare accesso admin.', 'success');
+  } catch (err) {
+    setMessage('Sincronizzazione ora non disponibile: prima entra in modalità Configura rete.');
   }
 });

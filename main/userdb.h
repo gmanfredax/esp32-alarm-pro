@@ -34,6 +34,13 @@ esp_err_t   userdb_totp_disable(const char* user);
 bool        userdb_totp_is_enabled(const char* user);
 bool        userdb_totp_verify(const char* user, const char* otp);
 
+#define USERDB_RECOVERY_CODE_COUNT 8
+#define USERDB_RECOVERY_CODE_LEN   20
+esp_err_t   userdb_recovery_generate(const char* user, char codes[USERDB_RECOVERY_CODE_COUNT][USERDB_RECOVERY_CODE_LEN]);
+esp_err_t   userdb_recovery_revoke(const char* user);
+size_t      userdb_recovery_remaining(const char* user);
+bool        userdb_recovery_verify_and_consume(const char* user, const char* code);
+
 #ifdef __cplusplus
 }
 #endif

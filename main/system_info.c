@@ -26,6 +26,7 @@
 #include "outputs.h"
 #include "roster.h"
 #include "network_manager.h"
+#include "system_time.h"
 
 #ifndef FW_VERSION
 #define FW_VERSION "unknown"
@@ -198,6 +199,7 @@ esp_err_t system_info_append_json(cJSON *root)
     cJSON_AddNumberToObject(rt, "boot_count", s_boot_count);
     cJSON_AddStringToObject(rt, "alarm_state", alarm_state_name(alarm_get_state()));
     add_net(root);
+    system_time_append_json(root);
 
     const esp_partition_t *running = esp_ota_get_running_partition();
     cJSON *st = cJSON_AddObjectToObject(root, "storage");

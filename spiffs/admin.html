@@ -226,6 +226,17 @@
                 <h3>Utenti</h3>
                 <button class="btn" id="btnNewUser">+ Nuovo utente</button>
               </div>
+              <div class="card" style="margin:.75rem 0">
+                <h4>Codici di recupero 2FA admin</h4>
+                <p class="muted">I codici sono mostrati in chiaro solo subito dopo la generazione. In NVS restano solo salt e hash.</p>
+                <div class="row" style="gap:.5rem;flex-wrap:wrap;align-items:center">
+                  <strong id="recoveryRemaining">Codici rimanenti: —</strong>
+                  <button class="btn" id="btnRecoveryGenerate" type="button">Genera nuovi codici</button>
+                  <button class="btn" id="btnRecoveryRevoke" type="button">Revoca tutti</button>
+                  <button class="btn" id="btnRecoveryDownload" type="button" style="display:none">Scarica/copia codici</button>
+                </div>
+                <pre id="recoveryCodesBox" class="hidden" style="white-space:pre-wrap;margin-top:.5rem"></pre>
+              </div>
               <div class="table-wrap" style="margin-top:.5rem">
                 <table class="table">
                   <thead>
@@ -239,6 +250,10 @@
 
           <!-- RETE -->
           <section id="view-network" class="view">
+            <div class="card" id="setupLimitedBanner" style="display:none;border-color:#f59e0b">
+              <h3>Modalità setup limitata</h3>
+              <p class="muted">Accesso limitato a rete, diagnostica minima, sincronizzazione ora e riavvio. Per dashboard completa sincronizza l'orologio e rifai login con OTP, oppure usa un codice di recupero.</p>
+            </div>
             <div class="card">
               <h3>Rete</h3>
               <div id="netStatus" class="info-grid" style="margin-bottom:1rem"></div>
@@ -259,6 +274,10 @@
                   <label class="field"><span>Password Wi-Fi</span><input id="net_wifi_password" type="password" maxlength="64" autocomplete="new-password" placeholder="lascia vuoto per mantenerla" /></label>
                   <label class="field"><span>AP fallback</span><select id="net_setup_enabled"><option value="1">Abilitato</option><option value="0">Disabilitato</option></select></label>
                   <label class="field"><span>Password AP fallback</span><input id="net_setup_password" type="password" minlength="8" maxlength="64" autocomplete="new-password" placeholder="lascia vuoto per mantenerla" /></label>
+                </div>
+                <div class="row" style="gap:.5rem;align-items:end;flex-wrap:wrap;margin-top:.4rem">
+                  <button class="btn" id="btnSyncBrowserTime" type="button">Sincronizza ora da questo dispositivo</button>
+                  <small id="timeSyncStatus" class="muted">Usa questa funzione se SNTP non è disponibile e l'OTP non è verificabile.</small>
                 </div>
                 <div id="netWifiScan" class="info-grid" style="margin-top:.6rem"></div>
                 <div class="row" style="justify-content:flex-end;margin-top:.6rem;gap:.5rem;flex-wrap:wrap">

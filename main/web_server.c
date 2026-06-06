@@ -61,6 +61,7 @@
 #include "can_master.h"
 #include "can_bus_protocol.h"
 #include "system_info.h"
+#include "system_time.h"
 #include "notification_events.h"
 #include "network_manager.h"
 
@@ -267,8 +268,7 @@ static void build_http_location(httpd_req_t* req, const char* target, char* out,
 }
 
 static esp_err_t send_http_redirect(httpd_req_t* req, const char* target, const char* status){
-    char location[192];
-    build_http_location(req, target, location, sizeof(location));
+    const char *location = (target && target[0]) ? target : "/";
     set_http_security_headers(req);
     httpd_resp_set_status(req, status ? status : "302 Found");
     httpd_resp_set_hdr(req, "Location", location);
@@ -2311,14 +2311,22 @@ static void provisioning_load_cloudflare(provisioning_cloudflare_config_t* cfg){
 static esp_err_t only_admin(httpd_req_t* req){
     if (!s_provisioned) return ESP_OK;
     user_info_t u;
-    if (!auth_check_bearer(req,&u) || u.role != ROLE_ADMIN){
+    if (!auth_check_bearer(req,&u) || u.role != ROLE_ADMIN || auth_session_is_setup_limited(req)){
         return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
     }
     return ESP_OK;
 }
 
+static esp_err_t setup_or_admin(httpd_req_t* req){
+    if (!s_provisioned) return ESP_OK;
+    user_info_t u;
+    if (!auth_check_bearer(req,&u)) return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+    if (u.role == ROLE_ADMIN || auth_session_is_setup_limited(req)) return ESP_OK;
+    return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+}
+
 static esp_err_t api_admin_system_get(httpd_req_t* req){
-    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
     cJSON *root = cJSON_CreateObject();
     if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
     system_info_append_json(root);
@@ -2384,7 +2392,7 @@ static esp_err_t network_json_error(httpd_req_t *req, int status, const char *er
 
 static esp_err_t api_admin_network_get(httpd_req_t* req)
 {
-    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
     cJSON *root = cJSON_CreateObject();
     if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
     network_status_append_json(root);
@@ -2401,7 +2409,7 @@ static esp_err_t api_network_status_get(httpd_req_t* req)
 
 static esp_err_t api_admin_network_restart_post(httpd_req_t* req)
 {
-    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
     esp_err_t err = network_manager_restart();
     if (err != ESP_OK) return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "restart_failed", "Riavvio rete fallito");
     return json_reply(req, "{\"ok\":true,\"message\":\"Riavvio rete avviato\"}");
@@ -2409,7 +2417,7 @@ static esp_err_t api_admin_network_restart_post(httpd_req_t* req)
 
 static esp_err_t api_admin_network_wifi_scan_get(httpd_req_t* req)
 {
-    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
     cJSON *root = cJSON_CreateObject();
     if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
     cJSON *arr = cJSON_AddArrayToObject(root, "networks");
@@ -2424,7 +2432,7 @@ static esp_err_t api_admin_network_wifi_scan_get(httpd_req_t* req)
 
 static esp_err_t api_admin_network_setup_exit_post(httpd_req_t* req)
 {
-    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
     esp_err_t err = network_setup_exit();
     if (err != ESP_OK) {
         return network_json_error(req, HTTPD_400_BAD_REQUEST, "setup_exit_failed", "Impossibile uscire dal setup senza una rete operativa");
@@ -2434,7 +2442,7 @@ static esp_err_t api_admin_network_setup_exit_post(httpd_req_t* req)
 
 static esp_err_t api_admin_network_wifi_test_post(httpd_req_t* req)
 {
-    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
     char body[512]; size_t bl=0;
     if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
     cJSON* j = cJSON_ParseWithLength(body, bl);
@@ -2460,7 +2468,7 @@ static esp_err_t api_admin_network_wifi_test_post(httpd_req_t* req)
 
 static esp_err_t api_admin_network_post(httpd_req_t* req)
 {
-    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
     char body[1024]; size_t bl=0;
     if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
     cJSON* j = cJSON_ParseWithLength(body, bl);
@@ -2520,6 +2528,59 @@ static esp_err_t api_admin_network_post(httpd_req_t* req)
 }
 
 // ---- /api/sys/net GET/POST ----
+
+static esp_err_t api_setup_time_post(httpd_req_t* req)
+{
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
+    char body[256]; size_t bl=0;
+    if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
+    cJSON* j = cJSON_ParseWithLength(body, bl);
+    if (!j) return httpd_resp_send_err(req,400,"json"), ESP_FAIL;
+    const cJSON *jt = cJSON_GetObjectItemCaseSensitive(j, "unix_time");
+    const cJSON *jtz = cJSON_GetObjectItemCaseSensitive(j, "timezone");
+    int64_t unix_time = cJSON_IsNumber(jt) ? (int64_t)jt->valuedouble : 0;
+    const char *tz = (cJSON_IsString(jtz) && jtz->valuestring) ? jtz->valuestring : "browser";
+    esp_err_t err = system_time_set_browser_manual(unix_time, tz);
+    cJSON_Delete(j);
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "time"), ESP_FAIL;
+    audit_append("time", "", 1, "browser_manual");
+    return json_reply(req, "{\"ok\":true,\"time_valid\":true,\"source\":\"browser_manual\",\"message\":\"Ora sincronizzata da browser. Effettua OTP per accesso admin completo.\"}");
+}
+
+static esp_err_t api_recovery_status_get(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char uname[32]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, 401, "token"), ESP_FAIL;
+    char resp[96];
+    snprintf(resp, sizeof(resp), "{\"ok\":true,\"remaining\":%u}", (unsigned)auth_recovery_remaining(uname));
+    return json_reply(req, resp);
+}
+
+static esp_err_t api_recovery_generate_post(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char uname[32]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, 401, "token"), ESP_FAIL;
+    char codes[AUTH_RECOVERY_CODE_COUNT][AUTH_RECOVERY_CODE_LEN];
+    if (auth_recovery_generate(uname, codes) != ESP_OK) return httpd_resp_send_err(req, 500, "recovery"), ESP_FAIL;
+    audit_append("recovery", uname, 1, "generated");
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON *arr = cJSON_AddArrayToObject(root, "codes");
+    for (int i=0; i<AUTH_RECOVERY_CODE_COUNT; ++i) cJSON_AddItemToArray(arr, cJSON_CreateString(codes[i]));
+    cJSON_AddNumberToObject(root, "remaining", AUTH_RECOVERY_CODE_COUNT);
+    cJSON_AddStringToObject(root, "message", "Salva questi codici. Saranno mostrati una sola volta.");
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_recovery_revoke_post(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    char uname[32]={0}; if(!current_user_from_req(req, uname, sizeof(uname))) return httpd_resp_send_err(req, 401, "token"), ESP_FAIL;
+    if (auth_recovery_revoke(uname) != ESP_OK) return httpd_resp_send_err(req, 500, "recovery"), ESP_FAIL;
+    audit_append("recovery", uname, 1, "revoked");
+    return json_reply(req, "{\"ok\":true,\"remaining\":0}");
+}
+
 static esp_err_t sys_net_get(httpd_req_t* req){
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
     provisioning_net_config_t cfg; provisioning_load_net(&cfg);
@@ -3509,7 +3570,15 @@ static esp_err_t user_post_totp_confirm(httpd_req_t* req){
 
     if(auth_totp_enable(uname, secret)!=ESP_OK) return httpd_resp_send_err(req,500,"enable"), ESP_FAIL;
     auth_totp_clear_pending(req);
-    return json_bool(req, true);
+    char codes[AUTH_RECOVERY_CODE_COUNT][AUTH_RECOVERY_CODE_LEN];
+    if (auth_recovery_generate(uname, codes) != ESP_OK) return httpd_resp_send_err(req,500,"recovery"), ESP_FAIL;
+    audit_append("recovery", uname, 1, "generated");
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddStringToObject(resp, "message", "2FA abilitata. Salva questi codici: saranno mostrati una sola volta.");
+    cJSON *arr = cJSON_AddArrayToObject(resp, "recovery_codes");
+    for (int i=0; i<AUTH_RECOVERY_CODE_COUNT; ++i) cJSON_AddItemToArray(arr, cJSON_CreateString(codes[i]));
+    return json_reply_cjson(req, resp);
 }
 
 static esp_err_t user_post_totp_disable(httpd_req_t* req){
@@ -6592,6 +6661,9 @@ static esp_err_t root_get(httpd_req_t* req){
     if (!auth_check_cookie(req, &user)){
         return send_file(req, "login.html");
     }
+    if (auth_session_is_setup_limited(req)){
+        return send_http_redirect(req, "/admin.html#network", "302 Found");
+    }
     return send_file(req, "index.html");
 }
 
@@ -6612,13 +6684,18 @@ static esp_err_t index_html_get(httpd_req_t* req){
     if (!auth_check_cookie(req,&u)){
         return send_http_redirect(req, "/login.html", "302 Found");
     }
+    if (auth_session_is_setup_limited(req)){
+        return send_http_redirect(req, "/admin.html#network", "302 Found");
+    }
     return send_file(req, "index.html");
 }
 static esp_err_t wizard_html_get(httpd_req_t* req){
     return send_file(req, "wizard.html");
 }
 static esp_err_t admin_html_get(httpd_req_t* req){
-    if (!auth_gate_html(req, ROLE_ADMIN)) return ESP_OK;
+    user_info_t u;
+    if (!auth_check_cookie(req, &u)) return send_http_redirect(req, "/login.html", "302 Found");
+    if (u.role != ROLE_ADMIN && !auth_session_is_setup_limited(req)) return send_file(req,"403.html");
     return send_file(req,"admin.html");
 }
 static esp_err_t four03_html_get(httpd_req_t* req){
@@ -6640,6 +6717,11 @@ static esp_err_t js_get(httpd_req_t* req){
     if (strstr(uri,"/js/app.js"))   return send_file(req,"js/app.js");
     return httpd_resp_send_err(req,HTTPD_404_NOT_FOUND,"nope");
 }
+static esp_err_t favicon_get(httpd_req_t* req){
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, NULL, 0);
+}
+
 static esp_err_t css_get(httpd_req_t* req){
     const char* uri = req->uri;
     if (strstr(uri,"style.css")) return send_file(req,"css/style.css"); 
@@ -6689,6 +6771,7 @@ static esp_err_t users_admin_list_get(httpd_req_t* req);
 static const httpd_uri_t s_http_routes[] = {
     { .uri = "/",                 .method = HTTP_GET,     .handler = root_get },
     { .uri = "/login.html",       .method = HTTP_GET,     .handler = login_html_get },
+    { .uri = "/favicon.ico",      .method = HTTP_GET,     .handler = favicon_get },
     { .uri = "/index.html",       .method = HTTP_GET,     .handler = index_html_get },
     { .uri = "/wizard.html",      .method = HTTP_GET,     .handler = wizard_html_get },
     { .uri = "/admin.html",       .method = HTTP_GET,     .handler = admin_html_get },
@@ -6715,6 +6798,7 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/admin/network/wifi/test", .method = HTTP_POST, .handler = api_admin_network_wifi_test_post },
     { .uri = "/api/admin/network/wifi/scan", .method = HTTP_GET, .handler = api_admin_network_wifi_scan_get },
     { .uri = "/api/admin/network/setup/exit", .method = HTTP_POST, .handler = api_admin_network_setup_exit_post },
+    { .uri = "/api/setup/time", .method = HTTP_POST, .handler = api_setup_time_post },
     { .uri = "/api/network/status", .method = HTTP_GET, .handler = api_network_status_get },
     { .uri = "/api/network/config", .method = HTTP_POST, .handler = api_admin_network_post },
     { .uri = "/api/admin/mqtt", .method = HTTP_GET, .handler = sys_mqtt_get },
@@ -6731,6 +6815,9 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/admin/ads1115/*", .method = HTTP_POST, .handler = api_admin_ads1115_action_post },
     { .uri = "/api/admin/ads1115/*", .method = HTTP_DELETE, .handler = api_admin_ads1115_delete },
     { .uri = "/api/admin/diagnostics/ads1115", .method = HTTP_GET, .handler = api_admin_ads1115_diag_get },
+    { .uri = "/api/admin/security/recovery-codes/status", .method = HTTP_GET, .handler = api_recovery_status_get },
+    { .uri = "/api/admin/security/recovery-codes/generate", .method = HTTP_POST, .handler = api_recovery_generate_post },
+    { .uri = "/api/admin/security/recovery-codes/revoke", .method = HTTP_POST, .handler = api_recovery_revoke_post },
 #if ADS1115_COUNT > 0
     { .uri = "/api/admin/inputs/analog-eol", .method = HTTP_GET,  .handler = api_admin_analog_eol_get },
     { .uri = "/api/admin/inputs/analog-eol", .method = HTTP_POST, .handler = api_admin_analog_eol_post },

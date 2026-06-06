@@ -44,6 +44,15 @@
             <span>Codice OTP</span>
             <input id="otp" name="otp" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" />
           </label>
+          <label id="recoveryField" class="field hidden">
+            <span>Codice di recupero monouso</span>
+            <input id="recoveryCode" name="recovery_code" autocomplete="one-time-code" placeholder="ABCD-EFGH-IJKL-MNPQ" />
+          </label>
+          <div id="fallbackActions" class="row actions hidden" style="gap:.5rem;flex-wrap:wrap">
+            <button type="button" class="btn" id="btnSetupLimited">Configura rete</button>
+            <button type="button" class="btn" id="btnBrowserTime">Sincronizza ora da questo dispositivo</button>
+            <button type="button" class="btn" id="btnUseRecovery">Usa codice di recupero</button>
+          </div>
           <div id="loginMessage" class="msg small hidden"></div>
           <div class="row actions">
             <button type="submit" class="btn primary" id="loginSubmit">Accedi</button>

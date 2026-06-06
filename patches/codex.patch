@@ -1,0 +1,55 @@
+diff --git a/spiffs/login.html b/spiffs/login.html
+index 8462abc6e8f21cd3b56ba3618cc018d036d2f63c..c981fed526079384ca9bd064fe1bb1060a483fe5 100755
+--- a/spiffs/login.html
++++ b/spiffs/login.html
+@@ -22,41 +22,50 @@
+   <main class="container auth-main" style="padding-top: 10vh; max-width: 420px;">
+     <div class="login-panel">
+       <div class="card login-card">
+         <h1 class="title">Accedi al sistema</h1>
+         <p class="muted">Inserisci il suffisso ID (dopo <strong>nsalarmpro-</strong>) e le tue credenziali.</p>
+         <form id="loginForm" class="form" autocomplete="on">
+           <label class="field">
+             <span>ID sistema</span>
+             <div class="prefix-input">
+               <span class="prefix">nsalarmpro-</span>
+               <input id="systemId" name="systemSuffix" autocomplete="off" spellcheck="false" placeholder="example" required />
+             </div>
+           </label>
+           <label class="field">
+             <span>Username</span>
+             <input id="username" name="username" autocomplete="username" required />
+           </label>
+           <label class="field">
+             <span>Password</span>
+             <input id="password" name="password" type="password" autocomplete="current-password" required />
+           </label>
+           <label id="otpField" class="field hidden">
+             <span>Codice OTP</span>
+             <input id="otp" name="otp" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" />
+           </label>
++          <label id="recoveryField" class="field hidden">
++            <span>Codice di recupero monouso</span>
++            <input id="recoveryCode" name="recovery_code" autocomplete="one-time-code" placeholder="ABCD-EFGH-IJKL-MNPQ" />
++          </label>
++          <div id="fallbackActions" class="row actions hidden" style="gap:.5rem;flex-wrap:wrap">
++            <button type="button" class="btn" id="btnSetupLimited">Configura rete</button>
++            <button type="button" class="btn" id="btnBrowserTime">Sincronizza ora da questo dispositivo</button>
++            <button type="button" class="btn" id="btnUseRecovery">Usa codice di recupero</button>
++          </div>
+           <div id="loginMessage" class="msg small hidden"></div>
+           <div class="row actions">
+             <button type="submit" class="btn primary" id="loginSubmit">Accedi</button>
+           </div>
+         </form>
+       </div>
+     </div>
+   </main>
+ 
+   <footer class="container foot">
+     <small>© <span id="footYear"></span> NeXtorSystem</small>
+   </footer>
+ 
+   <script type="module" src="/js/login.js"></script>
+ </body>
+ </html>

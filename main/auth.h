@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include "esp_err.h"
 #include "esp_http_server.h"
+#include "userdb.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -14,6 +15,7 @@ extern "C" {
 typedef enum {
     ROLE_GUEST = 0,
     ROLE_USER  = 1,
+    ROLE_SETUP_LIMITED = 1,
     ROLE_ADMIN = 2
 } user_role_t;
 
@@ -76,9 +78,17 @@ esp_err_t auth_totp_enable     (const char* username, const char* base32_secret)
 esp_err_t auth_totp_disable    (const char* username);
 bool      auth_totp_enabled    (const char* username);
 bool      auth_check_totp_for_user(const char* username, const char* otp);
+
+#define AUTH_RECOVERY_CODE_COUNT USERDB_RECOVERY_CODE_COUNT
+#define AUTH_RECOVERY_CODE_LEN   USERDB_RECOVERY_CODE_LEN
+esp_err_t auth_recovery_generate(const char* username, char codes[AUTH_RECOVERY_CODE_COUNT][AUTH_RECOVERY_CODE_LEN]);
+esp_err_t auth_recovery_revoke(const char* username);
+size_t    auth_recovery_remaining(const char* username);
+bool      auth_recovery_verify_and_consume(const char* username, const char* code);
 bool      auth_totp_store_pending(httpd_req_t* req, const char* secret_base32);
 bool      auth_totp_get_pending  (httpd_req_t* req, char* out, size_t out_cap);
 void      auth_totp_clear_pending(httpd_req_t* req);
+bool      auth_session_is_setup_limited(httpd_req_t* req);
 
 #ifdef __cplusplus
 }

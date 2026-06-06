@@ -53,6 +53,8 @@
 
   let currentUser = "";
   let isAdmin = false;
+let setupLimited = false;
+let lastRecoveryCodes = [];
 
   async function apiGet(url){
     const r = await fetch(url, { headers: { "Accept":"application/json" } });
@@ -1686,6 +1688,7 @@
   }
 
   async function loadUsers(){
+    if (setupLimited) return;
     try{
       const list = await apiGet("/api/admin/users");
       if (!Array.isArray(list)) throw new Error("formato inatteso");
@@ -1694,6 +1697,52 @@
       renderUsers(null);
       toast("Errore caricando utenti: " + e.message, false);
     }
+  }
+
+
+
+  async function loadRecoveryStatus(){
+    if (setupLimited) return;
+    const el = $("#recoveryRemaining");
+    try{
+      const data = await apiGet("/api/admin/security/recovery-codes/status");
+      if (el) el.textContent = `Codici rimanenti: ${data.remaining ?? 0}`;
+    }catch(e){ if (el) el.textContent = "Codici rimanenti: —"; }
+  }
+
+  function showGeneratedRecoveryCodes(codes){
+    lastRecoveryCodes = Array.isArray(codes) ? codes : [];
+    const box = $("#recoveryCodesBox");
+    const btn = $("#btnRecoveryDownload");
+    if (box){
+      box.textContent = lastRecoveryCodes.length ? `Salva questi codici. Saranno mostrati una sola volta.\n\n${lastRecoveryCodes.join('\n')}` : "";
+      box.classList.toggle("hidden", !lastRecoveryCodes.length);
+    }
+    if (btn) btn.style.display = lastRecoveryCodes.length ? "inline-block" : "none";
+  }
+
+  function setupRecoveryCodesSection(){
+    if (setupLimited) return;
+    loadRecoveryStatus().catch(()=>{});
+    $("#btnRecoveryGenerate")?.addEventListener("click", async ()=>{
+      if (!confirm("Generare nuovi codici? I precedenti verranno invalidati.")) return;
+      try{
+        const data = await apiPost("/api/admin/security/recovery-codes/generate", {});
+        showGeneratedRecoveryCodes(data.codes || []);
+        await loadRecoveryStatus();
+        toast("Codici generati: salvarli ora");
+      }catch(e){ toast("Generazione codici: " + e.message, false); }
+    });
+    $("#btnRecoveryRevoke")?.addEventListener("click", async ()=>{
+      if (!confirm("Revocare tutti i codici di recupero?")) return;
+      try{ await apiPost("/api/admin/security/recovery-codes/revoke", {}); showGeneratedRecoveryCodes([]); await loadRecoveryStatus(); toast("Codici revocati"); }
+      catch(e){ toast("Revoca codici: " + e.message, false); }
+    });
+    $("#btnRecoveryDownload")?.addEventListener("click", async ()=>{
+      const text = lastRecoveryCodes.join("\n");
+      try { await navigator.clipboard.writeText(text); toast("Codici copiati negli appunti"); }
+      catch { const blob = new Blob([text], {type:"text/plain"}); const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download="alarmpro-recovery-codes.txt"; a.click(); URL.revokeObjectURL(a.href); }
+    });
   }
 
   // ---- Modals
@@ -2675,17 +2724,33 @@
     const me = await apiGet("/api/me");
     currentUser = me.user || "";
     const role = normalizeRole(me.role);
-    isAdmin = role != null ? role >= ROLE_ADMIN : !!me.is_admin;
+    setupLimited = me.session === "setup_limited";
+    isAdmin = !setupLimited && (role != null ? role >= ROLE_ADMIN : !!me.is_admin);
+    document.body.classList.toggle("setup-limited", setupLimited);
+    const banner = document.getElementById("setupLimitedBanner");
+    if (banner) banner.style.display = setupLimited ? "block" : "none";
+    if (setupLimited) {
+      document.querySelectorAll('.side button').forEach((btn) => {
+        const keep = btn.getAttribute('data-view') === 'view-network' || btn.getAttribute('data-view') === 'view-system';
+        btn.style.display = keep ? '' : 'none';
+        if (btn.getAttribute('data-view') === 'view-network') btn.classList.add('active');
+      });
+      document.querySelectorAll('.view').forEach((view) => view.classList.toggle('active', view.id === 'view-network'));
+    }
     syncHeader();
     mountUserMenu();
     updateAdminVisibility();
     setupSidebar();
-    const setupPromises = [
+    const setupPromises = setupLimited ? [
+      setupSystemSection(),
+      setupNetMqttForms()
+    ] : [
       setupAdsDiagnostics(),
       setupAnalogGeneralSection(),
       setupDigitalFiltersSection(),
       setupSystemSection(),
       setupNetMqttForms(),
+      setupRecoveryCodesSection(),
       setupNotificationsSection(),
       setupWebSecForm(),
       setupExpansionsSection()
@@ -2695,8 +2760,8 @@
       location.href = "/index.html";
     });
     if (!(await ensureAdmin())) return;     // ora è un no-op che sblocca la UI
-    attachNewUser();
+    if (!setupLimited) attachNewUser();
 //    await Promise.all([loadUsers(), loadNetwork(), loadMqtt()]);
-    await Promise.all([loadUsers(), ...setupPromises]);
+    await Promise.all([...(setupLimited ? [] : [loadUsers()]), ...setupPromises]);
   })();
 })();

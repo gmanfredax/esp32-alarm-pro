@@ -2,6 +2,7 @@
 #include "auth.h"
 #include "userdb.h"
 #include "audit_log.h"
+#include "system_time.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -47,6 +48,7 @@ typedef struct {
     time_t expires_abs;
     char  pending_totp_secret[64];
     time_t pending_totp_time;
+    bool setup_limited;
 } session_t;
 
 static session_t g_sessions[SESSION_MAX];
@@ -177,6 +179,8 @@ static bool get_cookie_value(httpd_req_t* req, const char* key, char* out, size_
     return found;
 }
 
+static bool setup_limited_uri_allowed(const char *uri);
+
 static session_t* session_from_request(httpd_req_t* req){
     if (!req) return NULL;
     bool touch_allowed = should_touch_session(req);
@@ -190,6 +194,7 @@ static session_t* session_from_request(httpd_req_t* req){
                     const char* token = hdr + 7;
                     session_t* s = find_by_atk(token);
                     if (s){
+                        if (s->setup_limited && !setup_limited_uri_allowed(req->uri)) { free(hdr); return NULL; }
                         if (touch_allowed) touch_session(s);
                         free(hdr);
                         return s;
@@ -203,6 +208,8 @@ static session_t* session_from_request(httpd_req_t* req){
     if (get_cookie_value(req, "SID", sid, sizeof(sid))){
         session_t* s = find_by_sid(sid);
         if (s){
+            if (s->setup_limited && !setup_limited_uri_allowed(req->uri)
+                && strcmp(req->uri, "/admin.html") != 0 && strcmp(req->uri, "/") != 0 && strcmp(req->uri, "/index.html") != 0) return NULL;
             if (touch_allowed) touch_session(s);
             return s;
         }
@@ -285,6 +292,17 @@ static esp_err_t json_reply(httpd_req_t* req, const char* json){
     return httpd_resp_sendstr(req, json);
 }
 
+static bool setup_limited_uri_allowed(const char *uri){
+    if (!uri) return false;
+    if (!strcmp(uri, "/api/me") || !strcmp(uri, "/api/logout")) return true;
+    if (!strcmp(uri, "/api/admin/system") || !strcmp(uri, "/api/admin/network")) return true;
+    if (!strcmp(uri, "/api/admin/network/restart") || !strcmp(uri, "/api/admin/network/wifi/test")) return true;
+    if (!strcmp(uri, "/api/admin/network/wifi/scan") || !strcmp(uri, "/api/admin/network/setup/exit")) return true;
+    if (!strcmp(uri, "/api/network/status") || !strcmp(uri, "/api/network/config")) return true;
+    if (!strcmp(uri, "/api/setup/time")) return true;
+    return false;
+}
+
 // ===== Check Authorization / Cookie ==========================================
 bool auth_check_bearer(httpd_req_t* req, user_info_t* out){
     size_t n = httpd_req_get_hdr_value_len(req, "Authorization");
@@ -297,6 +315,7 @@ bool auth_check_bearer(httpd_req_t* req, user_info_t* out){
         const char* token = h+7;
         session_t* s = find_by_atk(token);
         if (s){
+            if (s->setup_limited && !setup_limited_uri_allowed(req->uri)) { free(h); return false; }
             touch_session(s);
             if (out){ strncpy(out->username, s->username, sizeof(out->username)-1); out->role = s->role; }
             ok = true;
@@ -310,6 +329,8 @@ bool auth_check_cookie(httpd_req_t* req, user_info_t* out){
     if (!get_cookie_value(req,"SID",sid,sizeof(sid))) return false;
     session_t* s = find_by_sid(sid);
     if (!s) return false;
+    if (s->setup_limited && !setup_limited_uri_allowed(req->uri)
+        && strcmp(req->uri, "/admin.html") != 0 && strcmp(req->uri, "/") != 0 && strcmp(req->uri, "/index.html") != 0) return false;
     touch_session(s);
     if (out){ strncpy(out->username, s->username, sizeof(out->username)-1); out->role=s->role; }
     return true;
@@ -329,23 +350,24 @@ esp_err_t auth_handle_login(httpd_req_t* req){
     if (parse_json_from_body(req,&body,&blen)!=ESP_OK){
         return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"bad body");
     }
-    char user[32]={0}, pass[64]={0};
-    char otp[16]={0};
+    char user[32]={0}, pass[64]={0}, otp[16]={0}, recovery[40]={0};
+    bool request_setup_limited = strstr(body,"\"setup_limited\"") && strstr(body,"true");
     const char* u = strstr(body,"\"user\"");
     const char* p = strstr(body,"\"pass\"");
+    const char* o = strstr(body,"\"otp\"");
+    const char* rc = strstr(body,"\"recovery_code\"");
     if (u){ u = strchr(u,':'); if(u){ while(*u && (*u==' '||*u==':'||*u=='\"')) u++; char* e = strchr(u,'\"'); if(e){ size_t n=(size_t)(e-u); if(n>sizeof(user)-1)n=sizeof(user)-1; memcpy(user,u,n); user[n]=0; } } }
     if (p){ p = strchr(p,':'); if(p){ while(*p && (*p==' '||*p==':'||*p=='\"')) p++; char* e = strchr(p,'\"'); if(e){ size_t n=(size_t)(e-p); if(n>sizeof(pass)-1)n=sizeof(pass)-1; memcpy(pass,p,n); pass[n]=0; } } }
-    const char* o = strstr(body,"\"otp\"");
     if (o){ o = strchr(o,':'); if(o){ while(*o && (*o==' '||*o==':'||*o=='\"')) o++; char* e = strchr(o,'\"'); if(e){ size_t n=(size_t)(e-o); if(n>sizeof(otp)-1)n=sizeof(otp)-1; memcpy(otp,o,n); otp[n]=0; } } }
-    free(body);
+    if (rc){ rc = strchr(rc,':'); if(rc){ while(*rc && (*rc==' '||*rc==':'||*rc=='\"')) rc++; char* e = strchr(rc,'\"'); if(e){ size_t n=(size_t)(e-rc); if(n>sizeof(recovery)-1)n=sizeof(recovery)-1; memcpy(recovery,rc,n); recovery[n]=0; } } }
 
-    // Rate limit per-username
     rl_item_t* rl = rl_find_or_make(user[0]?user:"(empty)");
     int retry_after=0;
     if (rl && rl_check_locked(rl, &retry_after)){
         char hdr[64]; snprintf(hdr,sizeof(hdr),"%d", retry_after);
         httpd_resp_set_hdr(req,"Retry-After", hdr);
         audit_append("login", user, 0, "locked");
+        free(body);
         return httpd_resp_send_err(req,HTTPD_429_TOO_MANY_REQUESTS,"locked");
     }
 
@@ -353,23 +375,48 @@ esp_err_t auth_handle_login(httpd_req_t* req){
     if (!valid_user_pass(user,pass,&role)){
         if (rl) rl_on_fail(rl);
         audit_append("login", user, 0, "invalid");
+        free(body);
         return httpd_resp_send_err(req,HTTPD_401_UNAUTHORIZED,"invalid");
     }
 
+    bool setup_limited = false;
     if (auth_totp_enabled(user)){
-        if (!otp[0]){
-            audit_append("login", user, 0, "otp required");
-            httpd_resp_set_status(req, "401 Unauthorized");
-            return json_reply(req, "{\"otp_required\":true}");
-        }
-        if (!auth_check_totp_for_user(user, otp)){
-            if (rl) rl_on_fail(rl);
-            audit_append("login", user, 0, "otp invalid");
-            httpd_resp_set_status(req, "401 Unauthorized");
-            return json_reply(req, "{\"otp_required\":true}");
+        if (recovery[0]){
+            if (!auth_recovery_verify_and_consume(user, recovery)){
+                if (rl) rl_on_fail(rl);
+                audit_append("recovery", user, 0, "invalid");
+                httpd_resp_set_status(req, "401 Unauthorized");
+                free(body);
+                return json_reply(req, "{\"ok\":false,\"message\":\"Codice di recupero non valido o gia utilizzato.\"}");
+            }
+            audit_append("recovery", user, 1, "used");
+        } else if (!system_time_is_valid()){
+            if (request_setup_limited){
+                setup_limited = true;
+                audit_append("setup", user, 1, "limited");
+            } else {
+                audit_append("login", user, 0, "time invalid");
+                httpd_resp_set_status(req, "401 Unauthorized");
+                free(body);
+                return json_reply(req, "{\"ok\":false,\"otp_required\":false,\"requires_setup_limited\":true,\"requires_recovery_or_time_sync\":true,\"time_valid\":false,\"message\":\"Orologio centrale non sincronizzato: OTP non verificabile\"}");
+            }
+        } else {
+            if (!otp[0]){
+                audit_append("login", user, 0, "otp required");
+                httpd_resp_set_status(req, "401 Unauthorized");
+                free(body);
+                return json_reply(req, "{\"otp_required\":true,\"time_valid\":true}");
+            }
+            if (!auth_check_totp_for_user(user, otp)){
+                if (rl) rl_on_fail(rl);
+                audit_append("otp", user, 0, "invalid");
+                httpd_resp_set_status(req, "401 Unauthorized");
+                free(body);
+                return json_reply(req, "{\"otp_required\":true,\"message\":\"Codice OTP non valido\"}");
+            }
         }
     }
-
+    free(body);
     if (rl) rl_on_success(rl);
 
     session_t* s = alloc_session();
@@ -379,14 +426,14 @@ esp_err_t auth_handle_login(httpd_req_t* req){
     b64_of_random(ATK_LEN,  s->atk_b64,  sizeof(s->atk_b64));
     b64_of_random(CSRF_LEN, s->csrf_b64, sizeof(s->csrf_b64));
     strncpy(s->username, user, sizeof(s->username)-1);
-    s->role = role;
+    s->setup_limited = setup_limited;
+    s->role = setup_limited ? ROLE_SETUP_LIMITED : role;
 
     time_t now = time(NULL);
     s->created   = now;
     s->last_seen = now;
     s->expires_abs = now + IDLE_TTL_SEC;
 
-    // Set-Cookie
     char cookie[160];
     if (build_cookie_sid(cookie, sizeof(cookie), s->sid_b64) < 0){
         audit_append("login", user, 0, "cookie build fail");
@@ -394,11 +441,14 @@ esp_err_t auth_handle_login(httpd_req_t* req){
     }
     httpd_resp_set_hdr(req, "Set-Cookie", cookie);
 
-    char resp[256];
+    char resp[384];
     snprintf(resp,sizeof(resp),
-        "{\"ok\":true,\"user\":\"%s\",\"role\":%d,\"token\":\"%s\"}",
-        s->username, (int)s->role, s->atk_b64);
-    audit_append("login", user, 1, "ok");
+        "{\"ok\":true,\"user\":\"%s\",\"role\":%d,\"token\":\"%s\",\"session\":\"%s\",\"redirect\":\"%s\",\"message\":\"%s\"}",
+        s->username, (int)s->role, s->atk_b64,
+        setup_limited ? "setup_limited" : "full_admin",
+        setup_limited ? "/admin.html#network" : "/index.html",
+        recovery[0] ? "Codice di recupero accettato. Codice invalidato." : "ok");
+    audit_append("login", user, 1, setup_limited ? "setup_limited" : "ok");
     return json_reply(req, resp);
 }
 
@@ -431,7 +481,7 @@ esp_err_t auth_handle_logout(httpd_req_t* req){
 esp_err_t auth_handle_me(httpd_req_t* req){
     user_info_t u={0};
     if (auth_check_bearer(req,&u) || auth_check_cookie(req,&u)){
-        char resp[200];
+        char resp[256];
         bool is_admin = ((int)u.role >= (int)ROLE_ADMIN);
         snprintf(resp,sizeof(resp),"{\"ok\":true,\"user\":\"%s\",\"role\":%d,\"is_admin\":%s}", u.username,(int)u.role,is_admin?"true":"false");
         return json_reply(req, resp);
@@ -505,7 +555,20 @@ bool auth_totp_enabled(const char* username){
     return userdb_totp_is_enabled(username);
 }
 bool auth_check_totp_for_user(const char* username, const char* otp){
+    if (!system_time_is_valid()) return false;
     return userdb_totp_verify(username, otp);
+}
+
+esp_err_t auth_recovery_generate(const char* username, char codes[AUTH_RECOVERY_CODE_COUNT][AUTH_RECOVERY_CODE_LEN]){
+    return userdb_recovery_generate(username, codes);
+}
+esp_err_t auth_recovery_revoke(const char* username){ return userdb_recovery_revoke(username); }
+size_t auth_recovery_remaining(const char* username){ return userdb_recovery_remaining(username); }
+bool auth_recovery_verify_and_consume(const char* username, const char* code){ return userdb_recovery_verify_and_consume(username, code); }
+
+bool auth_session_is_setup_limited(httpd_req_t* req){
+    session_t* s = session_from_request(req);
+    return s && s->setup_limited;
 }
 
 bool auth_totp_store_pending(httpd_req_t* req, const char* secret_base32){

@@ -393,3 +393,157 @@ size_t userdb_list_csv(char* buf, size_t buflen)
     return needed ? (needed - 1) : 0;              // lunghezza senza l’ultima virgola
 }
 
+
+// ===== Recovery code 2FA monouso ============================================
+#define REC_NS "reccode"
+#define REC_VER 1
+#define REC_COUNT USERDB_RECOVERY_CODE_COUNT
+#define REC_SALT_LEN 16
+#define REC_HASH_LEN 32
+
+typedef struct __attribute__((packed)){
+    uint8_t ver;
+    uint8_t count;
+    uint8_t used[REC_COUNT];
+    uint8_t salt[REC_COUNT][REC_SALT_LEN];
+    uint8_t hash[REC_COUNT][REC_HASH_LEN];
+} recovery_rec_t;
+
+static void k_reckey(const char* username, char out[32]){
+    char u[20]={0};
+    size_t n = strlen(username ? username : "");
+    if (n>15) n=15;
+    for(size_t i=0;i<n;i++) u[i]=(char)tolower((unsigned char)username[i]);
+    snprintf(out,32,"r_%s",u);
+}
+
+static esp_err_t recovery_open(nvs_open_mode_t mode, nvs_handle_t *out){
+    return nvs_open(REC_NS, mode, out);
+}
+
+static void recovery_normalize_code(const char *in, char *out, size_t cap){
+    size_t o=0;
+    if (!out || cap==0) return;
+    if (in){
+        for (size_t i=0; in[i] && o+1<cap; ++i){
+            unsigned char c=(unsigned char)in[i];
+            if (c=='-' || c==' ' || c=='\t' || c=='\r' || c=='\n') continue;
+            out[o++]=(char)toupper(c);
+        }
+    }
+    out[o]=0;
+}
+
+static void recovery_hash_code(const uint8_t salt[REC_SALT_LEN], const char *norm, uint8_t out[REC_HASH_LEN]){
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts(&ctx, 0);
+    mbedtls_sha256_update(&ctx, salt, REC_SALT_LEN);
+    mbedtls_sha256_update(&ctx, (const unsigned char*)norm, strlen(norm));
+    mbedtls_sha256_finish(&ctx, out);
+    mbedtls_sha256_free(&ctx);
+}
+
+static uint8_t ct_memcmp32(const uint8_t *a, const uint8_t *b){
+    uint8_t diff=0;
+    for (size_t i=0;i<REC_HASH_LEN;i++) diff |= (uint8_t)(a[i]^b[i]);
+    return diff;
+}
+
+static void recovery_format_code(char out[USERDB_RECOVERY_CODE_LEN]){
+    static const char alphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    size_t o=0;
+    for (int group=0; group<4; ++group){
+        if (group) out[o++]='-';
+        for (int i=0; i<4; ++i){
+            out[o++] = alphabet[esp_random() % (sizeof(alphabet)-1)];
+        }
+    }
+    out[o]=0;
+}
+
+esp_err_t userdb_recovery_generate(const char* user, char codes[USERDB_RECOVERY_CODE_COUNT][USERDB_RECOVERY_CODE_LEN]){
+    if (!user || !user[0] || !codes) return ESP_ERR_INVALID_ARG;
+    recovery_rec_t rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.ver = REC_VER;
+    rec.count = REC_COUNT;
+    for (int i=0; i<REC_COUNT; ++i){
+        recovery_format_code(codes[i]);
+        random_bytes(rec.salt[i], REC_SALT_LEN);
+        char norm[32];
+        recovery_normalize_code(codes[i], norm, sizeof(norm));
+        recovery_hash_code(rec.salt[i], norm, rec.hash[i]);
+    }
+    nvs_handle_t nvs;
+    esp_err_t err = recovery_open(NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    char key[32]; k_reckey(user, key);
+    err = nvs_set_blob(nvs, key, &rec, sizeof(rec));
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+esp_err_t userdb_recovery_revoke(const char* user){
+    if (!user || !user[0]) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t nvs;
+    esp_err_t err = recovery_open(NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    char key[32]; k_reckey(user, key);
+    err = nvs_erase_key(nvs, key);
+    if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    return err;
+}
+
+static esp_err_t recovery_load(const char* user, recovery_rec_t *rec, nvs_handle_t *out_nvs, char key[32]){
+    if (!user || !rec) return ESP_ERR_INVALID_ARG;
+    nvs_handle_t nvs;
+    esp_err_t err = recovery_open(NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    k_reckey(user, key);
+    size_t len = sizeof(*rec);
+    err = nvs_get_blob(nvs, key, rec, &len);
+    if (err != ESP_OK || len != sizeof(*rec) || rec->ver != REC_VER){
+        nvs_close(nvs);
+        return ESP_ERR_NVS_NOT_FOUND;
+    }
+    if (out_nvs) *out_nvs = nvs; else nvs_close(nvs);
+    return ESP_OK;
+}
+
+size_t userdb_recovery_remaining(const char* user){
+    recovery_rec_t rec; nvs_handle_t nvs=0; char key[32];
+    if (recovery_load(user, &rec, &nvs, key) != ESP_OK) return 0;
+    size_t n=0;
+    for (int i=0; i<rec.count && i<REC_COUNT; ++i) if (!rec.used[i]) n++;
+    nvs_close(nvs);
+    return n;
+}
+
+bool userdb_recovery_verify_and_consume(const char* user, const char* code){
+    if (!user || !code) return false;
+    char norm[32];
+    recovery_normalize_code(code, norm, sizeof(norm));
+    if (strlen(norm) < 12) return false;
+    recovery_rec_t rec; nvs_handle_t nvs=0; char key[32];
+    if (recovery_load(user, &rec, &nvs, key) != ESP_OK) return false;
+    bool ok=false;
+    int match=-1;
+    for (int i=0; i<rec.count && i<REC_COUNT; ++i){
+        uint8_t hash[REC_HASH_LEN];
+        recovery_hash_code(rec.salt[i], norm, hash);
+        uint8_t eq = (uint8_t)(ct_memcmp32(hash, rec.hash[i]) == 0);
+        if (eq && !rec.used[i] && match < 0) match = i;
+    }
+    if (match >= 0){
+        rec.used[match] = 1;
+        esp_err_t err = nvs_set_blob(nvs, key, &rec, sizeof(rec));
+        if (err == ESP_OK) err = nvs_commit(nvs);
+        ok = (err == ESP_OK);
+    }
+    nvs_close(nvs);
+    return ok;
+}

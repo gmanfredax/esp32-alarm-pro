@@ -46,6 +46,7 @@
 #include "can_master.h"
 
 #include "lwip/apps/sntp.h"
+#include "system_time.h"
 #include "esp_idf_version.h"
 #include <time.h>
 
@@ -80,6 +81,7 @@ static void sntp_start_and_wait(void){
         ESP_LOGW("time", "SNTP non sincronizzato (timeout)");
     } else {
         ESP_LOGI("time", "SNTP ok: %ld", (long)now);
+        system_time_mark_sntp_synced((int64_t)now);
     }
 }
 
