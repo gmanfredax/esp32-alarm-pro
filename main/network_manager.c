@@ -51,6 +51,15 @@ typedef struct {
     bool eth_has_ip;
     bool wifi_connected;
     bool setup_ap_active;
+    bool setup_ap_ip_configured;
+    bool setup_ap_dhcp_started;
+    uint32_t setup_ap_start_count;
+    uint32_t setup_ap_client_count;
+    uint64_t setup_ap_last_start_ms;
+    char setup_ap_last_reason[48];
+    char setup_ap_last_client_event[96];
+    wifi_mode_t wifi_current_mode;
+    bool wifi_started;
     bool wifi_has_ip;
     uint32_t wifi_failures;
     int wifi_rssi;
@@ -284,16 +293,30 @@ static esp_err_t ensure_wifi_driver(void)
 }
 
 
-static esp_err_t configure_ap_ip(void)
+static esp_err_t configure_ap_ip_locked(void)
 {
     if (!s_ap_netif) return ESP_ERR_INVALID_STATE;
+    if (s_net.setup_ap_ip_configured && s_net.setup_ap_dhcp_started) return ESP_OK;
+
     esp_netif_ip_info_t ip_info = {0};
     ip_info.ip.addr = ipaddr_addr(NETWORK_SETUP_AP_IP);
     ip_info.gw.addr = ipaddr_addr(NETWORK_SETUP_AP_IP);
     ip_info.netmask.addr = ipaddr_addr(NETWORK_SETUP_AP_NETMASK);
-    esp_netif_dhcps_stop(s_ap_netif);
-    ESP_RETURN_ON_ERROR(esp_netif_set_ip_info(s_ap_netif, &ip_info), TAG, "ap_ip");
-    return esp_netif_dhcps_start(s_ap_netif);
+
+    if (!s_net.setup_ap_ip_configured) {
+        esp_err_t err = esp_netif_dhcps_stop(s_ap_netif);
+        if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED) return err;
+        s_net.setup_ap_dhcp_started = false;
+        ESP_RETURN_ON_ERROR(esp_netif_set_ip_info(s_ap_netif, &ip_info), TAG, "ap_ip");
+        s_net.setup_ap_ip_configured = true;
+    }
+
+    if (!s_net.setup_ap_dhcp_started) {
+        esp_err_t err = esp_netif_dhcps_start(s_ap_netif);
+        if (err != ESP_OK && err != ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED) return err;
+        s_net.setup_ap_dhcp_started = true;
+    }
+    return ESP_OK;
 }
 
 static esp_err_t wifi_apply_mode_locked(void)
@@ -301,16 +324,42 @@ static esp_err_t wifi_apply_mode_locked(void)
     wifi_mode_t mode = WIFI_MODE_NULL;
     if (s_net.wifi_sta_started || s_net.wifi_runtime_desired) mode = WIFI_MODE_STA;
     if (s_net.setup_ap_active) mode = (mode == WIFI_MODE_STA) ? WIFI_MODE_APSTA : WIFI_MODE_AP;
-    return esp_wifi_set_mode(mode);
+    if (s_net.wifi_current_mode == mode) return ESP_OK;
+    esp_err_t err = esp_wifi_set_mode(mode);
+    if (err == ESP_OK) s_net.wifi_current_mode = mode;
+    return err;
+}
+
+static esp_err_t wifi_start_once_locked(void)
+{
+    if (s_net.wifi_started) return ESP_OK;
+    esp_err_t err = esp_wifi_start();
+    if (err == ESP_ERR_WIFI_CONN) err = ESP_OK;
+    if (err == ESP_OK) s_net.wifi_started = true;
+    return err;
+}
+
+static void wifi_stop_driver_locked(void)
+{
+    if (!s_net.wifi_started) return;
+    esp_wifi_stop();
+    s_net.wifi_started = false;
+    s_net.wifi_current_mode = WIFI_MODE_NULL;
 }
 
 static esp_err_t setup_ap_start_locked(const char *reason)
 {
     if (!setup_ap_allowed(&s_net.cfg)) return ESP_ERR_INVALID_STATE;
+    if (s_net.setup_ap_active) {
+        if (!has_real_link_locked()) set_active_locked(NETWORK_IF_SETUP_AP);
+        ESP_LOGD(TAG, "Fallback AP already active");
+        return ESP_OK;
+    }
+
     ESP_RETURN_ON_ERROR(ensure_wifi_driver(), TAG, "ensure_wifi_ap");
     build_setup_ap_ssid(s_net.setup_ap_ssid, sizeof(s_net.setup_ap_ssid));
     strlcpy(s_net.setup_ap_ip, NETWORK_SETUP_AP_IP, sizeof(s_net.setup_ap_ip));
-    ESP_RETURN_ON_ERROR(configure_ap_ip(), TAG, "ap_ip_config");
+    ESP_RETURN_ON_ERROR(configure_ap_ip_locked(), TAG, "ap_ip_config");
 
     char ap_pass[NETWORK_WIFI_PASSWORD_MAX + 1] = {0};
     if (s_net.cfg.fallback_ap_password_set && strlen(s_net.cfg.fallback_ap_password) >= 8) {
@@ -325,20 +374,29 @@ static esp_err_t setup_ap_start_locked(const char *reason)
     ap_cfg.ap.channel = NETWORK_SETUP_AP_CHANNEL;
     ap_cfg.ap.max_connection = 4;
     ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ap_cfg.ap.ssid_hidden = 0;
+    ap_cfg.ap.pmf_cfg.required = false;
     strlcpy((char *)ap_cfg.ap.password, ap_pass, sizeof(ap_cfg.ap.password));
     if (strlen(ap_pass) < 8) ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
 
-    bool already = s_net.setup_ap_active;
     s_net.setup_ap_active = true;
-    ESP_RETURN_ON_ERROR(wifi_apply_mode_locked(), TAG, "ap_mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg), TAG, "ap_config");
-    esp_err_t err = esp_wifi_start();
-    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
-    if (!has_real_link_locked()) set_active_locked(NETWORK_IF_SETUP_AP);
-    if (!already) {
-        ESP_LOGW(TAG, "Fallback AP attivo: SSID=%s IP=%s motivo=%s", s_net.setup_ap_ssid, s_net.setup_ap_ip, reason ? reason : "fallback");
-        ESP_LOGW(TAG, "MQTT sospeso: AP setup senza connettività broker");
+    esp_err_t err = wifi_apply_mode_locked();
+    if (err == ESP_OK) err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    if (err == ESP_OK) err = wifi_start_once_locked();
+    if (err != ESP_OK) {
+        s_net.setup_ap_active = false;
+        s_net.setup_ap_ssid[0] = '\0';
+        s_net.setup_ap_ip[0] = '\0';
+        return err;
     }
+    if (!has_real_link_locked()) set_active_locked(NETWORK_IF_SETUP_AP);
+    s_net.setup_ap_start_count++;
+    s_net.setup_ap_last_start_ms = now_ms();
+    strlcpy(s_net.setup_ap_last_reason, reason ? reason : "fallback", sizeof(s_net.setup_ap_last_reason));
+    ESP_LOGW(TAG, "Fallback AP started: SSID=%s IP=%s reason=%s start_count=%lu",
+             s_net.setup_ap_ssid, s_net.setup_ap_ip, s_net.setup_ap_last_reason,
+             (unsigned long)s_net.setup_ap_start_count);
+    ESP_LOGW(TAG, "MQTT sospeso: AP setup senza connettività broker");
     return ESP_OK;
 }
 
@@ -350,7 +408,7 @@ static void setup_ap_stop_locked(void)
     s_net.setup_ap_ip[0] = '\0';
     if (s_net.active_if == NETWORK_IF_SETUP_AP) set_active_locked(NETWORK_IF_NONE);
     wifi_apply_mode_locked();
-    if (!s_net.wifi_sta_started) esp_wifi_stop();
+    if (!s_net.wifi_sta_started && !s_net.wifi_runtime_desired) wifi_stop_driver_locked();
     ESP_LOGI(TAG, "AP fallback disattivato");
 }
 
@@ -377,9 +435,9 @@ static esp_err_t wifi_start_sta_locked(void)
     s_net.wifi_runtime_desired = true;
     ESP_RETURN_ON_ERROR(wifi_apply_mode_locked(), TAG, "wifi_mode_sta");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg), TAG, "wifi_config");
-    esp_err_t err = esp_wifi_start();
+    esp_err_t err = wifi_start_once_locked();
     if (err == ESP_ERR_WIFI_NOT_INIT) return err;
-    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
+    if (err != ESP_OK) return err;
     s_net.wifi_sta_started = true;
     err = esp_wifi_connect();
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
@@ -394,7 +452,7 @@ static void wifi_stop_sta_locked(void)
     s_net.wifi_sta_started = false;
     s_net.wifi_runtime_desired = false;
     wifi_apply_mode_locked();
-    if (!s_net.setup_ap_active) esp_wifi_stop();
+    if (!s_net.setup_ap_active) wifi_stop_driver_locked();
     s_net.wifi_connected = false;
     s_net.wifi_has_ip = false;
     s_net.wifi_ip[0] = '\0';
@@ -499,11 +557,12 @@ static void network_ip_event_handler(void *arg, esp_event_base_t base, int32_t i
 
 static void network_wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
-    (void)arg; (void)base; (void)data;
+    (void)arg; (void)base;
     if (!s_net.lock) return;
     bool stop_mqtt = false;
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
     if (id == WIFI_EVENT_STA_START) {
+        s_net.wifi_started = true;
         s_net.wifi_sta_started = true;
     } else if (id == WIFI_EVENT_STA_CONNECTED) {
         s_net.wifi_connected = true;
@@ -520,10 +579,32 @@ static void network_wifi_event_handler(void *arg, esp_event_base_t base, int32_t
         stop_mqtt = was_active && !has_real_link_locked();
     } else if (id == WIFI_EVENT_STA_STOP) {
         bool was_active = s_net.active_if == NETWORK_IF_WIFI || s_net.wifi_has_ip;
+        s_net.wifi_started = false;
+        s_net.wifi_current_mode = WIFI_MODE_NULL;
         s_net.wifi_sta_started = false;
         s_net.wifi_connected = false;
         s_net.wifi_has_ip = false;
         stop_mqtt = was_active && !has_real_link_locked();
+    } else if (id == WIFI_EVENT_AP_START) {
+        s_net.wifi_started = true;
+    } else if (id == WIFI_EVENT_AP_STOP) {
+        s_net.setup_ap_active = false;
+        s_net.setup_ap_client_count = 0;
+        s_net.wifi_started = s_net.wifi_sta_started;
+    } else if (id == WIFI_EVENT_AP_STACONNECTED && data) {
+        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)data;
+        if (s_net.setup_ap_client_count < UINT32_MAX) s_net.setup_ap_client_count++;
+        snprintf(s_net.setup_ap_last_client_event, sizeof(s_net.setup_ap_last_client_event),
+                 "join " MACSTR " aid=%u", MAC2STR(event->mac), event->aid);
+        ESP_LOGI(TAG, "Fallback AP station join: " MACSTR " aid=%u clients=%lu",
+                 MAC2STR(event->mac), event->aid, (unsigned long)s_net.setup_ap_client_count);
+    } else if (id == WIFI_EVENT_AP_STADISCONNECTED && data) {
+        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)data;
+        if (s_net.setup_ap_client_count > 0) s_net.setup_ap_client_count--;
+        snprintf(s_net.setup_ap_last_client_event, sizeof(s_net.setup_ap_last_client_event),
+                 "leave " MACSTR " aid=%u reason=%u", MAC2STR(event->mac), event->aid, event->reason);
+        ESP_LOGI(TAG, "Fallback AP station leave: " MACSTR " aid=%u reason=%u clients=%lu",
+                 MAC2STR(event->mac), event->aid, event->reason, (unsigned long)s_net.setup_ap_client_count);
     }
     xSemaphoreGive(s_net.lock);
     if (stop_mqtt) {
@@ -606,7 +687,7 @@ static void manager_loop(void *arg)
             else if (mode == NETWORK_MODE_ETHERNET_ONLY && eth_timed_out) { needs_setup_ap = true; reason = "ethernet_no_ip"; }
         }
 
-        if (needs_setup_ap) {
+        if (needs_setup_ap && !s_net.setup_ap_active) {
             setup_ap_start_locked(reason);
         } else if (has_real_link_locked() && s_net.setup_ap_active) {
             setup_ap_stop_locked();
@@ -706,6 +787,11 @@ esp_err_t network_get_status(network_status_t *out)
     out->setup_ap_active = s_net.setup_ap_active;
     strlcpy(out->setup_ap_ssid, s_net.setup_ap_ssid, sizeof(out->setup_ap_ssid));
     strlcpy(out->setup_ap_ip, s_net.setup_ap_ip[0] ? s_net.setup_ap_ip : NETWORK_SETUP_AP_IP, sizeof(out->setup_ap_ip));
+    out->setup_ap_client_count = s_net.setup_ap_client_count;
+    out->setup_ap_start_count = s_net.setup_ap_start_count;
+    out->setup_ap_last_start_ms = s_net.setup_ap_last_start_ms;
+    strlcpy(out->setup_ap_last_reason, s_net.setup_ap_last_reason, sizeof(out->setup_ap_last_reason));
+    strlcpy(out->setup_ap_last_client_event, s_net.setup_ap_last_client_event, sizeof(out->setup_ap_last_client_event));
     out->fallback_ap_enabled = s_net.cfg.fallback_ap_enabled;
     out->fallback_ap_password_set = s_net.cfg.fallback_ap_password_set;
     strlcpy(out->last_error, s_net.last_error, sizeof(out->last_error));
@@ -749,6 +835,11 @@ esp_err_t network_status_append_json(cJSON *root)
     cJSON_AddBoolToObject(ap, "active", st.setup_ap_active);
     cJSON_AddStringToObject(ap, "ssid", st.setup_ap_ssid);
     cJSON_AddStringToObject(ap, "ip", st.setup_ap_ip);
+    cJSON_AddNumberToObject(ap, "clients", st.setup_ap_client_count);
+    cJSON_AddNumberToObject(ap, "start_count", st.setup_ap_start_count);
+    cJSON_AddNumberToObject(ap, "last_start_ms", (double)st.setup_ap_last_start_ms);
+    cJSON_AddStringToObject(ap, "last_reason", st.setup_ap_last_reason);
+    cJSON_AddStringToObject(ap, "last_client_event", st.setup_ap_last_client_event);
     cJSON_AddBoolToObject(ap, "password_set", st.fallback_ap_password_set);
 
     cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
@@ -805,8 +896,7 @@ esp_err_t network_wifi_scan_append_json(cJSON *array)
         err = wifi_apply_mode_locked();
     }
     if (err == ESP_OK) {
-        err = esp_wifi_start();
-        if (err == ESP_ERR_WIFI_CONN) err = ESP_OK;
+        err = wifi_start_once_locked();
     }
     xSemaphoreGive(s_net.lock);
     if (err != ESP_OK) return err;

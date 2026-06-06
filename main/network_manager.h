@@ -62,6 +62,11 @@ typedef struct {
     bool setup_ap_active;
     char setup_ap_ssid[NETWORK_WIFI_SSID_MAX + 1];
     char setup_ap_ip[16];
+    uint32_t setup_ap_client_count;
+    uint32_t setup_ap_start_count;
+    uint64_t setup_ap_last_start_ms;
+    char setup_ap_last_reason[48];
+    char setup_ap_last_client_event[96];
     bool fallback_ap_enabled;
     bool fallback_ap_password_set;
     char last_error[96];

@@ -2323,6 +2323,10 @@
       ["Password Wi-Fi", wifi.password_set ? "configurata" : "non configurata"],
       ["AP fallback", c.setup_ap?.active ? `attivo (${c.setup_ap.ssid || "—"})` : (c.setup_ap?.enabled ? "abilitato" : "disabilitato")],
       ["IP AP fallback", c.setup_ap?.ip || "192.168.4.1"],
+      ["Client AP fallback", Number.isFinite(c.setup_ap?.clients) ? c.setup_ap.clients : "—"],
+      ["Avvii AP fallback", Number.isFinite(c.setup_ap?.start_count) ? c.setup_ap.start_count : "—"],
+      ["Motivo ultimo AP", c.setup_ap?.last_reason || "—"],
+      ["Ultimo evento client AP", c.setup_ap?.last_client_event || "—"],
       ["Password AP", c.setup_ap?.password_set ? "configurata" : "non configurata"],
       ["Ultimo errore", c.last_error || "—"],
     ];
