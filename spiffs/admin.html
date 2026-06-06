@@ -257,13 +257,18 @@
                 <div class="row" style="gap:1rem;flex-wrap:wrap;margin-top:.4rem">
                   <label class="field"><span>SSID Wi-Fi</span><input id="net_wifi_ssid" type="text" maxlength="32" autocomplete="off" placeholder="Casa" /></label>
                   <label class="field"><span>Password Wi-Fi</span><input id="net_wifi_password" type="password" maxlength="64" autocomplete="new-password" placeholder="lascia vuoto per mantenerla" /></label>
+                  <label class="field"><span>AP fallback</span><select id="net_setup_enabled"><option value="1">Abilitato</option><option value="0">Disabilitato</option></select></label>
+                  <label class="field"><span>Password AP fallback</span><input id="net_setup_password" type="password" minlength="8" maxlength="64" autocomplete="new-password" placeholder="lascia vuoto per mantenerla" /></label>
                 </div>
-                <div class="row" style="justify-content:flex-end;margin-top:.6rem;gap:.5rem">
+                <div id="netWifiScan" class="info-grid" style="margin-top:.6rem"></div>
+                <div class="row" style="justify-content:flex-end;margin-top:.6rem;gap:.5rem;flex-wrap:wrap">
+                  <button class="btn" id="btnNetWifiScan" type="button">Scansiona reti Wi-Fi</button>
                   <button class="btn" id="btnNetWifiTest" type="button">Test Wi-Fi</button>
+                  <button class="btn" id="btnNetSetupExit" type="button">Esci dal setup</button>
                   <button class="btn" id="btnNetRestart" type="button">Riavvia rete</button>
                   <button class="btn" id="btnNetSave" type="button">Salva configurazione</button>
                 </div>
-                <small class="muted">La password non viene mai mostrata né restituita dalle API. Per Solo Wi-Fi serve prima un Test Wi-Fi riuscito.</small>
+                <small class="muted">La password non viene mai mostrata né restituita dalle API. In AP fallback la UI è raggiungibile su http://192.168.4.1</small>
               </form>
             </div>
           </section>

@@ -2391,12 +2391,45 @@ static esp_err_t api_admin_network_get(httpd_req_t* req)
     return json_reply_cjson(req, root);
 }
 
+static esp_err_t api_network_status_get(httpd_req_t* req)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    network_status_append_json(root);
+    return json_reply_cjson(req, root);
+}
+
 static esp_err_t api_admin_network_restart_post(httpd_req_t* req)
 {
     if (only_admin(req)!=ESP_OK) return ESP_FAIL;
     esp_err_t err = network_manager_restart();
     if (err != ESP_OK) return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "restart_failed", "Riavvio rete fallito");
     return json_reply(req, "{\"ok\":true,\"message\":\"Riavvio rete avviato\"}");
+}
+
+static esp_err_t api_admin_network_wifi_scan_get(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    cJSON *arr = cJSON_AddArrayToObject(root, "networks");
+    if (!arr) { cJSON_Delete(root); return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL; }
+    esp_err_t err = network_wifi_scan_append_json(arr);
+    if (err != ESP_OK) {
+        cJSON_Delete(root);
+        return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "wifi_scan_failed", "Scansione reti Wi-Fi fallita");
+    }
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_admin_network_setup_exit_post(httpd_req_t* req)
+{
+    if (only_admin(req)!=ESP_OK) return ESP_FAIL;
+    esp_err_t err = network_setup_exit();
+    if (err != ESP_OK) {
+        return network_json_error(req, HTTPD_400_BAD_REQUEST, "setup_exit_failed", "Impossibile uscire dal setup senza una rete operativa");
+    }
+    return json_reply(req, "{\"ok\":true,\"message\":\"Modalità setup disattivata\"}");
 }
 
 static esp_err_t api_admin_network_wifi_test_post(httpd_req_t* req)
@@ -2437,8 +2470,12 @@ static esp_err_t api_admin_network_post(httpd_req_t* req)
     const cJSON *jmode = cJSON_GetObjectItemCaseSensitive(j, "network_mode");
     const cJSON *jhost = cJSON_GetObjectItemCaseSensitive(j, "hostname");
     const cJSON *jwifi = cJSON_GetObjectItemCaseSensitive(j, "wifi");
+    const cJSON *jsetup = cJSON_GetObjectItemCaseSensitive(j, "setup_ap");
     const cJSON *jssid = jwifi ? cJSON_GetObjectItemCaseSensitive(jwifi, "ssid") : cJSON_GetObjectItemCaseSensitive(j, "wifi_ssid");
     const cJSON *jpass = jwifi ? cJSON_GetObjectItemCaseSensitive(jwifi, "password") : cJSON_GetObjectItemCaseSensitive(j, "wifi_password");
+    const cJSON *jclear = jwifi ? cJSON_GetObjectItemCaseSensitive(jwifi, "clear_password") : cJSON_GetObjectItemCaseSensitive(j, "wifi_clear_password");
+    const cJSON *jap_enabled = jsetup ? cJSON_GetObjectItemCaseSensitive(jsetup, "enabled") : cJSON_GetObjectItemCaseSensitive(j, "fallback_ap_enabled");
+    const cJSON *jap_pass = jsetup ? cJSON_GetObjectItemCaseSensitive(jsetup, "password") : cJSON_GetObjectItemCaseSensitive(j, "fallback_ap_password");
 
     if (cJSON_IsString(jmode)) {
         network_mode_t mode;
@@ -2453,10 +2490,19 @@ static esp_err_t api_admin_network_post(httpd_req_t* req)
         if (strlen(jssid->valuestring) > NETWORK_WIFI_SSID_MAX) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_ssid_too_long", "SSID Wi-Fi massimo 32 caratteri"); }
         strlcpy(cfg.wifi_ssid, jssid->valuestring, sizeof(cfg.wifi_ssid));
     }
-    if (cJSON_IsString(jpass) && jpass->valuestring && jpass->valuestring[0]) {
+    if (cJSON_IsTrue(jclear)) {
+        cfg.wifi_password[0] = '\0';
+        cfg.wifi_password_set = false;
+    } else if (cJSON_IsString(jpass) && jpass->valuestring && jpass->valuestring[0]) {
         if (strlen(jpass->valuestring) > NETWORK_WIFI_PASSWORD_MAX) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_password_too_long", "Password Wi-Fi massimo 64 caratteri"); }
         strlcpy(cfg.wifi_password, jpass->valuestring, sizeof(cfg.wifi_password));
         cfg.wifi_password_set = true;
+    }
+    if (cJSON_IsBool(jap_enabled)) cfg.fallback_ap_enabled = cJSON_IsTrue(jap_enabled);
+    if (cJSON_IsString(jap_pass) && jap_pass->valuestring && jap_pass->valuestring[0]) {
+        if (strlen(jap_pass->valuestring) > NETWORK_WIFI_PASSWORD_MAX || strlen(jap_pass->valuestring) < 8) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "setup_ap_password_invalid", "Password AP setup da 8 a 64 caratteri"); }
+        strlcpy(cfg.fallback_ap_password, jap_pass->valuestring, sizeof(cfg.fallback_ap_password));
+        cfg.fallback_ap_password_set = true;
     }
     if (network_mode_requires_wifi(cfg.mode)) {
         if (!cfg.wifi_ssid[0]) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "missing_wifi_ssid", "SSID Wi-Fi obbligatorio per la modalità selezionata"); }
@@ -6667,6 +6713,10 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/admin/network", .method = HTTP_POST, .handler = api_admin_network_post },
     { .uri = "/api/admin/network/restart", .method = HTTP_POST, .handler = api_admin_network_restart_post },
     { .uri = "/api/admin/network/wifi/test", .method = HTTP_POST, .handler = api_admin_network_wifi_test_post },
+    { .uri = "/api/admin/network/wifi/scan", .method = HTTP_GET, .handler = api_admin_network_wifi_scan_get },
+    { .uri = "/api/admin/network/setup/exit", .method = HTTP_POST, .handler = api_admin_network_setup_exit_post },
+    { .uri = "/api/network/status", .method = HTTP_GET, .handler = api_network_status_get },
+    { .uri = "/api/network/config", .method = HTTP_POST, .handler = api_admin_network_post },
     { .uri = "/api/admin/mqtt", .method = HTTP_GET, .handler = sys_mqtt_get },
     { .uri = "/api/admin/mqtt", .method = HTTP_POST, .handler = sys_mqtt_post },
     { .uri = "/api/admin/mqtt/rediscover", .method = HTTP_POST, .handler = api_admin_mqtt_rediscover_post },

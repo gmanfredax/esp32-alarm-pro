@@ -2321,6 +2321,9 @@
       ["IP Wi-Fi", wifi.ip || "0.0.0.0"],
       ["MAC Wi-Fi", wifi.mac || "—"],
       ["Password Wi-Fi", wifi.password_set ? "configurata" : "non configurata"],
+      ["AP fallback", c.setup_ap?.active ? `attivo (${c.setup_ap.ssid || "—"})` : (c.setup_ap?.enabled ? "abilitato" : "disabilitato")],
+      ["IP AP fallback", c.setup_ap?.ip || "192.168.4.1"],
+      ["Password AP", c.setup_ap?.password_set ? "configurata" : "non configurata"],
       ["Ultimo errore", c.last_error || "—"],
     ];
     box.innerHTML = items.map(([k,v]) => `<div><span>${k}</span><strong>${v}</strong></div>`).join("");
@@ -2334,7 +2337,21 @@
       $("#net_host") && ($("#net_host").value = c.hostname || "");
       $("#net_wifi_ssid") && ($("#net_wifi_ssid").value = c.wifi?.ssid || "");
       $("#net_wifi_password") && ($("#net_wifi_password").value = "");
+      $("#net_setup_enabled") && ($("#net_setup_enabled").value = c.setup_ap?.enabled === false ? "0" : "1");
+      $("#net_setup_password") && ($("#net_setup_password").value = "");
     }catch(e){ toast("Errore caricando rete: " + e.message, false); }
+
+    $("#btnNetWifiScan")?.addEventListener("click", async ()=>{
+      try{
+        const res = await apiGet("/api/admin/network/wifi/scan");
+        const box = $("#netWifiScan");
+        if (box){
+          const nets = res.networks || [];
+          box.innerHTML = nets.length ? nets.map(n => `<button class="btn" type="button" data-ssid="${escapeHtml(n.ssid || "")}">${escapeHtml(n.ssid || "(nascosta)")} · ${n.rssi || 0} dBm · ${escapeHtml(n.security || "")}</button>`).join("") : "<div><span>Reti</span><strong>Nessuna rete trovata</strong></div>";
+          box.querySelectorAll("button[data-ssid]").forEach(b => b.addEventListener("click", ()=>{ const v=b.getAttribute("data-ssid")||""; if(v) $("#net_wifi_ssid").value=v; }));
+        }
+      }catch(e){ toast("Scansione Wi-Fi fallita: " + e.message, false); }
+    });
 
     $("#btnNetWifiTest")?.addEventListener("click", async ()=>{
       const ssid = ($("#net_wifi_ssid")?.value || "").trim();
@@ -2347,6 +2364,11 @@
       }catch(e){ toast("Test Wi-Fi fallito: " + e.message, false); }
     });
 
+    $("#btnNetSetupExit")?.addEventListener("click", async ()=>{
+      try{ await apiPost("/api/admin/network/setup/exit", {}); toast("Uscita setup richiesta"); setTimeout(loadNetwork, 1000); }
+      catch(e){ toast("Uscita setup: " + e.message, false); }
+    });
+
     $("#btnNetRestart")?.addEventListener("click", async ()=>{
       try{ await apiPost("/api/admin/network/restart", {}); toast("Riavvio rete avviato"); setTimeout(loadNetwork, 1500); }
       catch(e){ toast("Riavvio rete: " + e.message, false); }
@@ -2357,9 +2379,11 @@
       const ssid = ($("#net_wifi_ssid")?.value || "").trim();
       const password = $("#net_wifi_password")?.value || "";
       if ((mode === "wifi_only" || mode === "ethernet_preferred" || mode === "wifi_preferred") && !ssid) return toast("SSID Wi-Fi obbligatorio per la modalità scelta", false);
-      const body = { network_mode: mode, hostname: ($("#net_host")?.value || "").trim(), wifi: { ssid } };
+      const setupPass = $("#net_setup_password")?.value || "";
+      const body = { network_mode: mode, hostname: ($("#net_host")?.value || "").trim(), wifi: { ssid }, setup_ap: { enabled: ($("#net_setup_enabled")?.value || "1") === "1" } };
       if (password) body.wifi.password = password;
-      try{ await apiPost("/api/admin/network", body); toast("Configurazione rete salvata"); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); await loadNetwork(); }
+      if (setupPass) body.setup_ap.password = setupPass;
+      try{ await apiPost("/api/admin/network", body); toast("Configurazione rete salvata"); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); await loadNetwork(); }
       catch(e){ toast("Errore salvataggio rete: " + e.message, false); }
     });
   }

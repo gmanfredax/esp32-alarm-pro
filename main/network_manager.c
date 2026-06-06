@@ -4,7 +4,6 @@
 #include <stdio.h>
 #include <inttypes.h>
 #include <sys/param.h>
-
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -20,6 +19,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/inet.h"
 
 #include "ethernet.h"
 #include "app_mqtt.h"
@@ -31,7 +31,13 @@ static const char *TAG = "network";
 #define NETWORK_WAIT_ACTIVE_BIT BIT0
 #define NETWORK_WIFI_TEST_MAX_AGE_MS (10ULL * 60ULL * 1000ULL)
 #define NETWORK_FALLBACK_TIMEOUT_MS 8000
+#define NETWORK_ETH_IP_TIMEOUT_MS 20000
+#define NETWORK_WIFI_MAX_ATTEMPTS 4
+#define NETWORK_WIFI_CONNECT_TIMEOUT_MS 8000
 #define NETWORK_WIFI_RETRY_BASE_MS 5000
+#define NETWORK_SETUP_AP_IP "192.168.4.1"
+#define NETWORK_SETUP_AP_NETMASK "255.255.255.0"
+#define NETWORK_SETUP_AP_CHANNEL 6
 #define NETWORK_WIFI_RETRY_MAX_MS 60000
 
 typedef struct {
@@ -44,10 +50,14 @@ typedef struct {
     bool eth_link_up;
     bool eth_has_ip;
     bool wifi_connected;
+    bool setup_ap_active;
     bool wifi_has_ip;
+    uint32_t wifi_failures;
     int wifi_rssi;
     network_active_if_t active_if;
     char eth_ip[16];
+    char setup_ap_ssid[NETWORK_WIFI_SSID_MAX + 1];
+    char setup_ap_ip[16];
     char wifi_ip[16];
     char last_error[96];
     uint64_t last_change_ms;
@@ -59,6 +69,7 @@ typedef struct {
 } network_state_t;
 
 static network_state_t s_net = {0};
+static esp_netif_t *s_ap_netif = NULL;
 static esp_netif_t *s_wifi_netif = NULL;
 static TaskHandle_t s_manager_task = NULL;
 
@@ -82,7 +93,7 @@ static void set_active_locked(network_active_if_t iface)
     s_net.active_if = iface;
     s_net.last_change_ms = now_ms();
     if (s_net.events) {
-        if (iface != NETWORK_IF_NONE) xEventGroupSetBits(s_net.events, NETWORK_WAIT_ACTIVE_BIT);
+        if (iface == NETWORK_IF_ETHERNET || iface == NETWORK_IF_WIFI) xEventGroupSetBits(s_net.events, NETWORK_WAIT_ACTIVE_BIT);
         else xEventGroupClearBits(s_net.events, NETWORK_WAIT_ACTIVE_BIT);
     }
     ESP_LOGI(TAG, "Interfaccia attiva: %s", network_active_if_to_str(iface));
@@ -91,6 +102,39 @@ static void set_active_locked(network_active_if_t iface)
 static bool wifi_configured(const network_config_t *cfg)
 {
     return cfg && cfg->wifi_ssid[0] && cfg->wifi_password_set;
+}
+
+static bool setup_ap_allowed(const network_config_t *cfg)
+{
+    return !cfg || cfg->fallback_ap_enabled;
+}
+
+static bool has_real_link_locked(void)
+{
+    return s_net.active_if == NETWORK_IF_ETHERNET || s_net.active_if == NETWORK_IF_WIFI ||
+           s_net.eth_has_ip || s_net.wifi_has_ip;
+}
+
+static void build_default_ap_password(char *out, size_t len)
+{
+    uint8_t mac[6] = {0};
+    if (!out || !len) return;
+    if (esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP) == ESP_OK || esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        snprintf(out, len, "NS%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    } else {
+        strlcpy(out, "NSAlarmPro-Setup!", len);
+    }
+}
+
+static void build_setup_ap_ssid(char *out, size_t len)
+{
+    uint8_t mac[6] = {0};
+    if (!out || !len) return;
+    if (esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP) == ESP_OK || esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        snprintf(out, len, "NSAlarmPro-Setup-%02X%02X", mac[4], mac[5]);
+    } else {
+        strlcpy(out, "NSAlarmPro-Setup", len);
+    }
 }
 
 bool network_mode_requires_wifi(network_mode_t mode)
@@ -124,6 +168,7 @@ const char *network_active_if_to_str(network_active_if_t iface)
     switch (iface) {
     case NETWORK_IF_ETHERNET: return "ethernet";
     case NETWORK_IF_WIFI: return "wifi";
+    case NETWORK_IF_SETUP_AP: return "setup_ap";
     default: return "none";
     }
 }
@@ -154,7 +199,10 @@ esp_err_t network_config_load(network_config_t *cfg)
     cfg->mode = NETWORK_MODE_ETHERNET_ONLY;
     cfg->wifi_dhcp = true;
     cfg->eth_dhcp = true;
+    cfg->fallback_ap_enabled = true;
     strlcpy(cfg->hostname, NETWORK_DEFAULT_HOSTNAME, sizeof(cfg->hostname));
+    build_default_ap_password(cfg->fallback_ap_password, sizeof(cfg->fallback_ap_password));
+    cfg->fallback_ap_password_set = true;
 
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(NETWORK_NVS_NS, NVS_READONLY, &nvs);
@@ -172,6 +220,18 @@ esp_err_t network_config_load(network_config_t *cfg)
     }
     uint32_t pass_set = cfg->wifi_password_set ? 1 : 0;
     if (nvs_get_u32(nvs, "wifi_pass_set", &pass_set) == ESP_OK) cfg->wifi_password_set = pass_set != 0;
+    uint32_t ap_enabled = cfg->fallback_ap_enabled ? 1 : 0;
+    if (nvs_get_u32(nvs, "fallback_ap", &ap_enabled) == ESP_OK) cfg->fallback_ap_enabled = ap_enabled != 0;
+    len = sizeof(cfg->fallback_ap_password);
+    if (nvs_get_str(nvs, "ap_pass", cfg->fallback_ap_password, &len) == ESP_OK && cfg->fallback_ap_password[0]) {
+        cfg->fallback_ap_password_set = true;
+    }
+    uint32_t ap_pass_set = cfg->fallback_ap_password_set ? 1 : 0;
+    if (nvs_get_u32(nvs, "ap_pass_set", &ap_pass_set) == ESP_OK) cfg->fallback_ap_password_set = ap_pass_set != 0;
+    if (!cfg->fallback_ap_password_set || strlen(cfg->fallback_ap_password) < 8) {
+        build_default_ap_password(cfg->fallback_ap_password, sizeof(cfg->fallback_ap_password));
+        cfg->fallback_ap_password_set = true;
+    }
     cfg->wifi_dhcp = true;
     cfg->eth_dhcp = true;
     nvs_close(nvs);
@@ -190,6 +250,11 @@ esp_err_t network_config_save(const network_config_t *cfg)
     if (err == ESP_OK && !cfg->wifi_password_set) err = nvs_erase_key(nvs, "wifi_pass");
     if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
     if (err == ESP_OK) err = nvs_set_u32(nvs, "wifi_pass_set", cfg->wifi_password_set ? 1 : 0);
+    if (err == ESP_OK) err = nvs_set_u32(nvs, "fallback_ap", cfg->fallback_ap_enabled ? 1 : 0);
+    if (err == ESP_OK && cfg->fallback_ap_password_set && cfg->fallback_ap_password[0]) err = nvs_set_str(nvs, "ap_pass", cfg->fallback_ap_password);
+    if (err == ESP_OK && (!cfg->fallback_ap_password_set || !cfg->fallback_ap_password[0])) err = nvs_erase_key(nvs, "ap_pass");
+    if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+    if (err == ESP_OK) err = nvs_set_u32(nvs, "ap_pass_set", cfg->fallback_ap_password_set ? 1 : 0);
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     return err;
@@ -205,14 +270,87 @@ static esp_err_t ensure_wifi_driver(void)
         s_wifi_netif = esp_netif_create_default_wifi_sta();
         if (!s_wifi_netif) return ESP_ERR_NO_MEM;
     }
+    if (!s_ap_netif) {
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+        if (!s_ap_netif) return ESP_ERR_NO_MEM;
+    }
     wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_RETURN_ON_ERROR(esp_wifi_init(&init_cfg), TAG, "wifi_init");
     ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, network_wifi_event_handler, NULL), TAG, "wifi_handler");
     ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, network_ip_event_handler, NULL), TAG, "ip_handler");
     ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "wifi_storage");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "wifi_mode");
     s_net.wifi_driver_ready = true;
     return ESP_OK;
+}
+
+
+static esp_err_t configure_ap_ip(void)
+{
+    if (!s_ap_netif) return ESP_ERR_INVALID_STATE;
+    esp_netif_ip_info_t ip_info = {0};
+    ip_info.ip.addr = ipaddr_addr(NETWORK_SETUP_AP_IP);
+    ip_info.gw.addr = ipaddr_addr(NETWORK_SETUP_AP_IP);
+    ip_info.netmask.addr = ipaddr_addr(NETWORK_SETUP_AP_NETMASK);
+    esp_netif_dhcps_stop(s_ap_netif);
+    ESP_RETURN_ON_ERROR(esp_netif_set_ip_info(s_ap_netif, &ip_info), TAG, "ap_ip");
+    return esp_netif_dhcps_start(s_ap_netif);
+}
+
+static esp_err_t wifi_apply_mode_locked(void)
+{
+    wifi_mode_t mode = WIFI_MODE_NULL;
+    if (s_net.wifi_sta_started || s_net.wifi_runtime_desired) mode = WIFI_MODE_STA;
+    if (s_net.setup_ap_active) mode = (mode == WIFI_MODE_STA) ? WIFI_MODE_APSTA : WIFI_MODE_AP;
+    return esp_wifi_set_mode(mode);
+}
+
+static esp_err_t setup_ap_start_locked(const char *reason)
+{
+    if (!setup_ap_allowed(&s_net.cfg)) return ESP_ERR_INVALID_STATE;
+    ESP_RETURN_ON_ERROR(ensure_wifi_driver(), TAG, "ensure_wifi_ap");
+    build_setup_ap_ssid(s_net.setup_ap_ssid, sizeof(s_net.setup_ap_ssid));
+    strlcpy(s_net.setup_ap_ip, NETWORK_SETUP_AP_IP, sizeof(s_net.setup_ap_ip));
+    ESP_RETURN_ON_ERROR(configure_ap_ip(), TAG, "ap_ip_config");
+
+    char ap_pass[NETWORK_WIFI_PASSWORD_MAX + 1] = {0};
+    if (s_net.cfg.fallback_ap_password_set && strlen(s_net.cfg.fallback_ap_password) >= 8) {
+        strlcpy(ap_pass, s_net.cfg.fallback_ap_password, sizeof(ap_pass));
+    } else {
+        build_default_ap_password(ap_pass, sizeof(ap_pass));
+    }
+
+    wifi_config_t ap_cfg = {0};
+    strlcpy((char *)ap_cfg.ap.ssid, s_net.setup_ap_ssid, sizeof(ap_cfg.ap.ssid));
+    ap_cfg.ap.ssid_len = strlen(s_net.setup_ap_ssid);
+    ap_cfg.ap.channel = NETWORK_SETUP_AP_CHANNEL;
+    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    strlcpy((char *)ap_cfg.ap.password, ap_pass, sizeof(ap_cfg.ap.password));
+    if (strlen(ap_pass) < 8) ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+
+    bool already = s_net.setup_ap_active;
+    s_net.setup_ap_active = true;
+    ESP_RETURN_ON_ERROR(wifi_apply_mode_locked(), TAG, "ap_mode");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg), TAG, "ap_config");
+    esp_err_t err = esp_wifi_start();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
+    if (!has_real_link_locked()) set_active_locked(NETWORK_IF_SETUP_AP);
+    if (!already) {
+        ESP_LOGW(TAG, "AP fallback attivo: SSID=%s IP=%s motivo=%s", s_net.setup_ap_ssid, s_net.setup_ap_ip, reason ? reason : "fallback");
+    }
+    return ESP_OK;
+}
+
+static void setup_ap_stop_locked(void)
+{
+    if (!s_net.setup_ap_active || !s_net.wifi_driver_ready) return;
+    s_net.setup_ap_active = false;
+    s_net.setup_ap_ssid[0] = '\0';
+    s_net.setup_ap_ip[0] = '\0';
+    if (s_net.active_if == NETWORK_IF_SETUP_AP) set_active_locked(NETWORK_IF_NONE);
+    wifi_apply_mode_locked();
+    if (!s_net.wifi_sta_started) esp_wifi_stop();
+    ESP_LOGI(TAG, "AP fallback disattivato");
 }
 
 static esp_err_t wifi_apply_hostname(void)
@@ -235,12 +373,13 @@ static esp_err_t wifi_start_sta_locked(void)
     memcpy(wifi_cfg.sta.password, s_net.cfg.wifi_password, MIN(strlen(s_net.cfg.wifi_password), sizeof(wifi_cfg.sta.password)));
     wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     wifi_cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+    s_net.wifi_runtime_desired = true;
+    ESP_RETURN_ON_ERROR(wifi_apply_mode_locked(), TAG, "wifi_mode_sta");
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg), TAG, "wifi_config");
     esp_err_t err = esp_wifi_start();
     if (err == ESP_ERR_WIFI_NOT_INIT) return err;
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
     s_net.wifi_sta_started = true;
-    s_net.wifi_runtime_desired = true;
     err = esp_wifi_connect();
     if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) return err;
     ESP_LOGI(TAG, "Wi-Fi STA avviato per SSID '%s'", s_net.cfg.wifi_ssid);
@@ -251,9 +390,10 @@ static void wifi_stop_sta_locked(void)
 {
     if (!s_net.wifi_driver_ready) return;
     esp_wifi_disconnect();
-    esp_wifi_stop();
     s_net.wifi_sta_started = false;
     s_net.wifi_runtime_desired = false;
+    wifi_apply_mode_locked();
+    if (!s_net.setup_ap_active) esp_wifi_stop();
     s_net.wifi_connected = false;
     s_net.wifi_has_ip = false;
     s_net.wifi_ip[0] = '\0';
@@ -292,11 +432,13 @@ static void network_eth_event_handler(void *arg, esp_event_base_t base, int32_t 
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
     if (id == ETHERNET_EVENT_CONNECTED) {
         s_net.eth_link_up = true;
+        ESP_LOGI(TAG, "Ethernet link up");
         set_error_locked("");
     } else if (id == ETHERNET_EVENT_DISCONNECTED || id == ETHERNET_EVENT_STOP) {
         s_net.eth_link_up = false;
         s_net.eth_has_ip = false;
         s_net.eth_ip[0] = '\0';
+        ESP_LOGW(TAG, "Ethernet link down");
         if (s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED && wifi_configured(&s_net.cfg)) {
             s_net.wifi_runtime_desired = true;
         }
@@ -314,7 +456,9 @@ static void network_ip_event_handler(void *arg, esp_event_base_t base, int32_t i
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         s_net.eth_has_ip = true;
         ip_to_str(&event->ip_info, s_net.eth_ip, sizeof(s_net.eth_ip));
+        ESP_LOGI(TAG, "Ethernet IP ottenuto: %s", s_net.eth_ip);
         set_error_locked("");
+        if (s_net.setup_ap_active) setup_ap_stop_locked();
         if (s_net.cfg.mode == NETWORK_MODE_ETHERNET_ONLY || s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED) {
             set_active_locked(NETWORK_IF_ETHERNET);
             if (s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED && s_net.wifi_sta_started) wifi_stop_sta_locked();
@@ -325,7 +469,10 @@ static void network_ip_event_handler(void *arg, esp_event_base_t base, int32_t i
         ip_to_str(&event->ip_info, s_net.wifi_ip, sizeof(s_net.wifi_ip));
         wifi_ap_record_t ap = {0};
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) s_net.wifi_rssi = ap.rssi;
+        ESP_LOGI(TAG, "Wi-Fi connesso, IP ottenuto: %s", s_net.wifi_ip);
         set_error_locked("");
+        if (s_net.setup_ap_active) setup_ap_stop_locked();
+        s_net.wifi_failures = 0;
         if (s_net.cfg.mode == NETWORK_MODE_WIFI_ONLY ||
             s_net.cfg.mode == NETWORK_MODE_WIFI_PREFERRED ||
             (s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED && !s_net.eth_has_ip)) {
@@ -346,6 +493,8 @@ static void network_wifi_event_handler(void *arg, esp_event_base_t base, int32_t
         s_net.wifi_connected = true;
         set_error_locked("");
     } else if (id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_net.wifi_failures++;
+        ESP_LOGW(TAG, "Wi-Fi disconnesso (tentativo fallito %lu/%u)", (unsigned long)s_net.wifi_failures, NETWORK_WIFI_MAX_ATTEMPTS);
         s_net.wifi_connected = false;
         s_net.wifi_has_ip = false;
         s_net.wifi_ip[0] = '\0';
@@ -363,39 +512,88 @@ static void manager_loop(void *arg)
 {
     (void)arg;
     TickType_t last_wifi_attempt = 0;
+    TickType_t wifi_attempt_started = 0;
     uint32_t wifi_backoff_ms = NETWORK_WIFI_RETRY_BASE_MS;
-    const TickType_t started_at = xTaskGetTickCount();
+    TickType_t eth_started_at = xTaskGetTickCount();
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        bool need_mqtt_reload = false;
         xSemaphoreTake(s_net.lock, portMAX_DELAY);
         network_mode_t mode = s_net.cfg.mode;
-        bool need_wifi = false;
-        if (mode == NETWORK_MODE_WIFI_ONLY || mode == NETWORK_MODE_WIFI_PREFERRED) {
-            need_wifi = true;
-        } else if (mode == NETWORK_MODE_ETHERNET_PREFERRED && wifi_configured(&s_net.cfg)) {
-            TickType_t elapsed = xTaskGetTickCount() - started_at;
-            need_wifi = !s_net.eth_has_ip && elapsed >= pdMS_TO_TICKS(NETWORK_FALLBACK_TIMEOUT_MS);
-        }
-        if (mode == NETWORK_MODE_ETHERNET_PREFERRED && s_net.eth_has_ip && s_net.active_if != NETWORK_IF_ETHERNET) {
+        bool eth_usable = (mode == NETWORK_MODE_ETHERNET_ONLY || mode == NETWORK_MODE_ETHERNET_PREFERRED || mode == NETWORK_MODE_WIFI_PREFERRED) &&
+                          s_net.eth_started && s_net.eth_has_ip;
+        bool wifi_usable = (mode == NETWORK_MODE_WIFI_ONLY || mode == NETWORK_MODE_ETHERNET_PREFERRED || mode == NETWORK_MODE_WIFI_PREFERRED) &&
+                           s_net.wifi_has_ip;
+
+        if (mode == NETWORK_MODE_ETHERNET_PREFERRED && eth_usable) {
+            set_active_locked(NETWORK_IF_ETHERNET);
+            if (s_net.wifi_sta_started) wifi_stop_sta_locked();
+        } else if ((mode == NETWORK_MODE_WIFI_ONLY || mode == NETWORK_MODE_WIFI_PREFERRED) && wifi_usable) {
+            set_active_locked(NETWORK_IF_WIFI);
+        } else if (mode == NETWORK_MODE_ETHERNET_ONLY && eth_usable) {
             set_active_locked(NETWORK_IF_ETHERNET);
         }
-        if (mode == NETWORK_MODE_ETHERNET_PREFERRED && s_net.eth_has_ip && s_net.wifi_sta_started) {
-            wifi_stop_sta_locked();
-        } else if (need_wifi && !s_net.wifi_has_ip) {
+
+        bool eth_timed_out = (mode == NETWORK_MODE_ETHERNET_PREFERRED || mode == NETWORK_MODE_WIFI_PREFERRED || mode == NETWORK_MODE_ETHERNET_ONLY) &&
+                             s_net.eth_started && !s_net.eth_has_ip &&
+                             (xTaskGetTickCount() - eth_started_at) >= pdMS_TO_TICKS(NETWORK_ETH_IP_TIMEOUT_MS);
+        bool need_wifi = false;
+        if (mode == NETWORK_MODE_WIFI_ONLY || mode == NETWORK_MODE_WIFI_PREFERRED) {
+            need_wifi = wifi_configured(&s_net.cfg);
+        } else if (mode == NETWORK_MODE_ETHERNET_PREFERRED) {
+            need_wifi = !s_net.eth_has_ip && eth_timed_out && wifi_configured(&s_net.cfg);
+        }
+
+        if (need_wifi && !s_net.wifi_has_ip) {
             TickType_t now = xTaskGetTickCount();
-            if (!s_net.wifi_sta_started || (now - last_wifi_attempt) >= pdMS_TO_TICKS(wifi_backoff_ms)) {
+            bool timed_out = s_net.wifi_sta_started && wifi_attempt_started &&
+                             (now - wifi_attempt_started) >= pdMS_TO_TICKS(NETWORK_WIFI_CONNECT_TIMEOUT_MS);
+            if (timed_out) {
+                s_net.wifi_failures++;
+                set_error_locked("wifi_connect_timeout");
+                wifi_stop_sta_locked();
+                wifi_backoff_ms = MIN(wifi_backoff_ms * 2, NETWORK_WIFI_RETRY_MAX_MS);
+            }
+            if (s_net.wifi_failures < NETWORK_WIFI_MAX_ATTEMPTS &&
+                (!s_net.wifi_sta_started || (now - last_wifi_attempt) >= pdMS_TO_TICKS(wifi_backoff_ms))) {
                 last_wifi_attempt = now;
+                wifi_attempt_started = now;
                 esp_err_t err = wifi_start_sta_locked();
                 if (err != ESP_OK) {
+                    s_net.wifi_failures++;
                     set_error_locked("wifi_start_failed");
                     wifi_backoff_ms = MIN(wifi_backoff_ms * 2, NETWORK_WIFI_RETRY_MAX_MS);
-                } else {
-                    wifi_backoff_ms = NETWORK_WIFI_RETRY_BASE_MS;
                 }
             }
         }
+        if (s_net.wifi_has_ip) {
+            s_net.wifi_failures = 0;
+            wifi_backoff_ms = NETWORK_WIFI_RETRY_BASE_MS;
+        }
+
+        bool needs_setup_ap = false;
+        const char *reason = NULL;
+        if (!has_real_link_locked()) {
+            if (mode == NETWORK_MODE_WIFI_ONLY && !wifi_configured(&s_net.cfg)) { needs_setup_ap = true; reason = "wifi_not_configured"; }
+            else if ((mode == NETWORK_MODE_WIFI_ONLY || mode == NETWORK_MODE_ETHERNET_PREFERRED || mode == NETWORK_MODE_WIFI_PREFERRED) &&
+                     wifi_configured(&s_net.cfg) && s_net.wifi_failures >= NETWORK_WIFI_MAX_ATTEMPTS) { needs_setup_ap = true; reason = "wifi_failed"; }
+            else if ((mode == NETWORK_MODE_ETHERNET_PREFERRED || mode == NETWORK_MODE_WIFI_PREFERRED) && eth_timed_out && !wifi_configured(&s_net.cfg)) { needs_setup_ap = true; reason = "ethernet_no_ip_wifi_missing"; }
+            else if (mode == NETWORK_MODE_ETHERNET_ONLY && eth_timed_out) { needs_setup_ap = true; reason = "ethernet_no_ip"; }
+        }
+
+        if (needs_setup_ap) {
+            setup_ap_start_locked(reason);
+        } else if (has_real_link_locked() && s_net.setup_ap_active) {
+            setup_ap_stop_locked();
+        }
+        static network_active_if_t last_mqtt_iface = NETWORK_IF_NONE;
+        if (has_real_link_locked() && s_net.active_if != last_mqtt_iface) {
+            last_mqtt_iface = s_net.active_if;
+            need_mqtt_reload = true;
+        }
         xSemaphoreGive(s_net.lock);
+        if (need_mqtt_reload) mqtt_reload_config();
     }
 }
 
@@ -437,11 +635,13 @@ esp_err_t network_manager_restart(void)
     network_config_t cfg;
     ESP_RETURN_ON_ERROR(network_config_load(&cfg), TAG, "config_load");
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    setup_ap_stop_locked();
     wifi_stop_sta_locked();
     stop_eth_locked();
     s_net.cfg = cfg;
     s_net.eth_has_ip = false;
     s_net.wifi_has_ip = false;
+    s_net.wifi_failures = 0;
     set_active_locked(NETWORK_IF_NONE);
     set_error_locked("");
     if (cfg.mode == NETWORK_MODE_ETHERNET_ONLY || cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED || cfg.mode == NETWORK_MODE_WIFI_PREFERRED) {
@@ -479,6 +679,11 @@ esp_err_t network_get_status(network_status_t *out)
     out->wifi_password_set = s_net.cfg.wifi_password_set;
     out->wifi_rssi = s_net.wifi_rssi;
     strlcpy(out->wifi_ip, s_net.wifi_ip[0] ? s_net.wifi_ip : "0.0.0.0", sizeof(out->wifi_ip));
+    out->setup_ap_active = s_net.setup_ap_active;
+    strlcpy(out->setup_ap_ssid, s_net.setup_ap_ssid, sizeof(out->setup_ap_ssid));
+    strlcpy(out->setup_ap_ip, s_net.setup_ap_ip[0] ? s_net.setup_ap_ip : NETWORK_SETUP_AP_IP, sizeof(out->setup_ap_ip));
+    out->fallback_ap_enabled = s_net.cfg.fallback_ap_enabled;
+    out->fallback_ap_password_set = s_net.cfg.fallback_ap_password_set;
     strlcpy(out->last_error, s_net.last_error, sizeof(out->last_error));
     out->last_interface_change_ms = s_net.last_change_ms;
     if (s_net.lock) xSemaphoreGive(s_net.lock);
@@ -514,6 +719,72 @@ esp_err_t network_status_append_json(cJSON *root)
     cJSON_AddNumberToObject(wifi, "rssi", st.wifi_rssi);
     cJSON_AddStringToObject(wifi, "ip", st.wifi_ip);
     cJSON_AddStringToObject(wifi, "mac", st.wifi_mac);
+
+    cJSON *ap = cJSON_AddObjectToObject(root, "setup_ap");
+    cJSON_AddBoolToObject(ap, "enabled", st.fallback_ap_enabled);
+    cJSON_AddBoolToObject(ap, "active", st.setup_ap_active);
+    cJSON_AddStringToObject(ap, "ssid", st.setup_ap_ssid);
+    cJSON_AddStringToObject(ap, "ip", st.setup_ap_ip);
+    cJSON_AddBoolToObject(ap, "password_set", st.fallback_ap_password_set);
+    return ESP_OK;
+}
+
+
+bool network_has_real_connectivity(void)
+{
+    bool ok = false;
+    if (s_net.lock) xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    ok = has_real_link_locked();
+    if (s_net.lock) xSemaphoreGive(s_net.lock);
+    return ok;
+}
+
+esp_err_t network_setup_exit(void)
+{
+    if (!s_net.lock) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    if (!has_real_link_locked()) {
+        xSemaphoreGive(s_net.lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    setup_ap_stop_locked();
+    xSemaphoreGive(s_net.lock);
+    return ESP_OK;
+}
+
+esp_err_t network_wifi_scan_append_json(cJSON *array)
+{
+    if (!array) return ESP_ERR_INVALID_ARG;
+    if (!s_net.lock) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    esp_err_t err = ensure_wifi_driver();
+    if (err == ESP_OK) {
+        s_net.wifi_runtime_desired = true;
+        err = wifi_apply_mode_locked();
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+        if (err == ESP_ERR_WIFI_CONN) err = ESP_OK;
+    }
+    xSemaphoreGive(s_net.lock);
+    if (err != ESP_OK) return err;
+
+    wifi_scan_config_t scan_cfg = {0};
+    err = esp_wifi_scan_start(&scan_cfg, true);
+    if (err != ESP_OK) return err;
+    uint16_t count = 0;
+    ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_num(&count), TAG, "scan_num");
+    if (count > 20) count = 20;
+    wifi_ap_record_t aps[20] = {0};
+    ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_records(&count, aps), TAG, "scan_records");
+    for (uint16_t i = 0; i < count; ++i) {
+        cJSON *item = cJSON_CreateObject();
+        if (!item) continue;
+        cJSON_AddStringToObject(item, "ssid", (const char *)aps[i].ssid);
+        cJSON_AddNumberToObject(item, "rssi", aps[i].rssi);
+        cJSON_AddStringToObject(item, "security", aps[i].authmode == WIFI_AUTH_OPEN ? "open" : "secured");
+        cJSON_AddItemToArray(array, item);
+    }
     return ESP_OK;
 }
 

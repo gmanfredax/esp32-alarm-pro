@@ -1609,6 +1609,10 @@ static void system_main_task(void *arg)
     ESP_ERROR_CHECK(system_info_init());
     ESP_ERROR_CHECK(notification_events_init());
     ESP_ERROR_CHECK(mqtt_start());
+    esp_err_t mqtt_err = mqtt_start();
+    if (mqtt_err != ESP_OK) {
+        ESP_LOGW(TAG, "MQTT non avviato ora: %s", esp_err_to_name(mqtt_err));
+    }
     notification_events_emit_simple("system_boot", NOTIFY_SEVERITY_INFO, "system", -1, "Avvio sistema", "Firmware avviato", false);
 
     alarm_init();

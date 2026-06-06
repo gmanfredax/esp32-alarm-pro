@@ -36,6 +36,7 @@
 #include "zone_mask.h"
 #include "auth.h"
 #include "system_info.h"
+#include "network_manager.h"
 #include "notification_events.h"
 
 #include "cJSON.h"
@@ -567,6 +568,22 @@ esp_err_t mqtt_publish_state(void)
     cJSON_AddStringToObject(root, "last_event_ts", ts);
     ensure_timestamp(root);
     system_info_append_json(root);
+    cJSON *net = cJSON_GetObjectItemCaseSensitive(root, "network");
+    if (net) {
+        cJSON *eth = cJSON_GetObjectItemCaseSensitive(net, "ethernet");
+        cJSON *wifi = cJSON_GetObjectItemCaseSensitive(net, "wifi");
+        cJSON *ap = cJSON_GetObjectItemCaseSensitive(net, "setup_ap");
+        const char *active_if = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(net, "active_interface"));
+        const char *net_mode = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(net, "network_mode"));
+        const char *net_ip = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(net, "ip"));
+        cJSON_AddStringToObject(root, "network_mode", net_mode ? net_mode : "ethernet_only");
+        cJSON_AddStringToObject(root, "active_interface", active_if ? active_if : "none");
+        cJSON_AddStringToObject(root, "ip", net_ip ? net_ip : "0.0.0.0");
+        cJSON_AddBoolToObject(root, "ethernet_link", eth && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(eth, "link_up")));
+        cJSON_AddBoolToObject(root, "wifi_connected", wifi && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(wifi, "connected")));
+        cJSON_AddNumberToObject(root, "wifi_rssi", wifi ? cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(wifi, "rssi")) : 0);
+        cJSON_AddBoolToObject(root, "setup_ap_active", ap && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ap, "active")));
+    }
 
     char *payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -1308,6 +1325,10 @@ esp_err_t mqtt_start(void)
         ESP_LOGI(TAG, "MQTT disabled");
         return ESP_OK;
     }
+    if (!network_has_real_connectivity()) {
+        ESP_LOGW(TAG, "MQTT sospeso: nessuna connettività reale (eventuale solo AP setup)");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     bool tls_uri = (strncasecmp(s_mqtt_uri, "mqtts://", 8) == 0) ||
                    (strncasecmp(s_mqtt_uri, "wss://", 6) == 0);
@@ -1397,6 +1418,10 @@ esp_err_t mqtt_reload_config(void)
     mqtt_prepare_configuration();
 
     err = mqtt_start();
+    if (err == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "MQTT reload deferred: network not ready");
+        return ESP_OK;
+    }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "MQTT reload failed to start client: %s", esp_err_to_name(err));
         return err;

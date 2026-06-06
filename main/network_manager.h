@@ -21,7 +21,8 @@ typedef enum {
 typedef enum {
     NETWORK_IF_NONE = 0,
     NETWORK_IF_ETHERNET,
-    NETWORK_IF_WIFI
+    NETWORK_IF_WIFI,
+    NETWORK_IF_SETUP_AP
 } network_active_if_t;
 
 #define NETWORK_WIFI_SSID_MAX 32
@@ -36,6 +37,9 @@ typedef struct {
     bool wifi_password_set;
     bool wifi_dhcp;
     bool eth_dhcp;
+    bool fallback_ap_enabled;
+    char fallback_ap_password[NETWORK_WIFI_PASSWORD_MAX + 1];
+    bool fallback_ap_password_set;
 } network_config_t;
 
 typedef struct {
@@ -55,6 +59,11 @@ typedef struct {
     int wifi_rssi;
     char wifi_ip[16];
     char wifi_mac[18];
+    bool setup_ap_active;
+    char setup_ap_ssid[NETWORK_WIFI_SSID_MAX + 1];
+    char setup_ap_ip[16];
+    bool fallback_ap_enabled;
+    bool fallback_ap_password_set;
     char last_error[96];
     uint64_t last_interface_change_ms;
 } network_status_t;
@@ -73,6 +82,9 @@ esp_err_t network_get_status(network_status_t *out);
 esp_err_t network_status_append_json(cJSON *root);
 esp_err_t network_wifi_test(const char *ssid, const char *password, bool use_saved_password, uint32_t timeout_ms);
 bool network_wifi_test_recent_ok(const char *ssid, const char *password);
+esp_err_t network_wifi_scan_append_json(cJSON *array);
+esp_err_t network_setup_exit(void);
+bool network_has_real_connectivity(void);
 
 #ifdef __cplusplus
 }
