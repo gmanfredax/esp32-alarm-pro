@@ -87,6 +87,7 @@ void           alarm_set_led_maint(bool on);
 // Info diagnostica
 bool           alarm_last_alarm_was_tamper(void);
 const char*    alarm_last_alarm_cause(void);
+const char*    alarm_active_mode(void);
 void           alarm_get_violated_zone_mask(zone_mask_t *out_mask);
 void           alarm_get_zone_tamper_mask(zone_mask_t *out_mask);
 void           alarm_get_armed_zone_mask(zone_mask_t *out_mask);

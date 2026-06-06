@@ -353,6 +353,75 @@ static void ensure_timestamp(cJSON *root)
     cJSON_AddNumberToObject(root, "timestamp", (double)now);
 }
 
+static const char *alarm_state_to_ha_payload(alarm_state_t st, bool exit_pending, bool entry_pending)
+{
+    if (st == ALARM_ALARM) return "triggered";
+    if (entry_pending) return "pending";
+    if (exit_pending) return "arming";
+    switch (st) {
+    case ALARM_DISARMED:     return "disarmed";
+    case ALARM_ARMED_HOME:   return "armed_home";
+    case ALARM_ARMED_AWAY:   return "armed_away";
+    case ALARM_ARMED_NIGHT:  return "armed_night";
+    case ALARM_ARMED_CUSTOM: return "armed_custom_bypass";
+    default:                 return "disarmed";
+    }
+}
+
+static const char *active_mode_to_scenario_id(const char *mode)
+{
+    if (!mode || strcasecmp(mode, "DISARMED") == 0) return "disarmed";
+    if (strcasecmp(mode, "AWAY") == 0) return "away";
+    if (strcasecmp(mode, "HOME") == 0) return "home";
+    if (strcasecmp(mode, "NIGHT") == 0) return "night";
+    if (strcasecmp(mode, "CUSTOM") == 0) return "custom";
+    return "unknown";
+}
+
+static void iso_timestamp_now(char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    time_t now = time(NULL);
+    struct tm tm_now;
+    if (gmtime_r(&now, &tm_now)) {
+        strftime(out, out_len, "%Y-%m-%dT%H:%M:%SZ", &tm_now);
+    } else {
+        snprintf(out, out_len, "%ld", (long)now);
+    }
+}
+
+static cJSON *create_zone_ref(uint16_t zone_index)
+{
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) return NULL;
+    char name[32];
+    snprintf(name, sizeof(name), "Zona %u", (unsigned)(zone_index + 1));
+    cJSON_AddNumberToObject(obj, "id", (double)(zone_index + 1));
+    cJSON_AddStringToObject(obj, "name", name);
+    return obj;
+}
+
+static void add_zone_ref_array(cJSON *root, const char *key, const zone_mask_t *mask, uint16_t total)
+{
+    cJSON *arr = cJSON_AddArrayToObject(root, key);
+    if (!arr || !mask) return;
+    for (uint16_t i = 0; i < total; ++i) {
+        if (zone_mask_test(mask, i)) {
+            cJSON *ref = create_zone_ref(i);
+            if (ref) cJSON_AddItemToArray(arr, ref);
+        }
+    }
+}
+
+static int first_zone_in_mask(const zone_mask_t *mask, uint16_t total)
+{
+    if (!mask) return -1;
+    for (uint16_t i = 0; i < total; ++i) {
+        if (zone_mask_test(mask, i)) return (int)i;
+    }
+    return -1;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Event handler MQTT
 // Telemetry
@@ -366,6 +435,7 @@ esp_err_t mqtt_publish_state(void)
     int entry_zone = -1;
     bool exit_pending = alarm_exit_pending(&exit_ms);
     bool entry_pending = alarm_entry_pending(&entry_zone, &entry_ms);
+    const char *ha_state = alarm_state_to_ha_payload(st, exit_pending, entry_pending);
 
     const char *state_name = alarm_state_to_name(st);
     if (entry_pending) {
@@ -403,33 +473,69 @@ esp_err_t mqtt_publish_state(void)
     if (!root) return ESP_ERR_NO_MEM;
 
     uint16_t zones_total = roster_effective_zones(inputs_master_zone_capacity());
+    if (zones_total > SCENES_MAX_ZONES) zones_total = SCENES_MAX_ZONES;
+    zone_mask_t open_zone_mask;
     zone_mask_t violated_zone_mask;
     zone_mask_t armed_zone_mask;
+    zone_mask_t fault_zone_mask;
+    zone_mask_clear(&open_zone_mask);
     zone_mask_clear(&violated_zone_mask);
     zone_mask_clear(&armed_zone_mask);
+    zone_mask_clear(&fault_zone_mask);
     alarm_get_violated_zone_mask(&violated_zone_mask);
     alarm_get_armed_zone_mask(&armed_zone_mask);
+    for (uint16_t i = 0; i < zones_total; ++i) {
+        input_zone_filtered_state_t filtered = {0};
+        if (inputs_get_filtered_zone_state(i, &filtered)) {
+            if (filtered.known && filtered.alarm) zone_mask_set(&open_zone_mask, i);
+            if (filtered.unavailable || !filtered.known) zone_mask_set(&fault_zone_mask, i);
+        } else {
+            zone_mask_set(&fault_zone_mask, i);
+        }
+    }
     zone_mask_limit(&bypass_mask, zones_total);
     zone_mask_limit(&zone_tamper_mask, zones_total);
     zone_mask_limit(&violated_zone_mask, zones_total);
     zone_mask_limit(&armed_zone_mask, zones_total);
+    zone_mask_limit(&open_zone_mask, zones_total);
+    zone_mask_limit(&fault_zone_mask, zones_total);
     char bypass_hex[ZONE_MASK_WORDS * 8u + 1u];
     char violated_hex[ZONE_MASK_WORDS * 8u + 1u];
     char armed_hex[ZONE_MASK_WORDS * 8u + 1u];
+    char open_hex[ZONE_MASK_WORDS * 8u + 1u];
     zone_mask_to_hex(&bypass_mask, zones_total, bypass_hex, sizeof(bypass_hex));
     zone_mask_to_hex(&violated_zone_mask, zones_total, violated_hex, sizeof(violated_hex));
     zone_mask_to_hex(&armed_zone_mask, zones_total, armed_hex, sizeof(armed_hex));
+    zone_mask_to_hex(&open_zone_mask, zones_total, open_hex, sizeof(open_hex));
 
-    cJSON_AddStringToObject(root, "state", state_name);
+    const char *active_mode = alarm_active_mode();
+    const char *active_scenario_id = active_mode_to_scenario_id(active_mode);
+    const char *alarm_cause = alarm_last_alarm_cause();
+    bool arming = exit_pending;
+    uint32_t exit_delay_s = (exit_ms + 999u) / 1000u;
+    uint32_t entry_delay_s = (entry_ms + 999u) / 1000u;
+    char ts[32];
+    iso_timestamp_now(ts, sizeof(ts));
+
+    cJSON_AddStringToObject(root, "state", ha_state);
+    cJSON_AddStringToObject(root, "core_state", state_name);
+    cJSON_AddStringToObject(root, "active_mode", active_mode);
+    cJSON_AddStringToObject(root, "active_scenario", active_mode);
+    cJSON_AddStringToObject(root, "active_scenario_id", active_scenario_id);
+    cJSON_AddBoolToObject(root, "arming", arming);
+    cJSON_AddNumberToObject(root, "exit_delay_s", (double)exit_delay_s);
+    cJSON_AddNumberToObject(root, "entry_delay_s", (double)entry_delay_s);
+    cJSON_AddStringToObject(root, "alarm_cause", alarm_cause ? alarm_cause : "none");
+    cJSON_AddBoolToObject(root, "global_tamper", global_tamper);
     cJSON_AddNumberToObject(root, "zones_count", (double)zones_total);
     cJSON_AddNumberToObject(root, "outputs_mask", (double)outputs_mask);
     cJSON_AddStringToObject(root, "bypass_mask", bypass_hex);
     cJSON_AddNumberToObject(root, "bypass_mask_legacy", (double)zone_mask_to_u32(&bypass_mask));
-    cJSON_AddItemToObject(root, "tamper", cJSON_CreateBool(system_tamper));
-    cJSON_AddItemToObject(root, "system_tamper", cJSON_CreateBool(system_tamper));
-    cJSON_AddItemToObject(root, "global_tamper", cJSON_CreateBool(global_tamper));
-    cJSON_AddItemToObject(root, "tamper_alarm", cJSON_CreateBool(tamper_alarm));
-    cJSON_AddStringToObject(root, "alarm_cause", alarm_last_alarm_cause());
+    cJSON_AddStringToObject(root, "open_zone_mask", open_hex);
+    cJSON_AddNumberToObject(root, "open_zone_mask_legacy", (double)zone_mask_to_u32(&open_zone_mask));
+    cJSON_AddBoolToObject(root, "tamper", system_tamper);
+    cJSON_AddBoolToObject(root, "system_tamper", system_tamper);
+    cJSON_AddBoolToObject(root, "tamper_alarm", tamper_alarm);
     cJSON_AddStringToObject(root, "violated_zone_mask", violated_hex);
     cJSON_AddNumberToObject(root, "violated_zone_mask_legacy", (double)zone_mask_to_u32(&violated_zone_mask));
     cJSON_AddStringToObject(root, "armed_zone_mask", armed_hex);
@@ -438,6 +544,23 @@ esp_err_t mqtt_publish_state(void)
     cJSON_AddNumberToObject(root, "exit_pending_ms", (double)exit_ms);
     cJSON_AddNumberToObject(root, "entry_pending_ms", (double)entry_ms);
     cJSON_AddNumberToObject(root, "entry_zone", (double)entry_zone);
+    add_zone_ref_array(root, "open_zones", &open_zone_mask, zones_total);
+    add_zone_ref_array(root, "violated_zones", &violated_zone_mask, zones_total);
+    add_zone_ref_array(root, "zone_tampers", &zone_tamper_mask, zones_total);
+    add_zone_ref_array(root, "zone_faults", &fault_zone_mask, zones_total);
+
+    int last_idx = first_zone_in_mask(&violated_zone_mask, zones_total);
+    if (last_idx >= 0) {
+        char last_name[32];
+        snprintf(last_name, sizeof(last_name), "Zona %d", last_idx + 1);
+        cJSON_AddNumberToObject(root, "last_violated_zone_id", (double)(last_idx + 1));
+        cJSON_AddStringToObject(root, "last_violated_zone_name", last_name);
+    } else {
+        cJSON_AddItemToObject(root, "last_violated_zone_id", cJSON_CreateNull());
+        cJSON_AddStringToObject(root, "last_violated_zone_name", "");
+    }
+    cJSON_AddStringToObject(root, "last_event", ha_state);
+    cJSON_AddStringToObject(root, "last_event_ts", ts);
     ensure_timestamp(root);
     system_info_append_json(root);
 
@@ -446,18 +569,13 @@ esp_err_t mqtt_publish_state(void)
     if (!payload) return ESP_ERR_NO_MEM;
 
     esp_err_t err = publish_raw(s_topic_state, payload, CONFIG_APP_CLOUD_QOS_STATE, true);
-    publish_raw(s_topic_alarm_attr, payload, CONFIG_APP_CLOUD_QOS_STATE, true);
+    esp_err_t attr_err = publish_raw(s_topic_alarm_attr, payload, CONFIG_APP_CLOUD_QOS_STATE, true);
     cJSON_free(payload);
-    const char *ha_state = "disarmed";
-    if (entry_pending) ha_state = "pending";
-    else if (exit_pending) ha_state = "arming";
-    else if (st == ALARM_ARMED_HOME) ha_state = "armed_home";
-    else if (st == ALARM_ARMED_AWAY) ha_state = "armed_away";
-    else if (st == ALARM_ARMED_NIGHT) ha_state = "armed_night";
-    else if (st == ALARM_ARMED_CUSTOM) ha_state = "armed_custom";
-    else if (st == ALARM_ALARM) ha_state = "triggered";
-    publish_raw(s_topic_alarm_state, ha_state, CONFIG_APP_CLOUD_QOS_STATE, true);
-    publish_raw(s_topic_tamper_state, global_tamper ? "ON" : "OFF", CONFIG_APP_CLOUD_QOS_STATE, true);
+    esp_err_t alarm_err = publish_raw(s_topic_alarm_state, ha_state, CONFIG_APP_CLOUD_QOS_STATE, true);
+    esp_err_t tamper_err = publish_raw(s_topic_tamper_state, global_tamper ? "ON" : "OFF", CONFIG_APP_CLOUD_QOS_STATE, true);
+    if (err == ESP_OK && attr_err != ESP_OK) err = attr_err;
+    if (err == ESP_OK && alarm_err != ESP_OK) err = alarm_err;
+    if (err == ESP_OK && tamper_err != ESP_OK) err = tamper_err;
     return err;
 }
 
@@ -542,6 +660,7 @@ static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
 
     esp_err_t err = publish_raw(s_topic_zones, payload, CONFIG_APP_CLOUD_QOS_STATE, true);
     cJSON_free(payload);
+    (void)mqtt_publish_state_async();
     return err;
 }
 
@@ -703,6 +822,16 @@ esp_err_t mqtt_publish_discovery(void)
     cJSON_AddBoolToObject(root, "code_disarm_required", true);
     cJSON_AddStringToObject(root, "command_template", "{\"command\":\"{{ action }}\",\"code\":\"{{ code }}\",\"user\":\"ha\"}");
     cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
+    cJSON_AddStringToObject(root, "payload_available", "online");
+    cJSON_AddStringToObject(root, "payload_not_available", "offline");
+    cJSON_AddStringToObject(root, "json_attributes_topic", s_topic_alarm_attr);
+    cJSON *features = cJSON_AddArrayToObject(root, "supported_features");
+    if (features) {
+        cJSON_AddItemToArray(features, cJSON_CreateString("arm_away"));
+        cJSON_AddItemToArray(features, cJSON_CreateString("arm_home"));
+        cJSON_AddItemToArray(features, cJSON_CreateString("arm_night"));
+        cJSON_AddItemToArray(features, cJSON_CreateString("arm_custom_bypass"));
+    }
     cJSON *dev = cJSON_AddObjectToObject(root, "device");
     cJSON *ids = cJSON_AddArrayToObject(dev, "identifiers"); cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
     cJSON_AddStringToObject(dev, "manufacturer", "NeXtorSystem");
@@ -799,6 +928,36 @@ esp_err_t mqtt_publish_discovery(void)
         payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
         if (payload) { publish_discovery_config_payload(topic, payload, &discovery_count, &err); cJSON_free(payload); }
     }
+
+    const char *attr_sensors[][3] = {
+        {"active_mode", "Active mode", "{{ value_json.active_mode }}"},
+        {"last_violated_zone", "Last violated zone", "{{ value_json.last_violated_zone_name }}"},
+        {"alarm_cause", "Alarm cause", "{{ value_json.alarm_cause }}"},
+    };
+    for (size_t i = 0; i < sizeof(attr_sensors)/sizeof(attr_sensors[0]); ++i) {
+        snprintf(topic, sizeof(topic), "%s/sensor/%s/%s/config", s_discovery_prefix, s_device_id, attr_sensors[i][0]);
+        root = cJSON_CreateObject();
+        if (!root) continue;
+        char uid[96];
+        snprintf(uid, sizeof(uid), "%s_%s", s_device_id, attr_sensors[i][0]);
+        cJSON_AddStringToObject(root, "name", attr_sensors[i][1]);
+        cJSON_AddStringToObject(root, "unique_id", uid);
+        cJSON_AddStringToObject(root, "state_topic", s_topic_alarm_attr);
+        cJSON_AddStringToObject(root, "value_template", attr_sensors[i][2]);
+        cJSON_AddStringToObject(root, "availability_topic", s_topic_avail);
+        cJSON_AddStringToObject(root, "payload_available", "online");
+        cJSON_AddStringToObject(root, "payload_not_available", "offline");
+        dev = cJSON_AddObjectToObject(root, "device");
+        ids = cJSON_AddArrayToObject(dev, "identifiers");
+        cJSON_AddItemToArray(ids, cJSON_CreateString(s_device_id));
+        payload = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (payload) {
+            publish_discovery_config_payload(topic, payload, &discovery_count, &err);
+            cJSON_free(payload);
+        }
+    }
+
     ESP_LOGI(TAG, "discovery published %u entities retained", (unsigned)discovery_count);
     return err;
 }
@@ -827,8 +986,10 @@ static void handle_arm_command(const char *payload)
         if (cJSON_IsString(cmd) && cmd->valuestring) {
             if (strcasecmp(cmd->valuestring, "ARM_HOME") == 0) strlcpy(mode_buf, "home", sizeof(mode_buf));
             else if (strcasecmp(cmd->valuestring, "ARM_NIGHT") == 0) strlcpy(mode_buf, "night", sizeof(mode_buf));
-            else if (strcasecmp(cmd->valuestring, "ARM_CUSTOM") == 0) strlcpy(mode_buf, "custom", sizeof(mode_buf));
-            else strlcpy(mode_buf, "away", sizeof(mode_buf));
+            else if (strcasecmp(cmd->valuestring, "ARM_CUSTOM") == 0 ||
+                     strcasecmp(cmd->valuestring, "ARM_CUSTOM_BYPASS") == 0) {
+                strlcpy(mode_buf, "custom", sizeof(mode_buf));
+            } else strlcpy(mode_buf, "away", sizeof(mode_buf));
         }
         cJSON *m = cJSON_GetObjectItemCaseSensitive(root, "mode");
         if (cJSON_IsString(m) && m->valuestring) {
@@ -874,6 +1035,10 @@ static void handle_arm_command(const char *payload)
     case ALARM_ARMED_NIGHT:  alarm_arm_night(); break;
     case ALARM_ARMED_CUSTOM: alarm_arm_custom(); break;
     default: break;
+    }
+    profile_t prof = alarm_get_profile(target);
+    if (prof.exit_delay_ms > 0) {
+        alarm_begin_exit(prof.exit_delay_ms);
     }
 
     char scene_desc[48];

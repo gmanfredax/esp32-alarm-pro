@@ -15,6 +15,7 @@
 static const char* TAG = "alarm_core";
 
 static alarm_state_t s_state = ALARM_DISARMED;
+static alarm_state_t s_active_mode = ALARM_DISARMED;
 static profile_t     profiles[7];
 
 // True se l'ultimo passaggio allo stato ALARM è stato causato dal tamper
@@ -153,6 +154,7 @@ static int           s_entry_zone        = -1;   // indice 0-based di una zona c
 void alarm_init(void)
 {
     s_state = ALARM_DISARMED;
+    s_active_mode = ALARM_DISARMED;
     zone_mask_clear(&s_bypass_mask);
     s_exit_deadline_us = 0;
     s_entry_pending = false;
@@ -196,6 +198,17 @@ bool alarm_last_alarm_was_tamper(void)
 const char* alarm_last_alarm_cause(void)
 {
     return s_last_alarm_cause;
+}
+
+const char* alarm_active_mode(void)
+{
+    switch (s_active_mode) {
+    case ALARM_ARMED_HOME:   return "HOME";
+    case ALARM_ARMED_AWAY:   return "AWAY";
+    case ALARM_ARMED_NIGHT:  return "NIGHT";
+    case ALARM_ARMED_CUSTOM: return "CUSTOM";
+    default:                 return "DISARMED";
+    }
 }
 
 void alarm_get_violated_zone_mask(zone_mask_t *out_mask)
@@ -286,6 +299,7 @@ void alarm_begin_exit(uint32_t duration_ms)
     const uint64_t now = esp_timer_get_time();
     s_exit_deadline_us = now + ((uint64_t)duration_ms) * 1000ULL;
     ESP_LOGI(TAG, "Exit delay avviato: %u ms", (unsigned)duration_ms);
+    mqtt_publish_state_async();
 }
 
 void alarm_set_exit_guard(const zone_mask_t *mask, bool use_unified)
@@ -307,6 +321,7 @@ void alarm_arm_home(void)
     zone_mask_clear(&s_zone_tamper_mask);
     zone_mask_clear(&s_armed_zone_mask);
     s_state = ALARM_ARMED_HOME;
+    s_active_mode = ALARM_ARMED_HOME;
     s_alarm_from_tamper = false;
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
@@ -320,6 +335,7 @@ void alarm_arm_away(void)
     zone_mask_clear(&s_zone_tamper_mask);
     zone_mask_clear(&s_armed_zone_mask);
     s_state = ALARM_ARMED_AWAY;
+    s_active_mode = ALARM_ARMED_AWAY;
     s_alarm_from_tamper = false;
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
@@ -333,6 +349,7 @@ void alarm_arm_night(void)
     zone_mask_clear(&s_zone_tamper_mask);
     zone_mask_clear(&s_armed_zone_mask);
     s_state = ALARM_ARMED_NIGHT;
+    s_active_mode = ALARM_ARMED_NIGHT;
     s_alarm_from_tamper = false;
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
@@ -346,6 +363,7 @@ void alarm_arm_custom(void)
     zone_mask_clear(&s_zone_tamper_mask);
     zone_mask_clear(&s_armed_zone_mask);
     s_state = ALARM_ARMED_CUSTOM;
+    s_active_mode = ALARM_ARMED_CUSTOM;
     s_alarm_from_tamper = false;
     strlcpy(s_last_alarm_cause, "none", sizeof(s_last_alarm_cause));
     outputs_led_state(true);
@@ -356,6 +374,7 @@ void alarm_arm_custom(void)
 void alarm_disarm(void)
 {
     s_state = ALARM_DISARMED;
+    s_active_mode = ALARM_DISARMED;
     outputs_led_state(false);
     outputs_led_maint(false);
     outputs_siren(false);
@@ -473,7 +492,13 @@ void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask
         zone_mask_andnot(&eff_mask, &eff_mask, &s_bypass_mask); // bypass sessione
 
         const uint64_t now = esp_timer_get_time();
-        const bool in_exit = (s_exit_deadline_us != 0 && now < s_exit_deadline_us);
+        const bool exit_was_active = (s_exit_deadline_us != 0);
+        const bool in_exit = (exit_was_active && now < s_exit_deadline_us);
+        if (exit_was_active && !in_exit && !s_exit_unified) {
+            s_exit_deadline_us = 0;
+            ESP_LOGI(TAG, "Exit delay terminato: stato armato finale pubblicato");
+            mqtt_publish_state_async();
+        }
 
         // Ritardo unico: se la finestra di uscita è stata avviata perché c'erano zone a ritardo già aperte,
         // allora allo scadere dell'exit, se una di quelle zone è ANCORA aperta, scatta l'allarme.
@@ -497,9 +522,11 @@ void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask
                 s_entry_zone = -1;
                 return;
             } else {
-                // tutte richiusE prima della scadenza: fine exit "silenziosa"
+                // tutte richiuse prima della scadenza: fine exit e pubblicazione stato finale.
                 s_exit_unified = false;
+                s_exit_deadline_us = 0;
                 zone_mask_clear(&s_exit_guard_mask);
+                mqtt_publish_state_async();
                 // prosegui (stato rimane armato)
             }
         }
@@ -588,6 +615,7 @@ void alarm_tick_ex(const zone_mask_t *zmask, bool global_tamper, const zone_mask
             s_entry_deadline_us = now + ((uint64_t)min_ms) * 1000ULL;
             ESP_LOGI(TAG, "ENTRY delay avviato %u ms (Z%d)", (unsigned)min_ms, min_z >= 0 ? (min_z + 1) : -1);
             zone_mask_copy(&s_entry_zmask, &trig);
+            mqtt_publish_state_async();
         } else {
             // Se già in corso, eventualmente ACCORCIA la deadline se il nuovo minimo è più vicino
             const uint64_t candidate = now + ((uint64_t)min_ms) * 1000ULL;
