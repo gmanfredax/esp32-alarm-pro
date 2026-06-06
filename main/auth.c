@@ -194,7 +194,10 @@ static session_t* session_from_request(httpd_req_t* req){
                     const char* token = hdr + 7;
                     session_t* s = find_by_atk(token);
                     if (s){
-                        if (s->setup_limited && !setup_limited_uri_allowed(req->uri)) { free(hdr); return NULL; }
+                        if (s->setup_limited && !setup_limited_uri_allowed(req->uri)) {
+                            ESP_LOGW(TAG, "setup_limited denied bearer uri=%s", req->uri ? req->uri : "");
+                            free(hdr); return NULL;
+                        }
                         if (touch_allowed) touch_session(s);
                         free(hdr);
                         return s;
@@ -209,7 +212,10 @@ static session_t* session_from_request(httpd_req_t* req){
         session_t* s = find_by_sid(sid);
         if (s){
             if (s->setup_limited && !setup_limited_uri_allowed(req->uri)
-                && strcmp(req->uri, "/admin.html") != 0 && strcmp(req->uri, "/") != 0 && strcmp(req->uri, "/index.html") != 0) return NULL;
+                && strcmp(req->uri, "/admin.html") != 0 && strcmp(req->uri, "/") != 0 && strcmp(req->uri, "/index.html") != 0) {
+                ESP_LOGW(TAG, "setup_limited denied cookie uri=%s", req->uri ? req->uri : "");
+                return NULL;
+            }
             if (touch_allowed) touch_session(s);
             return s;
         }
@@ -294,8 +300,9 @@ static esp_err_t json_reply(httpd_req_t* req, const char* json){
 
 static bool setup_limited_uri_allowed(const char *uri){
     if (!uri) return false;
+    if (!strcmp(uri, "/setup") || !strcmp(uri, "/403.html")) return true;
     if (!strcmp(uri, "/api/me") || !strcmp(uri, "/api/logout")) return true;
-    if (!strcmp(uri, "/api/admin/system") || !strcmp(uri, "/api/admin/network")) return true;
+    if (!strcmp(uri, "/api/admin/network")) return true;
     if (!strcmp(uri, "/api/admin/network/restart") || !strcmp(uri, "/api/admin/network/wifi/test")) return true;
     if (!strcmp(uri, "/api/admin/network/wifi/scan") || !strcmp(uri, "/api/admin/network/setup/exit")) return true;
     if (!strcmp(uri, "/api/network/status") || !strcmp(uri, "/api/network/config")) return true;
@@ -315,7 +322,10 @@ bool auth_check_bearer(httpd_req_t* req, user_info_t* out){
         const char* token = h+7;
         session_t* s = find_by_atk(token);
         if (s){
-            if (s->setup_limited && !setup_limited_uri_allowed(req->uri)) { free(h); return false; }
+            if (s->setup_limited && !setup_limited_uri_allowed(req->uri)) {
+                ESP_LOGW(TAG, "setup_limited denied bearer uri=%s", req->uri ? req->uri : "");
+                free(h); return false;
+            }
             touch_session(s);
             if (out){ strncpy(out->username, s->username, sizeof(out->username)-1); out->role = s->role; }
             ok = true;
@@ -330,7 +340,10 @@ bool auth_check_cookie(httpd_req_t* req, user_info_t* out){
     session_t* s = find_by_sid(sid);
     if (!s) return false;
     if (s->setup_limited && !setup_limited_uri_allowed(req->uri)
-        && strcmp(req->uri, "/admin.html") != 0 && strcmp(req->uri, "/") != 0 && strcmp(req->uri, "/index.html") != 0) return false;
+        && strcmp(req->uri, "/admin.html") != 0 && strcmp(req->uri, "/") != 0 && strcmp(req->uri, "/index.html") != 0) {
+        ESP_LOGW(TAG, "setup_limited denied cookie uri=%s", req->uri ? req->uri : "");
+        return false;
+    }
     touch_session(s);
     if (out){ strncpy(out->username, s->username, sizeof(out->username)-1); out->role=s->role; }
     return true;
@@ -374,11 +387,13 @@ esp_err_t auth_handle_login(httpd_req_t* req){
     user_role_t role;
     if (!valid_user_pass(user,pass,&role)){
         if (rl) rl_on_fail(rl);
+        ESP_LOGW(TAG, "login password result user=%s ok=false", user);
         audit_append("login", user, 0, "invalid");
         free(body);
         return httpd_resp_send_err(req,HTTPD_401_UNAUTHORIZED,"invalid");
     }
 
+    ESP_LOGI(TAG, "login password result user=%s ok=true", user);
     bool setup_limited = false;
     if (auth_totp_enabled(user)){
         if (recovery[0]){
@@ -391,8 +406,10 @@ esp_err_t auth_handle_login(httpd_req_t* req){
             }
             audit_append("recovery", user, 1, "used");
         } else if (!system_time_is_valid()){
+            ESP_LOGW(TAG, "login 2FA active time_valid=false user=%s", user);
             if (request_setup_limited){
                 setup_limited = true;
+                ESP_LOGI(TAG, "setup_limited session requested user=%s", user);
                 audit_append("setup", user, 1, "limited");
             } else {
                 audit_append("login", user, 0, "time invalid");
@@ -401,6 +418,7 @@ esp_err_t auth_handle_login(httpd_req_t* req){
                 return json_reply(req, "{\"ok\":false,\"otp_required\":false,\"requires_setup_limited\":true,\"requires_recovery_or_time_sync\":true,\"time_valid\":false,\"message\":\"Orologio centrale non sincronizzato: OTP non verificabile\"}");
             }
         } else {
+            ESP_LOGI(TAG, "login 2FA active time_valid=true user=%s", user);
             if (!otp[0]){
                 audit_append("login", user, 0, "otp required");
                 httpd_resp_set_status(req, "401 Unauthorized");
@@ -440,14 +458,16 @@ esp_err_t auth_handle_login(httpd_req_t* req){
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "cookie");
     }
     httpd_resp_set_hdr(req, "Set-Cookie", cookie);
+    ESP_LOGI(TAG, "session cookie created user=%s setup_limited=%s", s->username, setup_limited ? "true" : "false");
 
     char resp[384];
     snprintf(resp,sizeof(resp),
         "{\"ok\":true,\"user\":\"%s\",\"role\":%d,\"token\":\"%s\",\"session\":\"%s\",\"redirect\":\"%s\",\"message\":\"%s\"}",
         s->username, (int)s->role, s->atk_b64,
         setup_limited ? "setup_limited" : "full_admin",
-        setup_limited ? "/admin.html#network" : "/index.html",
+        setup_limited ? "/setup" : "/index.html",
         recovery[0] ? "Codice di recupero accettato. Codice invalidato." : "ok");
+    ESP_LOGI(TAG, "login redirect user=%s target=%s", user, setup_limited ? "/setup" : "/index.html");
     audit_append("login", user, 1, setup_limited ? "setup_limited" : "ok");
     return json_reply(req, resp);
 }
@@ -483,7 +503,9 @@ esp_err_t auth_handle_me(httpd_req_t* req){
     if (auth_check_bearer(req,&u) || auth_check_cookie(req,&u)){
         char resp[256];
         bool is_admin = ((int)u.role >= (int)ROLE_ADMIN);
-        snprintf(resp,sizeof(resp),"{\"ok\":true,\"user\":\"%s\",\"role\":%d,\"is_admin\":%s}", u.username,(int)u.role,is_admin?"true":"false");
+        bool setup_limited = auth_session_is_setup_limited(req);
+        snprintf(resp,sizeof(resp),"{\"ok\":true,\"user\":\"%s\",\"role\":%d,\"is_admin\":%s,\"session\":\"%s\"}",
+                 u.username,(int)u.role,is_admin?"true":"false", setup_limited ? "setup_limited" : "full");
         return json_reply(req, resp);
     }
     return httpd_resp_send_err(req,HTTPD_401_UNAUTHORIZED,"no auth");

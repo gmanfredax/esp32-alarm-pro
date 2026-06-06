@@ -19,9 +19,9 @@
       <div class="card" style="margin-top:1rem;">
         <div class="card-body">
           <h1 style="margin:0 0 .5rem 0;">Accesso negato</h1>
-          <p>Questa pagina è <strong>riservata all'amministratore</strong>.</p>
+          <p id="denyMessage">Questa pagina è <strong>riservata all'amministratore</strong>.</p>
           <p>
-            <a class="btn" href="/index.html">Torna alla dashboard</a>
+            <a class="btn" id="denyPrimaryAction" href="/index.html">Torna alla dashboard</a>
           </p>
         </div>
       </div>
@@ -30,5 +30,23 @@
     <footer class="container foot">
       <small>Powered by NeXtorSystem - Copyright &copy <script type="text/javascript"> document.write(new Date().getFullYear());</script></small>
     </footer>
+    <script>
+      (async () => {
+        try {
+          const r = await fetch('/api/me', { credentials: 'include' });
+          if (!r.ok) return;
+          const me = await r.json();
+          if (me && me.session === 'setup_limited') {
+            const msg = document.getElementById('denyMessage');
+            const action = document.getElementById('denyPrimaryAction');
+            if (msg) msg.textContent = 'Accesso limitato alla configurazione rete.';
+            if (action) {
+              action.textContent = 'Vai alla configurazione rete';
+              action.href = '/setup';
+            }
+          }
+        } catch (_) {}
+      })();
+    </script>
   </body>
   </html>

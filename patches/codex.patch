@@ -1,55 +1,92 @@
-diff --git a/spiffs/login.html b/spiffs/login.html
-index 8462abc6e8f21cd3b56ba3618cc018d036d2f63c..c981fed526079384ca9bd064fe1bb1060a483fe5 100755
---- a/spiffs/login.html
-+++ b/spiffs/login.html
-@@ -22,41 +22,50 @@
-   <main class="container auth-main" style="padding-top: 10vh; max-width: 420px;">
-     <div class="login-panel">
-       <div class="card login-card">
-         <h1 class="title">Accedi al sistema</h1>
-         <p class="muted">Inserisci il suffisso ID (dopo <strong>nsalarmpro-</strong>) e le tue credenziali.</p>
-         <form id="loginForm" class="form" autocomplete="on">
-           <label class="field">
-             <span>ID sistema</span>
-             <div class="prefix-input">
-               <span class="prefix">nsalarmpro-</span>
-               <input id="systemId" name="systemSuffix" autocomplete="off" spellcheck="false" placeholder="example" required />
-             </div>
-           </label>
-           <label class="field">
-             <span>Username</span>
-             <input id="username" name="username" autocomplete="username" required />
-           </label>
-           <label class="field">
-             <span>Password</span>
-             <input id="password" name="password" type="password" autocomplete="current-password" required />
-           </label>
-           <label id="otpField" class="field hidden">
-             <span>Codice OTP</span>
-             <input id="otp" name="otp" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="one-time-code" />
-           </label>
-+          <label id="recoveryField" class="field hidden">
-+            <span>Codice di recupero monouso</span>
-+            <input id="recoveryCode" name="recovery_code" autocomplete="one-time-code" placeholder="ABCD-EFGH-IJKL-MNPQ" />
-+          </label>
-+          <div id="fallbackActions" class="row actions hidden" style="gap:.5rem;flex-wrap:wrap">
-+            <button type="button" class="btn" id="btnSetupLimited">Configura rete</button>
-+            <button type="button" class="btn" id="btnBrowserTime">Sincronizza ora da questo dispositivo</button>
-+            <button type="button" class="btn" id="btnUseRecovery">Usa codice di recupero</button>
-+          </div>
-           <div id="loginMessage" class="msg small hidden"></div>
-           <div class="row actions">
-             <button type="submit" class="btn primary" id="loginSubmit">Accedi</button>
-           </div>
-         </form>
-       </div>
-     </div>
-   </main>
+diff --git a/spiffs/js/login.js b/spiffs/js/login.js
+index 48f2abedaf7f57f2b2ff570f40613470d3401f3c..5bdf095f0645ebdeb4102d5f1215eb537418e31b 100755
+--- a/spiffs/js/login.js
++++ b/spiffs/js/login.js
+@@ -114,52 +114,52 @@ async function initializeSystemId(){
+   }
  
-   <footer class="container foot">
-     <small>© <span id="footYear"></span> NeXtorSystem</small>
-   </footer>
+   try {
+     const response = await fetch(`${window.location.origin}/api/provision/status`, {
+       credentials: 'include'
+     });
+     if (!response.ok) return;
+     const data = await response.json().catch(() => null);
+     if (!data || typeof data !== 'object') return;
+     const deviceId = typeof data.device_id === 'string' ? data.device_id.trim() : '';
+     if (!deviceId) return;
+     const normalized = deviceId.toLowerCase().startsWith('nsalarmpro-')
+       ? deviceId.slice('nsalarmpro-'.length)
+       : deviceId;
+     enforceLanSystemId(normalized);
+   } catch (err) {
+     console.warn('Impossibile recuperare ID sistema via LAN', err);
+   }
+ }
  
-   <script type="module" src="/js/login.js"></script>
- </body>
- </html>
+ initializeSystemId();
+ 
+ (async () => {
+   if (getToken() && getSystemSuffix()) {
+     try {
+-      await apiGet('/api/me');
+-      window.location.replace('./index.html');
++      const me = await apiGet('/api/me');
++      window.location.replace(me?.session === 'setup_limited' ? '/setup' : './index.html');
+     } catch {
+       clearSession();
+     }
+   }
+ })();
+ 
+ function setMessage(text, type = 'error'){
+   if (!messageEl) return;
+   if (!text) {
+     messageEl.textContent = '';
+     messageEl.classList.add('hidden');
+     return;
+   }
+   messageEl.textContent = text;
+   messageEl.classList.remove('hidden');
+   messageEl.style.color = type === 'success' ? '#22d3ee' : '#f87171';
+ }
+ 
+ function setDisabled(disabled){
+   [userInput, passInput, otpInput, recoveryInput, submitBtn, btnSetupLimited, btnBrowserTime, btnUseRecovery].forEach((el) => {
+     if (el) el.disabled = disabled;
+   });
+   if (systemInput) {
+     systemInput.disabled = disabled;
+     if (!disabled) {
+@@ -278,30 +278,30 @@ form?.addEventListener('submit', async (event) => {
+         showOtpField();
+       } else if (err.status === 401 || err.status === 403) {
+         setMessage('Credenziali non valide.');
+       } else {
+         const msg = err.message || 'Errore del server.';
+         setMessage(msg);
+       }
+     } else {
+       setMessage('Impossibile contattare il server.');
+     }
+   } finally {
+     pendingRequest = false;
+     setDisabled(false);
+   }
+ });
+ 
+ btnUseRecovery?.addEventListener('click', () => showRecoveryField());
+ btnSetupLimited?.addEventListener('click', () => { setupLimitedMode = true; recoveryMode = false; otpRequired = false; form?.requestSubmit(); });
+ btnBrowserTime?.addEventListener('click', async () => {
+   try {
+     const unix_time = Math.floor(Date.now() / 1000);
+     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'browser';
+     await apiRequest('/api/setup/time', { method: 'POST', body: { unix_time, timezone }, auth: true });
+     hideFallbackChoices();
+     showOtpField();
+-    setMessage('Ora sincronizzata da browser. Inserisci OTP per completare accesso admin.', 'success');
++    setMessage('Ora sincronizzata. Ora puoi completare l\'accesso con OTP.', 'success');
+   } catch (err) {
+     setMessage('Sincronizzazione ora non disponibile: prima entra in modalità Configura rete.');
+   }
+ });
+\ No newline at end of file

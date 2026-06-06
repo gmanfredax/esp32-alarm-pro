@@ -27,6 +27,9 @@
       return _fetch(input, { ...rest, headers, credentials: creds }).then(resp => {
         if (!__skipAuthRedirect){
           if (resp.status === 401) { location.replace("/login.html"); }
+          else if (resp.status === 403 && setupLimited) {
+            if (location.pathname !== "/setup") location.replace("/setup");
+          }
           else if (resp.status === 403) { location.replace("/403.html"); }
         }
         return resp;
@@ -2427,6 +2430,28 @@ let lastRecoveryCodes = [];
       catch(e){ toast("Riavvio rete: " + e.message, false); }
     });
 
+    $("#btnSyncBrowserTime")?.addEventListener("click", async ()=>{
+      const status = $("#timeSyncStatus");
+      try{
+        const unix_time = Math.floor(Date.now() / 1000);
+        const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "browser";
+        const resp = await apiPost("/api/setup/time", { unix_time, timezone });
+        const msg = resp?.message || "Ora sincronizzata. Ora puoi completare l'accesso con OTP.";
+        if (status) status.textContent = msg;
+        toast(msg);
+      }catch(e){
+        const msg = "Sincronizzazione ora: " + e.message;
+        if (status) status.textContent = msg;
+        toast(msg, false);
+      }
+    });
+
+    $("#btnCompleteAdminLogin")?.addEventListener("click", async ()=>{
+      try{ await apiPost("/api/logout", {}); }catch{}
+      try { localStorage.removeItem("alarmpro.token"); sessionStorage.removeItem("alarmpro.token"); } catch{}
+      location.replace("/login.html");
+    });
+
     $("#btnNetSave")?.addEventListener("click", async ()=>{
       const mode = $("#net_mode")?.value || "ethernet_only";
       const ssid = ($("#net_wifi_ssid")?.value || "").trim();
@@ -2610,6 +2635,10 @@ let lastRecoveryCodes = [];
   }
 
   // ---- Wrapper come da tua init() originale
+  async function setupNetworkForms(){
+    await loadNetwork();
+  }
+
   async function setupNetMqttForms(){
     await Promise.all([loadNetwork(), loadMqtt()]);
   }
@@ -2731,7 +2760,7 @@ let lastRecoveryCodes = [];
     if (banner) banner.style.display = setupLimited ? "block" : "none";
     if (setupLimited) {
       document.querySelectorAll('.side button').forEach((btn) => {
-        const keep = btn.getAttribute('data-view') === 'view-network' || btn.getAttribute('data-view') === 'view-system';
+        const keep = btn.getAttribute('data-view') === 'view-network';
         btn.style.display = keep ? '' : 'none';
         if (btn.getAttribute('data-view') === 'view-network') btn.classList.add('active');
       });
@@ -2742,8 +2771,7 @@ let lastRecoveryCodes = [];
     updateAdminVisibility();
     setupSidebar();
     const setupPromises = setupLimited ? [
-      setupSystemSection(),
-      setupNetMqttForms()
+      setupNetworkForms()
     ] : [
       setupAdsDiagnostics(),
       setupAnalogGeneralSection(),

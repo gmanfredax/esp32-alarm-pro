@@ -136,8 +136,8 @@ initializeSystemId();
 (async () => {
   if (getToken() && getSystemSuffix()) {
     try {
-      await apiGet('/api/me');
-      window.location.replace('./index.html');
+      const me = await apiGet('/api/me');
+      window.location.replace(me?.session === 'setup_limited' ? '/setup' : './index.html');
     } catch {
       clearSession();
     }
@@ -300,7 +300,7 @@ btnBrowserTime?.addEventListener('click', async () => {
     await apiRequest('/api/setup/time', { method: 'POST', body: { unix_time, timezone }, auth: true });
     hideFallbackChoices();
     showOtpField();
-    setMessage('Ora sincronizzata da browser. Inserisci OTP per completare accesso admin.', 'success');
+    setMessage('Ora sincronizzata. Ora puoi completare l\'accesso con OTP.', 'success');
   } catch (err) {
     setMessage('Sincronizzazione ora non disponibile: prima entra in modalità Configura rete.');
   }

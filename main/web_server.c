@@ -2311,7 +2311,8 @@ static void provisioning_load_cloudflare(provisioning_cloudflare_config_t* cfg){
 static esp_err_t only_admin(httpd_req_t* req){
     if (!s_provisioned) return ESP_OK;
     user_info_t u;
-    if (!auth_check_bearer(req,&u) || u.role != ROLE_ADMIN || auth_session_is_setup_limited(req)){
+    if (!(auth_check_bearer(req,&u) || auth_check_cookie(req,&u)) || u.role != ROLE_ADMIN || auth_session_is_setup_limited(req)){
+        ESP_LOGW(TAG, "route denied uri=%s requires=admin", req->uri ? req->uri : "");
         return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
     }
     return ESP_OK;
@@ -2320,8 +2321,15 @@ static esp_err_t only_admin(httpd_req_t* req){
 static esp_err_t setup_or_admin(httpd_req_t* req){
     if (!s_provisioned) return ESP_OK;
     user_info_t u;
-    if (!auth_check_bearer(req,&u)) return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
-    if (u.role == ROLE_ADMIN || auth_session_is_setup_limited(req)) return ESP_OK;
+    if (!(auth_check_bearer(req,&u) || auth_check_cookie(req,&u))) {
+        ESP_LOGW(TAG, "route denied uri=%s reason=no-auth-or-not-allowlisted", req->uri ? req->uri : "");
+        return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
+    }
+    if (u.role == ROLE_ADMIN || auth_session_is_setup_limited(req)) {
+        if (auth_session_is_setup_limited(req)) ESP_LOGI(TAG, "route allowed for setup_limited uri=%s", req->uri ? req->uri : "");
+        return ESP_OK;
+    }
+    ESP_LOGW(TAG, "route denied uri=%s requires=setup-or-admin role=%d", req->uri ? req->uri : "", (int)u.role);
     return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "forbidden");
 }
 
@@ -6662,7 +6670,8 @@ static esp_err_t root_get(httpd_req_t* req){
         return send_file(req, "login.html");
     }
     if (auth_session_is_setup_limited(req)){
-        return send_http_redirect(req, "/admin.html#network", "302 Found");
+        ESP_LOGI(TAG, "setup_limited root redirect target=/setup");
+        return send_http_redirect(req, "/setup", "302 Found");
     }
     return send_file(req, "index.html");
 }
@@ -6685,9 +6694,21 @@ static esp_err_t index_html_get(httpd_req_t* req){
         return send_http_redirect(req, "/login.html", "302 Found");
     }
     if (auth_session_is_setup_limited(req)){
-        return send_http_redirect(req, "/admin.html#network", "302 Found");
+        ESP_LOGI(TAG, "setup_limited root redirect target=/setup");
+        return send_http_redirect(req, "/setup", "302 Found");
     }
     return send_file(req, "index.html");
+}
+static esp_err_t setup_html_get(httpd_req_t* req){
+    user_info_t u;
+    if (!auth_check_cookie(req, &u)) return send_http_redirect(req, "/login.html", "302 Found");
+    bool setup_limited = auth_session_is_setup_limited(req);
+    if (u.role == ROLE_ADMIN || setup_limited) {
+        ESP_LOGI(TAG, "setup page allowed role=%d setup_limited=%s", (int)u.role, setup_limited ? "true" : "false");
+        return send_file(req, "admin.html");
+    }
+    ESP_LOGW(TAG, "setup page denied role=%d", (int)u.role);
+    return send_file(req,"403.html");
 }
 static esp_err_t wizard_html_get(httpd_req_t* req){
     return send_file(req, "wizard.html");
@@ -6695,10 +6716,21 @@ static esp_err_t wizard_html_get(httpd_req_t* req){
 static esp_err_t admin_html_get(httpd_req_t* req){
     user_info_t u;
     if (!auth_check_cookie(req, &u)) return send_http_redirect(req, "/login.html", "302 Found");
-    if (u.role != ROLE_ADMIN && !auth_session_is_setup_limited(req)) return send_file(req,"403.html");
+    if (auth_session_is_setup_limited(req)) {
+        ESP_LOGI(TAG, "setup_limited admin.html redirect target=/setup");
+        return send_http_redirect(req, "/setup", "302 Found");
+    }
+    if (u.role != ROLE_ADMIN) {
+        ESP_LOGW(TAG, "admin.html denied role=%d", (int)u.role);
+        return send_file(req,"403.html");
+    }
     return send_file(req,"admin.html");
 }
 static esp_err_t four03_html_get(httpd_req_t* req){
+    if (auth_session_is_setup_limited(req)) {
+        ESP_LOGI(TAG, "setup_limited 403 redirect target=/setup");
+        return send_http_redirect(req, "/setup", "302 Found");
+    }
     return send_file(req,"403.html");
 }
 
@@ -6771,6 +6803,7 @@ static esp_err_t users_admin_list_get(httpd_req_t* req);
 static const httpd_uri_t s_http_routes[] = {
     { .uri = "/",                 .method = HTTP_GET,     .handler = root_get },
     { .uri = "/login.html",       .method = HTTP_GET,     .handler = login_html_get },
+    { .uri = "/setup",            .method = HTTP_GET,     .handler = setup_html_get },
     { .uri = "/favicon.ico",      .method = HTTP_GET,     .handler = favicon_get },
     { .uri = "/index.html",       .method = HTTP_GET,     .handler = index_html_get },
     { .uri = "/wizard.html",      .method = HTTP_GET,     .handler = wizard_html_get },
