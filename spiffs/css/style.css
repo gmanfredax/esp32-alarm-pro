@@ -32,8 +32,8 @@ body.auth-body{display:flex;flex-direction:column;min-height:100vh;}
 .title{font-size:1.9rem;margin:0 0 .4rem;letter-spacing:.2px;}
 
 input,button,select,textarea{font:inherit;}
-.form input{background:#0d1525;border:1px solid var(--border);color:var(--text);padding:.6rem .75rem;border-radius:12px;transition:border-color .2s,box-shadow .2s;}
-.form input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(34,211,238,.25);}
+.form input,.form select{background:#0d1525;border:1px solid var(--border);color:var(--text);padding:.6rem .75rem;border-radius:12px;transition:border-color .2s,box-shadow .2s;}
+.form input:focus,.form select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px rgba(34,211,238,.25);}
 
 .prefix-input{display:flex;align-items:center;gap:.55rem;background:#0d1525;border:1px solid var(--border);border-radius:14px;padding:.55rem .75rem;}
 .prefix-input .prefix{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85rem;color:var(--muted);white-space:nowrap;}
@@ -355,3 +355,17 @@ body.wizard-open{overflow:hidden}
   .wizard-actions-nav{width:100%;justify-content:space-between}
   .wizard-actions-nav .btn{flex:1}
 }*/
+/* Network / setup page */
+.network-page{display:grid;grid-template-columns:1fr;gap:16px;align-items:start;}
+@media(min-width:900px){.network-page{grid-template-columns:repeat(2,minmax(0,1fr));}.network-config-card,.network-apply-card{grid-column:1/-1;}}
+.net-kv-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:.65rem;}
+.net-kv{display:flex;flex-direction:column;gap:.25rem;padding:.65rem .75rem;border:1px solid rgba(148,163,184,.16);border-radius:12px;background:rgba(13,21,37,.62);min-width:0;}
+.net-kv span{color:var(--muted);font-size:.78rem;letter-spacing:.02em;}
+.net-kv strong{font-size:.95rem;line-height:1.25;word-break:break-word;overflow-wrap:anywhere;}
+.net-form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.75rem 1rem;align-items:end;}
+.net-form-grid .field input,.net-form-grid .field select{width:100%;}
+.network-actions{display:flex;flex-wrap:wrap;gap:.5rem;justify-content:flex-end;margin:.9rem 0 .4rem;}
+.network-result{margin:.8rem 0;padding:.85rem;border:1px solid rgba(16,185,129,.45);border-radius:14px;background:rgba(16,185,129,.1);}
+.wifi-scan-list{display:flex;flex-wrap:wrap;gap:.5rem;}
+.network-apply-card a{color:#a5f3fc;font-weight:600;word-break:break-all;}
+@media(max-width:560px){.network-actions{justify-content:stretch}.network-actions .btn{flex:1 1 100%;}.net-kv-grid{grid-template-columns:1fr;}.network-card.card{padding:14px;margin:3px;}}

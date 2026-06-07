@@ -252,46 +252,52 @@
           <section id="view-network" class="view">
             <div class="card" id="setupLimitedBanner" style="display:none;border-color:#f59e0b">
               <h3>Modalità setup limitata</h3>
-              <p class="muted">Accesso limitato a rete, diagnostica minima, sincronizzazione ora e riavvio. Per dashboard completa sincronizza l'orologio e rifai login con OTP, oppure usa un codice di recupero.</p>
+              <p class="muted">Accesso limitato a rete, diagnostica minima, sincronizzazione ora e riavvio. Le funzioni allarme/admin sensibili restano bloccate.</p>
               <div class="row" style="gap:.5rem;flex-wrap:wrap">
                 <button class="btn" id="btnCompleteAdminLogin" type="button">Completa login admin</button>
               </div>
             </div>
-            <div class="card">
-              <h3>Rete</h3>
-              <div id="netStatus" class="info-grid" style="margin-bottom:1rem"></div>
-              <form class="form" id="netForm">
-                <div class="row" style="gap:1rem;flex-wrap:wrap">
-                  <label class="field"><span>Modalità rete</span>
-                    <select id="net_mode">
-                      <option value="ethernet_only">Solo Ethernet</option>
-                      <option value="wifi_only">Solo Wi-Fi</option>
-                      <option value="ethernet_preferred">Ethernet preferita + fallback Wi-Fi</option>
-                      <option value="wifi_preferred">Wi-Fi preferito + fallback Ethernet</option>
-                    </select>
-                  </label>
-                  <label class="field"><span>Hostname</span><input id="net_host" type="text" maxlength="63" placeholder="nsalarmpro" /></label>
-                </div>
-                <div class="row" style="gap:1rem;flex-wrap:wrap;margin-top:.4rem">
-                  <label class="field"><span>SSID Wi-Fi</span><input id="net_wifi_ssid" type="text" maxlength="32" autocomplete="off" placeholder="Casa" /></label>
-                  <label class="field"><span>Password Wi-Fi</span><input id="net_wifi_password" type="password" maxlength="64" autocomplete="new-password" placeholder="lascia vuoto per mantenerla" /></label>
-                  <label class="field"><span>AP fallback</span><select id="net_setup_enabled"><option value="1">Abilitato</option><option value="0">Disabilitato</option></select></label>
-                  <label class="field"><span>Password AP fallback</span><input id="net_setup_password" type="password" minlength="8" maxlength="64" autocomplete="new-password" placeholder="lascia vuoto per mantenerla" /></label>
-                </div>
-                <div class="row" style="gap:.5rem;align-items:end;flex-wrap:wrap;margin-top:.4rem">
-                  <button class="btn" id="btnSyncBrowserTime" type="button">Sincronizza ora da questo dispositivo</button>
-                  <small id="timeSyncStatus" class="muted">Usa questa funzione se SNTP non è disponibile e l'OTP non è verificabile.</small>
-                </div>
-                <div id="netWifiScan" class="info-grid" style="margin-top:.6rem"></div>
-                <div class="row" style="justify-content:flex-end;margin-top:.6rem;gap:.5rem;flex-wrap:wrap">
-                  <button class="btn" id="btnNetWifiScan" type="button">Scansiona reti Wi-Fi</button>
-                  <button class="btn" id="btnNetWifiTest" type="button">Test Wi-Fi</button>
-                  <button class="btn" id="btnNetSetupExit" type="button">Esci dal setup</button>
-                  <button class="btn" id="btnNetRestart" type="button">Riavvia rete</button>
-                  <button class="btn" id="btnNetSave" type="button">Salva configurazione</button>
-                </div>
-                <small class="muted">La password non viene mai mostrata né restituita dalle API. In AP fallback la UI è raggiungibile su http://192.168.4.1</small>
-              </form>
+            <div id="networkApplying" class="card network-apply-card hidden"></div>
+            <div class="network-page">
+              <div class="network-card card"><div class="card-head"><div class="title"><h2>Stato generale</h2></div></div><div id="netGeneral" class="net-kv-grid"></div></div>
+              <div class="network-card card"><div class="card-head"><div class="title"><h2>Ethernet</h2></div></div><div id="netEthernet" class="net-kv-grid"></div></div>
+              <div class="network-card card"><div class="card-head"><div class="title"><h2>Wi‑Fi</h2></div></div><div id="netWifi" class="net-kv-grid"></div></div>
+              <div class="network-card card"><div class="card-head"><div class="title"><h2>AP fallback</h2></div></div><div id="netFallback" class="net-kv-grid"></div></div>
+              <div class="network-card card network-config-card">
+                <div class="card-head"><div class="title"><h2>Configurazione</h2></div></div>
+                <form class="form" id="netForm">
+                  <div class="net-form-grid">
+                    <label class="field"><span>Modalità rete</span>
+                      <select id="net_mode">
+                        <option value="ethernet_only">Solo Ethernet</option>
+                        <option value="wifi_only">Solo Wi-Fi</option>
+                        <option value="ethernet_preferred">Ethernet preferita + fallback Wi-Fi</option>
+                        <option value="wifi_preferred">Wi-Fi preferito + fallback Ethernet</option>
+                      </select>
+                    </label>
+                    <label class="field"><span>Hostname</span><input id="net_host" type="text" maxlength="63" placeholder="nsalarmpro" /></label>
+                    <label class="field"><span>SSID Wi-Fi</span><input id="net_wifi_ssid" type="text" maxlength="32" autocomplete="off" placeholder="Casa" /></label>
+                    <label class="field"><span>Password Wi-Fi</span><input id="net_wifi_password" type="password" maxlength="64" autocomplete="new-password" placeholder="lascia vuoto per mantenerla" /></label>
+                    <label class="field"><span>AP fallback</span><select id="net_setup_enabled"><option value="1">Abilitato</option><option value="0">Disabilitato</option></select></label>
+                    <label class="field"><span>Password AP fallback</span><input id="net_setup_password" type="password" minlength="8" maxlength="64" autocomplete="new-password" placeholder="lascia vuoto per mantenerla" /></label>
+                  </div>
+                  <div class="network-actions">
+                    <button class="btn" id="btnNetWifiScan" type="button">Scansiona reti Wi-Fi</button>
+                    <button class="btn" id="btnNetWifiTest" type="button">Test Wi-Fi</button>
+                    <button class="btn primary" id="btnNetSave" type="button">Salva configurazione</button>
+                    <button class="btn primary" id="btnNetSaveApply" type="button">Salva e applica</button>
+                    <button class="btn" id="btnNetRestart" type="button">Riavvia rete</button>
+                    <button class="btn" id="btnNetSetupExit" type="button">Esci dal setup</button>
+                  </div>
+                  <div class="row" style="gap:.5rem;align-items:end;flex-wrap:wrap;margin-top:.6rem">
+                    <button class="btn" id="btnSyncBrowserTime" type="button">Sincronizza ora da questo dispositivo</button>
+                    <small id="timeSyncStatus" class="muted">Usa questa funzione se SNTP non è disponibile e l'OTP non è verificabile.</small>
+                  </div>
+                  <div id="netWifiTestResult" class="network-result hidden"></div>
+                  <div id="netWifiScan" class="wifi-scan-list" style="margin-top:.6rem"></div>
+                  <small class="muted">Le password non vengono mai mostrate né restituite dalle API. In AP fallback la UI è raggiungibile su http://192.168.4.1</small>
+                </form>
+              </div>
             </div>
           </section>
 

@@ -300,10 +300,11 @@ static esp_err_t json_reply(httpd_req_t* req, const char* json){
 
 static bool setup_limited_uri_allowed(const char *uri){
     if (!uri) return false;
-    if (!strcmp(uri, "/setup") || !strcmp(uri, "/403.html")) return true;
+    if (!strcmp(uri, "/setup") || !strcmp(uri, "/setup/applying") || !strcmp(uri, "/403.html")) return true;
     if (!strcmp(uri, "/api/me") || !strcmp(uri, "/api/logout")) return true;
-    if (!strcmp(uri, "/api/admin/network")) return true;
-    if (!strcmp(uri, "/api/admin/network/restart") || !strcmp(uri, "/api/admin/network/wifi/test")) return true;
+    if (!strcmp(uri, "/api/admin/network") || !strcmp(uri, "/api/setup/network")) return true;
+    if (!strcmp(uri, "/api/setup/network/save") || !strcmp(uri, "/api/setup/network/apply") || !strcmp(uri, "/api/setup/network/save-apply")) return true;
+    if (!strcmp(uri, "/api/admin/network/restart") || !strcmp(uri, "/api/admin/network/wifi/test") || !strcmp(uri, "/api/setup/wifi/test")) return true;
     if (!strcmp(uri, "/api/admin/network/wifi/scan") || !strcmp(uri, "/api/admin/network/setup/exit")) return true;
     if (!strcmp(uri, "/api/network/status") || !strcmp(uri, "/api/network/config")) return true;
     if (!strcmp(uri, "/api/setup/time")) return true;

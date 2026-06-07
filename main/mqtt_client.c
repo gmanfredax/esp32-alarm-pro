@@ -573,17 +573,30 @@ esp_err_t mqtt_publish_state(void)
     if (net) {
         cJSON *eth = cJSON_GetObjectItemCaseSensitive(net, "ethernet");
         cJSON *wifi = cJSON_GetObjectItemCaseSensitive(net, "wifi");
-        cJSON *ap = cJSON_GetObjectItemCaseSensitive(net, "setup_ap");
+        cJSON *ap = cJSON_GetObjectItemCaseSensitive(net, "fallback_ap");
+        if (!ap) ap = cJSON_GetObjectItemCaseSensitive(net, "setup_ap");
         const char *active_if = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(net, "active_interface"));
         const char *net_mode = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(net, "network_mode"));
         const char *net_ip = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(net, "ip"));
+        cJSON *active_netif = (active_if && !strcmp(active_if, "ethernet")) ? eth : ((active_if && !strcmp(active_if, "wifi")) ? wifi : NULL);
         cJSON_AddStringToObject(root, "network_mode", net_mode ? net_mode : "ethernet_only");
         cJSON_AddStringToObject(root, "active_interface", active_if ? active_if : "none");
         cJSON_AddStringToObject(root, "ip", net_ip ? net_ip : "0.0.0.0");
+        const char *netmask = active_netif ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(active_netif, "netmask")) : NULL;
+        const char *gateway = active_netif ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(active_netif, "gateway")) : NULL;
+        const char *dns1 = active_netif ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(active_netif, "dns1")) : NULL;
+        const char *dns2 = active_netif ? cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(active_netif, "dns2")) : NULL;
+        cJSON_AddStringToObject(root, "netmask", netmask ? netmask : "0.0.0.0");
+        cJSON_AddStringToObject(root, "gateway", gateway ? gateway : "0.0.0.0");
+        cJSON_AddStringToObject(root, "dns1", dns1 ? dns1 : "0.0.0.0");
+        cJSON_AddStringToObject(root, "dns2", dns2 ? dns2 : "0.0.0.0");
         cJSON_AddBoolToObject(root, "ethernet_link", eth && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(eth, "link_up")));
         cJSON_AddBoolToObject(root, "wifi_connected", wifi && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(wifi, "connected")));
         cJSON_AddNumberToObject(root, "wifi_rssi", wifi ? cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(wifi, "rssi")) : 0);
+        cJSON_AddNumberToObject(root, "wifi_channel", wifi ? cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(wifi, "channel")) : 0);
         cJSON_AddBoolToObject(root, "setup_ap_active", ap && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ap, "active")));
+        cJSON_AddBoolToObject(root, "fallback_ap_active", ap && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ap, "active")));
+        cJSON_AddBoolToObject(root, "fallback_ap_grace_active", ap && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(ap, "grace_active")));
     }
 
     char *payload = cJSON_PrintUnformatted(root);

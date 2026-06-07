@@ -2352,118 +2352,129 @@ let lastRecoveryCodes = [];
 
   // ========== RETE / MQTT
   function netLabel(value){
-    return ({ ethernet_only:"Solo Ethernet", wifi_only:"Solo Wi-Fi", ethernet_preferred:"Ethernet preferita", wifi_preferred:"Wi-Fi preferito", ethernet:"Ethernet", wifi:"Wi-Fi", none:"Nessuna" })[value] || value || "—";
+    return ({ ethernet_only:"Solo Ethernet", wifi_only:"Solo Wi‑Fi", ethernet_preferred:"Ethernet preferita", wifi_preferred:"Wi‑Fi preferito", ethernet:"Ethernet", wifi:"Wi‑Fi", setup_ap:"AP fallback", none:"Nessuna", connected:"connessa", disconnected:"disconnessa" })[value] || value || "—";
   }
-
+  function netBool(ok, yes="Sì", no="No"){
+    return `<span class="tag ${ok ? "ok" : "warn"}">${ok ? yes : no}</span>`;
+  }
+  function netValue(v){ return (v === 0 || v) ? escapeHtml(String(v)) : "—"; }
+  function netRows(rows){
+    return rows.map(([k,v]) => `<div class="net-kv"><span>${escapeHtml(k)}</span><strong>${v}</strong></div>`).join("");
+  }
   function renderNetworkStatus(c){
-    const box = $("#netStatus");
-    if (!box) return;
-    const wifi = c.wifi || {};
-    const eth = c.ethernet || {};
-    const items = [
-      ["Interfaccia attiva", netLabel(c.active_interface)],
-      ["Modalità", netLabel(c.network_mode)],
-      ["Hostname", c.hostname || "—"],
-      ["Ethernet", eth.link_up ? "link up" : "link down"],
-      ["IP Ethernet", eth.ip || "0.0.0.0"],
-      ["MAC Ethernet", eth.mac || "—"],
-      ["Wi-Fi", wifi.connected ? "connesso" : "disconnesso"],
-      ["SSID Wi-Fi", wifi.ssid || "—"],
-      ["RSSI Wi-Fi", wifi.rssi ? `${wifi.rssi} dBm` : "—"],
-      ["IP Wi-Fi", wifi.ip || "0.0.0.0"],
-      ["MAC Wi-Fi", wifi.mac || "—"],
-      ["Password Wi-Fi", wifi.password_set ? "configurata" : "non configurata"],
-      ["AP fallback", c.setup_ap?.active ? `attivo (${c.setup_ap.ssid || "—"})` : (c.setup_ap?.enabled ? "abilitato" : "disabilitato")],
-      ["IP AP fallback", c.setup_ap?.ip || "192.168.4.1"],
-      ["Client AP fallback", Number.isFinite(c.setup_ap?.clients) ? c.setup_ap.clients : "—"],
-      ["Avvii AP fallback", Number.isFinite(c.setup_ap?.start_count) ? c.setup_ap.start_count : "—"],
-      ["Motivo ultimo AP", c.setup_ap?.last_reason || "—"],
-      ["Ultimo evento client AP", c.setup_ap?.last_client_event || "—"],
-      ["Password AP", c.setup_ap?.password_set ? "configurata" : "non configurata"],
-      ["Ultimo errore", c.last_error || "—"],
-    ];
-    box.innerHTML = items.map(([k,v]) => `<div><span>${k}</span><strong>${v}</strong></div>`).join("");
+    const wifi = c.wifi || {}, eth = c.ethernet || {}, ap = c.fallback_ap || c.setup_ap || {};
+    const connOk = c.connectivity === "connected" || c.active_interface === "wifi" || c.active_interface === "ethernet";
+    const general = $("#netGeneral");
+    if (general) general.innerHTML = netRows([
+      ["Modalità configurata", netLabel(c.configured_mode || c.network_mode)],
+      ["Interfaccia attiva", `<span class="tag ${connOk ? "ok" : "warn"}">${escapeHtml(netLabel(c.active_interface))}</span>`],
+      ["Hostname", netValue(c.hostname)],
+      ["Connettività", netBool(connOk, "connessa", c.connectivity === "setup_ap" ? "solo setup" : "non connessa")],
+      ["Ultimo errore", netValue(c.last_error)],
+      ["Ultimo evento", netValue(c.last_event || c.active_interface)],
+    ]);
+    const ethBox = $("#netEthernet");
+    if (ethBox) ethBox.innerHTML = netRows([
+      ["Abilitata", netBool(eth.enabled !== false, "abilitata", "disabilitata")],
+      ["Link", netBool(!!eth.link_up, "link up", "link down")],
+      ["MAC", netValue(eth.mac)], ["IP", netValue(eth.ip)], ["Netmask", netValue(eth.netmask)],
+      ["Gateway", netValue(eth.gateway)], ["DNS 1", netValue(eth.dns1)], ["DNS 2", netValue(eth.dns2)],
+      ["DHCP/static", eth.dhcp === false ? "static" : "DHCP"],
+    ]);
+    const wifiBox = $("#netWifi");
+    if (wifiBox) wifiBox.innerHTML = netRows([
+      ["Abilitato", netBool(!!wifi.enabled, "abilitato", "disabilitato")],
+      ["Stato", netBool(!!wifi.connected, "connesso", "disconnesso")],
+      ["SSID", netValue(wifi.ssid)], ["BSSID", netValue(wifi.bssid)], ["Canale", netValue(wifi.channel)],
+      ["RSSI", wifi.rssi ? `${escapeHtml(String(wifi.rssi))} dBm` : "—"], ["MAC", netValue(wifi.mac)],
+      ["IP", netValue(wifi.ip)], ["Netmask", netValue(wifi.netmask)], ["Gateway", netValue(wifi.gateway)],
+      ["DNS 1", netValue(wifi.dns1)], ["DNS 2", netValue(wifi.dns2)], ["DHCP/static", wifi.dhcp === false ? "static" : "DHCP"],
+    ]);
+    const apBox = $("#netFallback");
+    if (apBox) apBox.innerHTML = netRows([
+      ["Configurazione", netBool(ap.enabled !== false, "abilitato", "disabilitato")],
+      ["Runtime", netBool(!!ap.active, "attivo", "non attivo")],
+      ["SSID AP", netValue(ap.ssid)], ["IP AP", netValue(ap.ip || "192.168.4.1")], ["Netmask AP", netValue(ap.netmask)],
+      ["Client", netValue(ap.clients)], ["Avvii AP", netValue(ap.start_count)],
+      ["Periodo di grazia", ap.grace_active ? `<span class="tag warn">${Number(ap.grace_remaining_s || 0)} s</span>` : "—"],
+      ["Ultimo motivo", netValue(ap.last_reason)], ["Ultimo evento client", netValue(ap.last_client_event)],
+    ]);
   }
-
+  function readNetworkBody(){
+    const mode = $("#net_mode")?.value || "ethernet_only";
+    const ssid = ($("#net_wifi_ssid")?.value || "").trim();
+    const password = $("#net_wifi_password")?.value || "";
+    const setupPass = $("#net_setup_password")?.value || "";
+    if ((mode === "wifi_only" || mode === "ethernet_preferred" || mode === "wifi_preferred") && !ssid) throw new Error("SSID Wi‑Fi obbligatorio per la modalità scelta");
+    const body = { network_mode: mode, hostname: ($("#net_host")?.value || "").trim(), wifi: { ssid }, setup_ap: { enabled: ($("#net_setup_enabled")?.value || "1") === "1" } };
+    if (password) body.wifi.password = password;
+    if (setupPass) body.setup_ap.password = setupPass;
+    return body;
+  }
+  function showApplying(resp, ssid){
+    const box = $("#networkApplying");
+    if (!box) return;
+    const host = resp?.hostname || ($("#net_host")?.value || "nsalarmpro").trim() || "nsalarmpro";
+    const ip = resp?.new_ip || "";
+    const grace = Number(resp?.setup_ap_grace_s || 120);
+    const mdns = `http://${host}.local/`;
+    const ipUrl = ip ? `http://${ip}/` : "";
+    box.classList.remove("hidden");
+    box.innerHTML = `<h3>Applicazione rete in corso</h3>
+      <p>Configurazione salvata. Riconnetti telefono/PC alla rete principale ${ssid ? `<strong>${escapeHtml(ssid)}</strong>` : ""} e apri ${ipUrl ? `<a href="${ipUrl}">${ipUrl}</a>` : "il nuovo IP"} oppure <a href="${mdns}">${mdns}</a>.</p>
+      <div class="net-kv-grid"><div class="net-kv"><span>Nuovo IP noto</span><strong>${escapeHtml(ip || "in attesa")}</strong></div><div class="net-kv"><span>Hostname</span><strong>${escapeHtml(host)}</strong></div><div class="net-kv"><span>AP fallback grace</span><strong><span id="netApplyCountdown">${grace}</span> s</strong></div></div>
+      <p class="muted">Il redirect automatico partirà dopo un tempo ragionevole; se fallisce usa i link manuali.</p>`;
+    let left = grace;
+    const timer = setInterval(() => { left -= 1; const el = $("#netApplyCountdown"); if (el) el.textContent = String(Math.max(0,left)); if (left <= 0) clearInterval(timer); }, 1000);
+    setTimeout(() => { if (ipUrl) location.href = ipUrl; }, 25000);
+  }
   async function loadNetwork(){
     try{
       const c = await apiGet("/api/admin/network");
       renderNetworkStatus(c);
-      $("#net_mode") && ($("#net_mode").value = c.network_mode || "ethernet_only");
+      $("#net_mode") && ($("#net_mode").value = c.configured_mode || c.network_mode || "ethernet_only");
       $("#net_host") && ($("#net_host").value = c.hostname || "");
       $("#net_wifi_ssid") && ($("#net_wifi_ssid").value = c.wifi?.ssid || "");
       $("#net_wifi_password") && ($("#net_wifi_password").value = "");
-      $("#net_setup_enabled") && ($("#net_setup_enabled").value = c.setup_ap?.enabled === false ? "0" : "1");
+      const ap = c.fallback_ap || c.setup_ap || {};
+      $("#net_setup_enabled") && ($("#net_setup_enabled").value = ap.enabled === false ? "0" : "1");
       $("#net_setup_password") && ($("#net_setup_password").value = "");
     }catch(e){ toast("Errore caricando rete: " + e.message, false); }
-
+  }
+  function setupNetworkEventHandlers(){
     $("#btnNetWifiScan")?.addEventListener("click", async ()=>{
       try{
         const res = await apiGet("/api/admin/network/wifi/scan");
         const box = $("#netWifiScan");
         if (box){
           const nets = res.networks || [];
-          box.innerHTML = nets.length ? nets.map(n => `<button class="btn" type="button" data-ssid="${escapeHtml(n.ssid || "")}">${escapeHtml(n.ssid || "(nascosta)")} · ${n.rssi || 0} dBm · ${escapeHtml(n.security || "")}</button>`).join("") : "<div><span>Reti</span><strong>Nessuna rete trovata</strong></div>";
+          box.innerHTML = nets.length ? nets.map(n => `<button class="btn" type="button" data-ssid="${escapeHtml(n.ssid || "")}">${escapeHtml(n.ssid || "(nascosta)")} · ${n.rssi || 0} dBm · ${escapeHtml(n.security || "")}</button>`).join("") : "<div class=\"net-kv\"><span>Reti</span><strong>Nessuna rete trovata</strong></div>";
           box.querySelectorAll("button[data-ssid]").forEach(b => b.addEventListener("click", ()=>{ const v=b.getAttribute("data-ssid")||""; if(v) $("#net_wifi_ssid").value=v; }));
         }
-      }catch(e){ toast("Scansione Wi-Fi fallita: " + e.message, false); }
+      }catch(e){ toast("Scansione Wi‑Fi fallita: " + e.message, false); }
     });
-
     $("#btnNetWifiTest")?.addEventListener("click", async ()=>{
       const ssid = ($("#net_wifi_ssid")?.value || "").trim();
       const password = $("#net_wifi_password")?.value || "";
-      if (!ssid) return toast("SSID Wi-Fi obbligatorio", false);
+      if (!ssid) return toast("SSID Wi‑Fi obbligatorio", false);
       try{
-        await apiPost("/api/admin/network/wifi/test", { ssid, password });
-        toast("Test Wi-Fi riuscito");
+        const r = await apiPost("/api/setup/wifi/test", { ssid, password });
+        const box = $("#netWifiTestResult");
+        if (box){
+          box.classList.remove("hidden");
+          box.innerHTML = `<strong>${escapeHtml(r.message || "Connessione Wi‑Fi riuscita")}</strong><div class="net-kv-grid">${netRows([["SSID", netValue(r.ssid)], ["IP", netValue(r.ip)], ["Netmask", netValue(r.netmask)], ["Gateway", netValue(r.gateway)], ["DNS 1", netValue(r.dns1)], ["DNS 2", netValue(r.dns2)], ["RSSI", r.rssi ? `${escapeHtml(String(r.rssi))} dBm` : "—"], ["Canale", netValue(r.channel)], ["BSSID", netValue(r.bssid)]])}</div><button class="btn primary" id="btnUseTestedWifi" type="button">Salva e applica questa rete</button>`;
+          $("#btnUseTestedWifi")?.addEventListener("click", () => $("#btnNetSaveApply")?.click());
+        }
+        toast(r.message || "Test Wi‑Fi riuscito");
         await loadNetwork();
-      }catch(e){ toast("Test Wi-Fi fallito: " + e.message, false); }
+      }catch(e){ toast("Test Wi‑Fi fallito: " + e.message, false); }
     });
-
-    $("#btnNetSetupExit")?.addEventListener("click", async ()=>{
-      try{ await apiPost("/api/admin/network/setup/exit", {}); toast("Uscita setup richiesta"); setTimeout(loadNetwork, 1000); }
-      catch(e){ toast("Uscita setup: " + e.message, false); }
-    });
-
-    $("#btnNetRestart")?.addEventListener("click", async ()=>{
-      try{ await apiPost("/api/admin/network/restart", {}); toast("Riavvio rete avviato"); setTimeout(loadNetwork, 1500); }
-      catch(e){ toast("Riavvio rete: " + e.message, false); }
-    });
-
-    $("#btnSyncBrowserTime")?.addEventListener("click", async ()=>{
-      const status = $("#timeSyncStatus");
-      try{
-        const unix_time = Math.floor(Date.now() / 1000);
-        const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "browser";
-        const resp = await apiPost("/api/setup/time", { unix_time, timezone });
-        const msg = resp?.message || "Ora sincronizzata. Ora puoi completare l'accesso con OTP.";
-        if (status) status.textContent = msg;
-        toast(msg);
-      }catch(e){
-        const msg = "Sincronizzazione ora: " + e.message;
-        if (status) status.textContent = msg;
-        toast(msg, false);
-      }
-    });
-
-    $("#btnCompleteAdminLogin")?.addEventListener("click", async ()=>{
-      try{ await apiPost("/api/logout", {}); }catch{}
-      try { localStorage.removeItem("alarmpro.token"); sessionStorage.removeItem("alarmpro.token"); } catch{}
-      location.replace("/login.html");
-    });
-
-    $("#btnNetSave")?.addEventListener("click", async ()=>{
-      const mode = $("#net_mode")?.value || "ethernet_only";
-      const ssid = ($("#net_wifi_ssid")?.value || "").trim();
-      const password = $("#net_wifi_password")?.value || "";
-      if ((mode === "wifi_only" || mode === "ethernet_preferred" || mode === "wifi_preferred") && !ssid) return toast("SSID Wi-Fi obbligatorio per la modalità scelta", false);
-      const setupPass = $("#net_setup_password")?.value || "";
-      const body = { network_mode: mode, hostname: ($("#net_host")?.value || "").trim(), wifi: { ssid }, setup_ap: { enabled: ($("#net_setup_enabled")?.value || "1") === "1" } };
-      if (password) body.wifi.password = password;
-      if (setupPass) body.setup_ap.password = setupPass;
-      try{ await apiPost("/api/admin/network", body); toast("Configurazione rete salvata"); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); await loadNetwork(); }
-      catch(e){ toast("Errore salvataggio rete: " + e.message, false); }
-    });
+    $("#btnNetSetupExit")?.addEventListener("click", async ()=>{ try{ await apiPost("/api/admin/network/setup/exit", {}); toast("Uscita setup richiesta"); setTimeout(loadNetwork, 1000); } catch(e){ toast("Uscita setup: " + e.message, false); } });
+    $("#btnNetRestart")?.addEventListener("click", async ()=>{ const btn=$("#btnNetRestart"); try{ if(btn) btn.disabled=true; const r=await apiPost("/api/admin/network/restart", {}); toast(r?.message || "Riavvio rete programmato"); setTimeout(loadNetwork, 2500); } catch(e){ toast("Riavvio rete: attendo riconnessione…", true); setTimeout(loadNetwork, 3500); } finally{ setTimeout(()=>{ if(btn) btn.disabled=false; }, 5000); } });
+    $("#btnSyncBrowserTime")?.addEventListener("click", async ()=>{ const status = $("#timeSyncStatus"); try{ const unix_time = Math.floor(Date.now() / 1000); const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "browser"; const resp = await apiPost("/api/setup/time", { unix_time, timezone }); const msg = resp?.message || "Ora sincronizzata. Ora puoi completare l'accesso con OTP."; if (status) status.textContent = msg; toast(msg); }catch(e){ const msg = "Sincronizzazione ora: " + e.message; if (status) status.textContent = msg; toast(msg, false); } });
+    $("#btnCompleteAdminLogin")?.addEventListener("click", async ()=>{ try{ await apiPost("/api/logout", {}); }catch{} try { localStorage.removeItem("alarmpro.token"); sessionStorage.removeItem("alarmpro.token"); } catch{} location.replace("/login.html"); });
+    $("#btnNetSave")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const r=await apiPost("/api/setup/network/save", body); toast(r?.message || "Configurazione salvata ma non ancora applicata"); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); await loadNetwork(); } catch(e){ toast("Errore salvataggio rete: " + e.message, false); } });
+    $("#btnNetSaveApply")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const ssid=body.wifi?.ssid || ""; const r=await apiPost("/api/setup/network/save-apply", body); toast(r?.message || "Configurazione salvata e applicazione avviata"); showApplying(r, ssid); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); setTimeout(loadNetwork, 3000); } catch(e){ toast("Salva e applica: " + e.message, false); } });
   }
 
   function normalizeMqttUriForTls(uri, tlsEnabled){
@@ -2636,10 +2647,12 @@ let lastRecoveryCodes = [];
 
   // ---- Wrapper come da tua init() originale
   async function setupNetworkForms(){
+    setupNetworkEventHandlers();
     await loadNetwork();
   }
 
   async function setupNetMqttForms(){
+    setupNetworkEventHandlers();
     await Promise.all([loadNetwork(), loadMqtt()]);
   }
 

@@ -229,6 +229,7 @@ static esp_timer_handle_t s_net_apply_timer = NULL;
 static provisioning_net_config_t s_net_apply_cfg = {0};
 static bool s_net_apply_cfg_valid = false;
 static portMUX_TYPE s_net_apply_lock = portMUX_INITIALIZER_UNLOCKED;
+static esp_timer_handle_t s_network_restart_timer = NULL;
 
 typedef struct ws_client {
     int fd;
@@ -2387,6 +2388,31 @@ static esp_err_t api_admin_notifications_test_post(httpd_req_t* req){
 }
 
 
+
+static void network_restart_timer_cb(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "network_restart_executed");
+    esp_err_t err = network_manager_restart();
+    if (err != ESP_OK) ESP_LOGW(TAG, "network_manager_restart scheduled failed: %s", esp_err_to_name(err));
+}
+
+static esp_err_t schedule_network_restart(uint32_t delay_ms)
+{
+    if (!s_network_restart_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = network_restart_timer_cb,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "net_restart",
+        };
+        ESP_RETURN_ON_ERROR(esp_timer_create(&args, &s_network_restart_timer), TAG, "net_restart_timer");
+    }
+    esp_timer_stop(s_network_restart_timer);
+    ESP_LOGI(TAG, "network_restart_scheduled delay_ms=%lu", (unsigned long)delay_ms);
+    return esp_timer_start_once(s_network_restart_timer, (uint64_t)delay_ms * 1000ULL);
+}
+
 static esp_err_t network_json_error(httpd_req_t *req, int status, const char *error, const char *message)
 {
     cJSON *root = cJSON_CreateObject();
@@ -2418,9 +2444,10 @@ static esp_err_t api_network_status_get(httpd_req_t* req)
 static esp_err_t api_admin_network_restart_post(httpd_req_t* req)
 {
     if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
-    esp_err_t err = network_manager_restart();
-    if (err != ESP_OK) return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "restart_failed", "Riavvio rete fallito");
-    return json_reply(req, "{\"ok\":true,\"message\":\"Riavvio rete avviato\"}");
+    ESP_LOGI(TAG, "network_restart_requested");
+    esp_err_t err = schedule_network_restart(1000);
+    if (err != ESP_OK) return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "restart_failed", "Riavvio rete non programmato");
+    return json_reply(req, "{\"ok\":true,\"message\":\"Riavvio rete programmato\",\"restart_scheduled\":true}");
 }
 
 static esp_err_t api_admin_network_wifi_scan_get(httpd_req_t* req)
@@ -2468,15 +2495,17 @@ static esp_err_t api_admin_network_wifi_test_post(httpd_req_t* req)
         return network_json_error(req, HTTPD_400_BAD_REQUEST, "missing_wifi_password", "Password Wi-Fi obbligatoria per testare nuove credenziali");
     }
     if (pass[0] && strlen(pass) > NETWORK_WIFI_PASSWORD_MAX) { cJSON_Delete(j); return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_password_too_long", "Password Wi-Fi massimo 64 caratteri"); }
-    esp_err_t err = network_wifi_test(ssid, pass, use_saved, 15000);
+    cJSON *root = cJSON_CreateObject();
+    if (!root) { cJSON_Delete(j); return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL; }
+    esp_err_t err = network_wifi_test_append_json(root, ssid, pass, use_saved, 15000);
     cJSON_Delete(j);
-    if (err != ESP_OK) return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_test_failed", "Connessione Wi-Fi fallita o IP non ottenuto");
-    return json_reply(req, "{\"ok\":true,\"message\":\"Test Wi-Fi riuscito\"}");
+    if (err != ESP_OK) { cJSON_Delete(root); return network_json_error(req, HTTPD_400_BAD_REQUEST, "wifi_test_failed", "Connessione Wi-Fi fallita o IP non ottenuto"); }
+    return json_reply_cjson(req, root);
 }
 
-static esp_err_t api_admin_network_post(httpd_req_t* req)
+static esp_err_t network_config_parse_and_save(httpd_req_t* req, bool *saved_out)
 {
-    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
+    if (saved_out) *saved_out = false;
     char body[1024]; size_t bl=0;
     if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return httpd_resp_send_err(req,400,"body"), ESP_FAIL;
     cJSON* j = cJSON_ParseWithLength(body, bl);
@@ -2531,8 +2560,57 @@ static esp_err_t api_admin_network_post(httpd_req_t* req)
     esp_err_t err = network_config_save(&cfg);
     cJSON_Delete(j);
     if (err != ESP_OK) return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "save_failed", "Salvataggio configurazione rete fallito");
-    network_manager_restart();
-    return json_reply(req, "{\"ok\":true,\"message\":\"Configurazione rete salvata\"}");
+    ESP_LOGI(TAG, "network_config_saved");
+    if (saved_out) *saved_out = true;
+    return ESP_OK;
+}
+
+static esp_err_t api_admin_network_post(httpd_req_t* req)
+{
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
+    bool saved = false;
+    esp_err_t err = network_config_parse_and_save(req, &saved);
+    if (err != ESP_OK) return err;
+    return json_reply(req, "{\"ok\":true,\"saved\":true,\"apply_started\":false,\"message\":\"Configurazione salvata. Premi Salva e applica/Riavvia rete per usarla.\"}");
+}
+
+static esp_err_t api_setup_network_apply_post(httpd_req_t* req)
+{
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
+    ESP_LOGI(TAG, "network_apply_started");
+    (void)network_setup_ap_start_grace(120);
+    esp_err_t err = schedule_network_restart(1000);
+    if (err != ESP_OK) return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "apply_failed", "Applicazione rete non programmata");
+    network_status_t st = {0};
+    network_get_status(&st);
+    char json[384];
+    const char *ip = st.wifi_has_ip ? st.wifi_ip : (st.ethernet_has_ip ? st.ethernet_ip : "");
+    char redirect[64] = "";
+    if (ip[0]) snprintf(redirect, sizeof(redirect), "http://%s/", ip);
+    ESP_LOGI(TAG, "new_network_ip=%s redirect_url=%s", ip, redirect);
+    snprintf(json, sizeof(json), "{\"ok\":true,\"saved\":false,\"apply_started\":true,\"message\":\"Applicazione rete programmata\",\"new_ip\":\"%s\",\"hostname\":\"%s\",\"setup_ap_grace_s\":120,\"redirect_url\":\"%s\"}", ip, st.hostname, redirect);
+    return json_reply(req, json);
+}
+
+static esp_err_t api_setup_network_save_apply_post(httpd_req_t* req)
+{
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
+    bool saved = false;
+    esp_err_t err = network_config_parse_and_save(req, &saved);
+    if (err != ESP_OK) return err;
+    ESP_LOGI(TAG, "network_apply_started");
+    (void)network_setup_ap_start_grace(120);
+    err = schedule_network_restart(1000);
+    if (err != ESP_OK) return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "apply_failed", "Applicazione rete non programmata");
+    network_status_t st = {0};
+    network_get_status(&st);
+    char json[448];
+    const char *ip = st.wifi_has_ip ? st.wifi_ip : (st.ethernet_has_ip ? st.ethernet_ip : "");
+    char redirect[64] = "";
+    if (ip[0]) snprintf(redirect, sizeof(redirect), "http://%s/", ip);
+    ESP_LOGI(TAG, "new_network_ip=%s redirect_url=%s", ip, redirect);
+    snprintf(json, sizeof(json), "{\"ok\":true,\"message\":\"Configurazione salvata e applicazione avviata\",\"saved\":true,\"apply_started\":true,\"new_ip\":\"%s\",\"hostname\":\"%s\",\"setup_ap_grace_s\":120,\"redirect_url\":\"%s\"}", ip, st.hostname, redirect);
+    return json_reply(req, json);
 }
 
 // ---- /api/sys/net GET/POST ----
@@ -6804,6 +6882,7 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/",                 .method = HTTP_GET,     .handler = root_get },
     { .uri = "/login.html",       .method = HTTP_GET,     .handler = login_html_get },
     { .uri = "/setup",            .method = HTTP_GET,     .handler = setup_html_get },
+    { .uri = "/setup/applying",   .method = HTTP_GET,     .handler = setup_html_get },
     { .uri = "/favicon.ico",      .method = HTTP_GET,     .handler = favicon_get },
     { .uri = "/index.html",       .method = HTTP_GET,     .handler = index_html_get },
     { .uri = "/wizard.html",      .method = HTTP_GET,     .handler = wizard_html_get },
@@ -6826,9 +6905,14 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/admin/secret", .method = HTTP_GET,     .handler = api_admin_only_get },
     { .uri = "/api/admin/system", .method = HTTP_GET, .handler = api_admin_system_get },
     { .uri = "/api/admin/network", .method = HTTP_GET, .handler = api_admin_network_get },
+    { .uri = "/api/setup/network", .method = HTTP_GET, .handler = api_admin_network_get },
     { .uri = "/api/admin/network", .method = HTTP_POST, .handler = api_admin_network_post },
+    { .uri = "/api/setup/network/save", .method = HTTP_POST, .handler = api_admin_network_post },
+    { .uri = "/api/setup/network/apply", .method = HTTP_POST, .handler = api_setup_network_apply_post },
+    { .uri = "/api/setup/network/save-apply", .method = HTTP_POST, .handler = api_setup_network_save_apply_post },
     { .uri = "/api/admin/network/restart", .method = HTTP_POST, .handler = api_admin_network_restart_post },
     { .uri = "/api/admin/network/wifi/test", .method = HTTP_POST, .handler = api_admin_network_wifi_test_post },
+    { .uri = "/api/setup/wifi/test", .method = HTTP_POST, .handler = api_admin_network_wifi_test_post },
     { .uri = "/api/admin/network/wifi/scan", .method = HTTP_GET, .handler = api_admin_network_wifi_scan_get },
     { .uri = "/api/admin/network/setup/exit", .method = HTTP_POST, .handler = api_admin_network_setup_exit_post },
     { .uri = "/api/setup/time", .method = HTTP_POST, .handler = api_setup_time_post },
