@@ -1,10 +1,14 @@
 #include "system_time.h"
 
 #include <string.h>
+#include <stdlib.h>
 #include <sys/time.h>
 #include <time.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
+#include "lwip/apps/sntp.h"
 
 #define SYSTEM_TIME_MIN_VALID_UNIX 1577836800LL /* 2020-01-01T00:00:00Z */
 #define SYSTEM_TIME_MAX_VALID_UNIX 4102444800LL /* 2100-01-01T00:00:00Z */
@@ -14,6 +18,8 @@ static bool s_time_valid;
 static system_time_source_t s_time_source = SYSTEM_TIME_SOURCE_UNKNOWN;
 static int64_t s_last_sync_unix;
 static char s_timezone[48] = "UTC";
+static TaskHandle_t s_sntp_task;
+static bool s_sntp_initialized;
 
 static bool unix_time_plausible(int64_t unix_time)
 {
@@ -43,6 +49,56 @@ const char *system_time_source_name(void)
 int64_t system_time_last_sync_unix(void)
 {
     return system_time_is_valid() ? s_last_sync_unix : 0;
+}
+
+static void sntp_sync_task(void *arg)
+{
+    char reason[32] = {0};
+    if (arg) {
+        strlcpy(reason, (const char *)arg, sizeof(reason));
+        free(arg);
+    }
+    ESP_LOGI(TAG, "sntp_start_after_ip reason=%s", reason[0] ? reason : "network_ip");
+    if (!s_sntp_initialized && !sntp_enabled()) {
+        sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        sntp_setservername(0, "time.google.com");
+        sntp_init();
+        s_sntp_initialized = true;
+    }
+
+    time_t now = 0;
+    for (int tries = 0; tries < 30; ++tries) {
+        time(&now);
+        if (unix_time_plausible((int64_t)now)) break;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    if (unix_time_plausible((int64_t)now)) {
+        system_time_mark_sntp_synced((int64_t)now);
+        ESP_LOGI(TAG, "sntp_sync_ok time_valid=true unix=%ld", (long)now);
+    } else {
+        ESP_LOGW(TAG, "sntp_sync_timeout time_valid=false");
+    }
+    s_sntp_task = NULL;
+    vTaskDelete(NULL);
+}
+
+esp_err_t system_time_sntp_start_async(const char *reason)
+{
+    if (system_time_is_valid() && system_time_source() == SYSTEM_TIME_SOURCE_SNTP) return ESP_OK;
+    if (s_sntp_task) return ESP_OK;
+    char *task_reason = NULL;
+    if (reason && reason[0]) {
+        task_reason = strdup(reason);
+        if (!task_reason) return ESP_ERR_NO_MEM;
+    }
+    BaseType_t ok = xTaskCreate(sntp_sync_task, "sntp_sync", 4096, task_reason, tskIDLE_PRIORITY + 2, &s_sntp_task);
+    if (ok != pdPASS) {
+        free(task_reason);
+        s_sntp_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
 }
 
 void system_time_mark_sntp_synced(int64_t unix_time)

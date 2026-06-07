@@ -281,21 +281,22 @@
                     <label class="field"><span>AP fallback</span><select id="net_setup_enabled"><option value="1">Abilitato</option><option value="0">Disabilitato</option></select></label>
                     <label class="field"><span>Password AP fallback</span><input id="net_setup_password" type="password" minlength="8" maxlength="64" autocomplete="new-password" placeholder="lascia vuoto per mantenerla" /></label>
                   </div>
-                  <div class="network-actions">
+                  <div class="network-actions secondary-actions">
                     <button class="btn" id="btnNetWifiScan" type="button">Scansiona reti Wi-Fi</button>
                     <button class="btn" id="btnNetWifiTest" type="button">Test Wi-Fi</button>
-                    <button class="btn primary" id="btnNetSave" type="button">Salva configurazione</button>
-                    <button class="btn primary" id="btnNetSaveApply" type="button">Salva e applica</button>
                     <button class="btn" id="btnNetRestart" type="button">Riavvia rete</button>
                     <button class="btn" id="btnNetSetupExit" type="button">Esci dal setup</button>
                   </div>
+                  <div id="netWifiScan" class="wifi-scan-list" style="margin-top:.6rem"></div>
+                  <div id="netWifiTestResult" class="network-result hidden"></div>
                   <div class="row" style="gap:.5rem;align-items:end;flex-wrap:wrap;margin-top:.6rem">
                     <button class="btn" id="btnSyncBrowserTime" type="button">Sincronizza ora da questo dispositivo</button>
-                    <small id="timeSyncStatus" class="muted">Usa questa funzione se SNTP non è disponibile e l'OTP non è verificabile.</small>
+                    <small id="timeSyncStatus" class="muted">SNTP parte automaticamente dopo IP Wi‑Fi/Ethernet; usa il browser solo se Internet/SNTP non è disponibile.</small>
                   </div>
-                  <div id="netWifiTestResult" class="network-result hidden"></div>
-                  <div id="netWifiScan" class="wifi-scan-list" style="margin-top:.6rem"></div>
                   <small class="muted">Le password non vengono mai mostrate né restituite dalle API. In AP fallback la UI è raggiungibile su http://192.168.4.1</small>
+                  <div class="network-actions final-actions">
+                    <button class="btn primary" id="btnNetSaveApply" type="button">Salva e applica configurazione</button>
+                  </div>
                 </form>
               </div>
             </div>

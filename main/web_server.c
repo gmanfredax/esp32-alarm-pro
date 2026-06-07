@@ -252,7 +252,7 @@ static void set_http_security_headers(httpd_req_t* req){
     auth_set_security_headers(req);
 }
 
-static void build_http_location(httpd_req_t* req, const char* target, char* out, size_t outlen){
+static void __attribute__((unused)) build_http_location(httpd_req_t* req, const char* target, char* out, size_t outlen){
     if (!out || !outlen) return;
     const char* dest = target && target[0] ? target : "/";
     if (!strncasecmp(dest, "http://", 7) || !strncasecmp(dest, "https://", 8)){
@@ -2393,7 +2393,7 @@ static esp_err_t api_admin_notifications_test_post(httpd_req_t* req){
 static void network_restart_timer_cb(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "network_restart_executed");
+    ESP_LOGI(TAG, "network_apply_started");
     esp_err_t err = network_manager_restart();
     if (err != ESP_OK) ESP_LOGW(TAG, "network_manager_restart scheduled failed: %s", esp_err_to_name(err));
 }
@@ -2446,6 +2446,7 @@ static esp_err_t api_admin_network_get(httpd_req_t* req)
     cJSON *root = cJSON_CreateObject();
     if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
     network_status_append_json(root);
+    system_time_append_json(root);
     return json_reply_cjson(req, root);
 }
 
@@ -2454,6 +2455,7 @@ static esp_err_t api_network_status_get(httpd_req_t* req)
     cJSON *root = cJSON_CreateObject();
     if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
     network_status_append_json(root);
+    system_time_append_json(root);
     return json_reply_cjson(req, root);
 }
 
@@ -2519,10 +2521,11 @@ static esp_err_t api_admin_network_wifi_test_post(httpd_req_t* req)
     return json_reply_cjson(req, root);
 }
 
-static esp_err_t network_config_parse_and_save(httpd_req_t* req, bool *saved_out)
+static esp_err_t network_config_parse_and_save(httpd_req_t* req, bool *saved_out, network_config_t *cfg_out)
 {
     if (saved_out) *saved_out = false;
-    ESP_LOGI(TAG_NETWORK_API, "save requested role=%s uri=%s", network_request_role(req), req && req->uri ? req->uri : "");
+    if (cfg_out) memset(cfg_out, 0, sizeof(*cfg_out));
+    ESP_LOGI(TAG_NETWORK_API, "network_config_save_apply requested role=%s uri=%s", network_request_role(req), req && req->uri ? req->uri : "");
     char body[1024]; size_t bl=0;
     if (read_body_to_buf(req, body, sizeof(body), &bl)!=ESP_OK) return network_json_error(req, HTTPD_400_BAD_REQUEST, "invalid_body", "Payload configurazione rete non valido");
     cJSON* j = cJSON_ParseWithLength(body, bl);
@@ -2578,7 +2581,8 @@ static esp_err_t network_config_parse_and_save(httpd_req_t* req, bool *saved_out
     esp_err_t err = network_config_save(&cfg);
     cJSON_Delete(j);
     if (err != ESP_OK) return network_json_error(req, HTTPD_500_INTERNAL_SERVER_ERROR, "save_failed", "Salvataggio configurazione rete fallito");
-    ESP_LOGI(TAG_NETWORK_API, "config saved mode=%s ssid=%s nvs_commit=ok", network_mode_to_str(cfg.mode), cfg.wifi_ssid[0] ? cfg.wifi_ssid : "-");
+    ESP_LOGI(TAG_NETWORK_API, "network_config_saved mode=%s ssid=%s nvs_commit=ok", network_mode_to_str(cfg.mode), cfg.wifi_ssid[0] ? cfg.wifi_ssid : "-");
+    if (cfg_out) *cfg_out = cfg;
     if (saved_out) *saved_out = true;
     return ESP_OK;
 }
@@ -2587,7 +2591,7 @@ static esp_err_t api_admin_network_post(httpd_req_t* req)
 {
     if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
     bool saved = false;
-    esp_err_t err = network_config_parse_and_save(req, &saved);
+    esp_err_t err = network_config_parse_and_save(req, &saved, NULL);
     if (err != ESP_OK) return err;
     return json_reply(req, "{\"ok\":true,\"saved\":true,\"applied\":false,\"apply_started\":false,\"message\":\"Configurazione salvata. Premi Salva e applica per usarla.\"}");
 }
@@ -2626,27 +2630,55 @@ static esp_err_t api_setup_network_save_apply_post(httpd_req_t* req)
     if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
     ESP_LOGI(TAG_NETWORK_API, "save_apply requested role=%s", network_request_role(req));
     bool saved = false;
-    esp_err_t err = network_config_parse_and_save(req, &saved);
+    network_config_t saved_cfg = {0};
+    esp_err_t err = network_config_parse_and_save(req, &saved, &saved_cfg);
     if (err != ESP_OK) return err;
     network_status_t st = {0};
     network_get_status(&st);
-    const char *ip = st.wifi_has_ip ? st.wifi_ip : (st.ethernet_has_ip ? st.ethernet_ip : "");
+    const char *expected = "none";
+    const char *ip = "";
+    switch (saved_cfg.mode) {
+    case NETWORK_MODE_ETHERNET_ONLY:
+        expected = "ethernet";
+        if (st.ethernet_has_ip) ip = st.ethernet_ip;
+        break;
+    case NETWORK_MODE_WIFI_ONLY:
+        expected = "wifi";
+        if (st.wifi_has_ip) ip = st.wifi_ip;
+        break;
+    case NETWORK_MODE_ETHERNET_PREFERRED:
+        if (st.ethernet_has_ip) { expected = "ethernet"; ip = st.ethernet_ip; }
+        else { expected = "wifi"; if (st.wifi_has_ip) ip = st.wifi_ip; }
+        break;
+    case NETWORK_MODE_WIFI_PREFERRED:
+        if (st.wifi_has_ip) { expected = "wifi"; ip = st.wifi_ip; }
+        else { expected = "ethernet"; if (st.ethernet_has_ip) ip = st.ethernet_ip; }
+        break;
+    default:
+        break;
+    }
     char redirect[64] = "";
+    char mdns[96] = "";
     if (ip[0]) snprintf(redirect, sizeof(redirect), "http://%s/", ip);
-    ESP_LOGI(TAG_NETWORK_API, "save_apply response prepared new_ip=%s redirect_url=%s", ip, redirect);
+    snprintf(mdns, sizeof(mdns), "http://%s.local/", saved_cfg.hostname[0] ? saved_cfg.hostname : st.hostname);
+    ESP_LOGI(TAG_NETWORK_API, "setup_transition new_ip=%s hostname=%s grace=%u", ip, saved_cfg.hostname[0] ? saved_cfg.hostname : st.hostname, 120U);
     cJSON *root = cJSON_CreateObject();
     if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
     cJSON_AddBoolToObject(root, "ok", true);
-    cJSON_AddStringToObject(root, "message", "Configurazione salvata e applicazione avviata");
+    cJSON_AddStringToObject(root, "message", "Configurazione salvata. Applicazione rete in corso.");
     cJSON_AddBoolToObject(root, "saved", true);
+    cJSON_AddBoolToObject(root, "apply_scheduled", true);
     cJSON_AddBoolToObject(root, "apply_started", true);
+    cJSON_AddStringToObject(root, "configured_mode", network_mode_to_str(saved_cfg.mode));
+    cJSON_AddStringToObject(root, "active_interface_expected", expected);
     cJSON_AddStringToObject(root, "new_ip", ip);
-    cJSON_AddStringToObject(root, "hostname", st.hostname);
+    cJSON_AddStringToObject(root, "hostname", saved_cfg.hostname[0] ? saved_cfg.hostname : st.hostname);
     cJSON_AddNumberToObject(root, "setup_ap_grace_s", 120);
     cJSON_AddStringToObject(root, "redirect_url", redirect);
+    cJSON_AddStringToObject(root, "mdns_url", mdns);
     esp_err_t reply_err = json_reply_cjson(req, root);
     if (reply_err != ESP_OK) return reply_err;
-    ESP_LOGI(TAG_NETWORK_API, "save_apply response sent, scheduling apply in 1000 ms");
+    ESP_LOGI(TAG_NETWORK_API, "network_apply_scheduled delay_ms=1000");
     (void)network_setup_ap_start_grace(120);
     err = schedule_network_restart(1000);
     if (err != ESP_OK) ESP_LOGW(TAG_NETWORK_API, "save_apply schedule failed err=%s", esp_err_to_name(err));

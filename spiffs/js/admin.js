@@ -2461,13 +2461,15 @@ let lastRecoveryCodes = [];
     const host = resp?.hostname || ($("#net_host")?.value || "nsalarmpro").trim() || "nsalarmpro";
     const ip = resp?.new_ip || "";
     const grace = Number(resp?.setup_ap_grace_s || 120);
-    const mdns = `http://${host}.local/`;
-    const ipUrl = ip ? `http://${ip}/` : "";
+    const ipUrl = resp?.redirect_url || (ip ? `http://${ip}/` : "");
+    const mdns = resp?.mdns_url || `http://${host}.local/`;
     box.classList.remove("hidden");
-    box.innerHTML = `<h3>Applicazione rete in corso</h3>
+    box.innerHTML = `<h3>Configurazione rete salvata</h3>
       <p>Configurazione salvata. Riconnetti telefono/PC alla rete principale ${ssid ? `<strong>${escapeHtml(ssid)}</strong>` : ""} e apri ${ipUrl ? `<a href="${ipUrl}">${ipUrl}</a>` : "il nuovo IP"} oppure <a href="${mdns}">${mdns}</a>.</p>
       <div class="net-kv-grid"><div class="net-kv"><span>Nuovo IP noto</span><strong>${escapeHtml(ip || "in attesa")}</strong></div><div class="net-kv"><span>Hostname</span><strong>${escapeHtml(host)}</strong></div><div class="net-kv"><span>AP fallback grace</span><strong><span id="netApplyCountdown">${grace}</span> s</strong></div></div>
-      <p class="muted">Il redirect automatico partirà dopo un tempo ragionevole; se fallisce usa i link manuali.</p>`;
+      <p>La centrale si sta collegando alla rete principale. Riconnetti questo dispositivo alla rete Wi‑Fi/rete principale, poi apri il nuovo URL.</p>
+      <p><a class="btn" href="/setup">Torna al setup fallback</a></p>
+      <p class="muted">Il polling/redirect automatico partirà dopo un tempo ragionevole; se fallisce usa i link manuali. Non considerare errori di fetch durante il cambio rete.</p>`;
     let left = grace;
     const timer = setInterval(() => { left -= 1; const el = $("#netApplyCountdown"); if (el) el.textContent = String(Math.max(0,left)); if (left <= 0) clearInterval(timer); }, 1000);
     setTimeout(() => { if (ipUrl) location.href = ipUrl; }, 25000);
@@ -2506,8 +2508,7 @@ let lastRecoveryCodes = [];
         const box = $("#netWifiTestResult");
         if (box){
           box.classList.remove("hidden");
-          box.innerHTML = `<strong>${escapeHtml(r.message || "Connessione Wi‑Fi riuscita")}</strong><div class="net-kv-grid">${netRows([["SSID", netValue(r.ssid)], ["IP", netValue(r.ip)], ["Netmask", netValue(r.netmask)], ["Gateway", netValue(r.gateway)], ["DNS 1", netValue(r.dns1)], ["DNS 2", netValue(r.dns2)], ["RSSI", r.rssi ? `${escapeHtml(String(r.rssi))} dBm` : "—"], ["Canale", netValue(r.channel)], ["BSSID", netValue(r.bssid)]])}</div><button class="btn primary" id="btnUseTestedWifi" type="button">Salva e applica questa rete</button>`;
-          $("#btnUseTestedWifi")?.addEventListener("click", () => $("#btnNetSaveApply")?.click());
+          box.innerHTML = `<strong>${escapeHtml(r.message || "Wi‑Fi testato con successo")}</strong><div class="net-kv-grid">${netRows([["SSID", netValue(r.ssid)], ["IP ottenuto", netValue(r.ip)], ["Netmask", netValue(r.netmask)], ["Gateway", netValue(r.gateway)], ["DNS 1", netValue(r.dns1)], ["DNS 2", netValue(r.dns2)], ["RSSI", r.rssi ? `${escapeHtml(String(r.rssi))} dBm` : "—"], ["Canale", netValue(r.channel)], ["BSSID", netValue(r.bssid)]])}</div><p class="muted">Test temporaneo: non ha salvato la configurazione e l'AP fallback resta attivo.</p>`;
         }
         toast(r.message || "Test Wi‑Fi riuscito");
         await loadNetwork();
@@ -2517,7 +2518,6 @@ let lastRecoveryCodes = [];
     $("#btnNetRestart")?.addEventListener("click", async ()=>{ const btn=$("#btnNetRestart"); try{ if(btn) btn.disabled=true; const r=await apiPost("/api/admin/network/restart", {}, { skipAuthRedirect: true, applyTransition: true }); toast(r?.message || "Riavvio rete programmato"); setTimeout(loadNetwork, 2500); } catch(e){ toast(e.status === 0 ? "Riavvio rete richiesto: attendo riconnessione…" : "Riavvio rete: " + e.message, e.status === 0); setTimeout(loadNetwork, 3500); } finally{ setTimeout(()=>{ if(btn) btn.disabled=false; }, 5000); } });
     $("#btnSyncBrowserTime")?.addEventListener("click", async ()=>{ const status = $("#timeSyncStatus"); try{ const unix_time = Math.floor(Date.now() / 1000); const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "browser"; const resp = await apiPost("/api/setup/time", { unix_time, timezone }); const msg = resp?.message || "Ora sincronizzata. Ora puoi completare l'accesso con OTP."; if (status) status.textContent = msg; toast(msg); }catch(e){ const msg = "Sincronizzazione ora: " + e.message; if (status) status.textContent = msg; toast(msg, false); } });
     $("#btnCompleteAdminLogin")?.addEventListener("click", async ()=>{ try{ await apiPost("/api/logout", {}); }catch{} try { localStorage.removeItem("alarmpro.token"); sessionStorage.removeItem("alarmpro.token"); } catch{} location.replace("/login.html"); });
-    $("#btnNetSave")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const r=await apiPost("/api/setup/network/save", body, { skipAuthRedirect: true }); toast(r?.message || "Configurazione salvata. Premi Salva e applica per usarla."); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); await loadNetwork(); } catch(e){ toast("Errore salvataggio rete: " + e.message, false); } });
     $("#btnNetSaveApply")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const ssid=body.wifi?.ssid || ""; const r=await apiPost("/api/setup/network/save-apply", body, { skipAuthRedirect: true, applyTransition: true }); toast(r?.message || "Configurazione salvata e applicazione avviata"); showApplying(r, ssid); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); setTimeout(loadNetwork, 6000); } catch(e){ toast("Salva e applica: " + e.message, e.status === 0); if (e.status === 0) showApplying({ message: e.message, setup_ap_grace_s: 120 }, ""); } });
   }
 

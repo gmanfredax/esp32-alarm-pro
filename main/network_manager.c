@@ -23,6 +23,7 @@
 
 #include "ethernet.h"
 #include "app_mqtt.h"
+#include "system_time.h"
 
 static const char *TAG = "network";
 
@@ -119,7 +120,7 @@ static void set_active_locked(network_active_if_t iface)
         if (iface == NETWORK_IF_ETHERNET || iface == NETWORK_IF_WIFI) xEventGroupSetBits(s_net.events, NETWORK_WAIT_ACTIVE_BIT);
         else xEventGroupClearBits(s_net.events, NETWORK_WAIT_ACTIVE_BIT);
     }
-    ESP_LOGI(TAG, "Interfaccia attiva: %s", network_active_if_to_str(iface));
+    ESP_LOGI(TAG, "active_interface=%s", network_active_if_to_str(iface));
 }
 
 static bool wifi_configured(const network_config_t *cfg)
@@ -132,10 +133,54 @@ static bool setup_ap_allowed(const network_config_t *cfg)
     return !cfg || cfg->fallback_ap_enabled;
 }
 
+static bool ethernet_allowed_locked(void)
+{
+    return s_net.cfg.mode == NETWORK_MODE_ETHERNET_ONLY ||
+           s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED ||
+           s_net.cfg.mode == NETWORK_MODE_WIFI_PREFERRED;
+}
+
+static bool wifi_allowed_locked(void)
+{
+    return s_net.cfg.mode == NETWORK_MODE_WIFI_ONLY ||
+           s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED ||
+           s_net.cfg.mode == NETWORK_MODE_WIFI_PREFERRED;
+}
+
+static network_active_if_t compute_active_if_locked(void)
+{
+    bool eth_usable = ethernet_allowed_locked() && s_net.eth_has_ip;
+    bool wifi_usable = wifi_allowed_locked() && s_net.wifi_has_ip;
+    switch (s_net.cfg.mode) {
+    case NETWORK_MODE_ETHERNET_ONLY:
+        if (eth_usable) return NETWORK_IF_ETHERNET;
+        break;
+    case NETWORK_MODE_WIFI_ONLY:
+        if (wifi_usable) return NETWORK_IF_WIFI;
+        break;
+    case NETWORK_MODE_ETHERNET_PREFERRED:
+        if (eth_usable) return NETWORK_IF_ETHERNET;
+        if (wifi_usable) return NETWORK_IF_WIFI;
+        break;
+    case NETWORK_MODE_WIFI_PREFERRED:
+        if (wifi_usable) return NETWORK_IF_WIFI;
+        if (eth_usable) return NETWORK_IF_ETHERNET;
+        break;
+    default:
+        break;
+    }
+    return s_net.setup_ap_active ? NETWORK_IF_SETUP_AP : NETWORK_IF_NONE;
+}
+
+static void refresh_active_locked(void)
+{
+    set_active_locked(compute_active_if_locked());
+}
+
 static bool has_real_link_locked(void)
 {
-    return s_net.active_if == NETWORK_IF_ETHERNET || s_net.active_if == NETWORK_IF_WIFI ||
-           s_net.eth_has_ip || s_net.wifi_has_ip;
+    network_active_if_t iface = compute_active_if_locked();
+    return iface == NETWORK_IF_ETHERNET || iface == NETWORK_IF_WIFI;
 }
 
 static void build_default_ap_password(char *out, size_t len)
@@ -506,7 +551,7 @@ static void wifi_stop_sta_locked(void)
     s_net.wifi_connected = false;
     s_net.wifi_has_ip = false;
     s_net.wifi_ip[0] = '\0';
-    if (s_net.active_if == NETWORK_IF_WIFI) set_active_locked(NETWORK_IF_NONE);
+    if (s_net.active_if == NETWORK_IF_WIFI) refresh_active_locked();
 }
 
 static esp_err_t start_eth_locked(void)
@@ -531,7 +576,7 @@ static void stop_eth_locked(void)
     s_net.eth_link_up = false;
     s_net.eth_has_ip = false;
     s_net.eth_ip[0] = '\0';
-    if (s_net.active_if == NETWORK_IF_ETHERNET) set_active_locked(NETWORK_IF_NONE);
+    if (s_net.active_if == NETWORK_IF_ETHERNET) refresh_active_locked();
 }
 
 static void network_eth_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -553,7 +598,7 @@ static void network_eth_event_handler(void *arg, esp_event_base_t base, int32_t 
         if (s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED && wifi_configured(&s_net.cfg)) {
             s_net.wifi_runtime_desired = true;
         }
-        if (s_net.active_if == NETWORK_IF_ETHERNET) set_active_locked(NETWORK_IF_NONE);
+        if (s_net.active_if == NETWORK_IF_ETHERNET) refresh_active_locked();
         stop_mqtt = was_active && !has_real_link_locked();
     }
     xSemaphoreGive(s_net.lock);
@@ -568,18 +613,21 @@ static void network_ip_event_handler(void *arg, esp_event_base_t base, int32_t i
     (void)arg; (void)base;
     if (!s_net.lock || !data) return;
     bool start_mqtt = false;
+    bool start_sntp = false;
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
     if (id == IP_EVENT_ETH_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         s_net.eth_has_ip = true;
         ip_to_str(&event->ip_info, s_net.eth_ip, sizeof(s_net.eth_ip));
+        char gw[16];
+        ip_to_str(&(esp_netif_ip_info_t){ .ip = event->ip_info.gw }, gw, sizeof(gw));
         ESP_LOGI(TAG, "Ethernet IP ottenuto: %s", s_net.eth_ip);
         set_error_locked("");
+        ESP_LOGI(TAG, "eth_got_ip ip=%s gw=%s", s_net.eth_ip, gw);
         if (s_net.setup_ap_active && !setup_ap_grace_active_locked()) setup_ap_stop_locked();
-        if (s_net.cfg.mode == NETWORK_MODE_ETHERNET_ONLY || s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED) {
-            set_active_locked(NETWORK_IF_ETHERNET);
-            if (s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED && s_net.wifi_sta_started) wifi_stop_sta_locked();
-        }
+        if (s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED && s_net.wifi_sta_started) wifi_stop_sta_locked();
+        refresh_active_locked();
+        start_sntp = has_real_link_locked();
         start_mqtt = has_real_link_locked();
     } else if (id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
@@ -587,18 +635,22 @@ static void network_ip_event_handler(void *arg, esp_event_base_t base, int32_t i
         ip_to_str(&event->ip_info, s_net.wifi_ip, sizeof(s_net.wifi_ip));
         wifi_ap_record_t ap = {0};
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) s_net.wifi_rssi = ap.rssi;
+        char gw[16];
+        ip_to_str(&(esp_netif_ip_info_t){ .ip = event->ip_info.gw }, gw, sizeof(gw));
         ESP_LOGI(TAG, "Wi-Fi connesso, IP ottenuto: %s", s_net.wifi_ip);
         set_error_locked("");
+        ESP_LOGI(TAG, "wifi_got_ip ip=%s gw=%s", s_net.wifi_ip, gw);
         if (s_net.setup_ap_active && !s_net.wifi_test_active && !setup_ap_grace_active_locked()) setup_ap_stop_locked();
         s_net.wifi_failures = 0;
-        if (s_net.cfg.mode == NETWORK_MODE_WIFI_ONLY ||
-            s_net.cfg.mode == NETWORK_MODE_WIFI_PREFERRED ||
-            (s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED && !s_net.eth_has_ip)) {
-            set_active_locked(NETWORK_IF_WIFI);
-        }
+        refresh_active_locked();
+        start_sntp = has_real_link_locked();
         start_mqtt = has_real_link_locked();
     }
     xSemaphoreGive(s_net.lock);
+    if (start_sntp) {
+        esp_err_t time_err = system_time_sntp_start_async(id == IP_EVENT_ETH_GOT_IP ? "eth_got_ip" : "wifi_got_ip");
+        if (time_err != ESP_OK) ESP_LOGW(TAG, "SNTP non avviato dopo IP: %s", esp_err_to_name(time_err));
+    }
     if (start_mqtt) {
         esp_err_t err = mqtt_reload_config();
         if (err != ESP_OK) ESP_LOGW(TAG, "MQTT non avviato dopo IP: %s", esp_err_to_name(err));
@@ -625,7 +677,7 @@ static void network_wifi_event_handler(void *arg, esp_event_base_t base, int32_t
         s_net.wifi_has_ip = false;
         s_net.wifi_ip[0] = '\0';
         set_error_locked("wifi_disconnected");
-        if (s_net.active_if == NETWORK_IF_WIFI) set_active_locked(NETWORK_IF_NONE);
+        if (s_net.active_if == NETWORK_IF_WIFI) refresh_active_locked();
         stop_mqtt = was_active && !has_real_link_locked();
     } else if (id == WIFI_EVENT_STA_STOP) {
         bool was_active = s_net.active_if == NETWORK_IF_WIFI || s_net.wifi_has_ip;
@@ -678,17 +730,11 @@ static void manager_loop(void *arg)
         network_mode_t mode = s_net.cfg.mode;
         bool eth_usable = (mode == NETWORK_MODE_ETHERNET_ONLY || mode == NETWORK_MODE_ETHERNET_PREFERRED || mode == NETWORK_MODE_WIFI_PREFERRED) &&
                           s_net.eth_started && s_net.eth_has_ip;
-        bool wifi_usable = (mode == NETWORK_MODE_WIFI_ONLY || mode == NETWORK_MODE_ETHERNET_PREFERRED || mode == NETWORK_MODE_WIFI_PREFERRED) &&
-                           s_net.wifi_has_ip;
 
-        if (mode == NETWORK_MODE_ETHERNET_PREFERRED && eth_usable) {
-            set_active_locked(NETWORK_IF_ETHERNET);
-            if (s_net.wifi_sta_started) wifi_stop_sta_locked();
-        } else if ((mode == NETWORK_MODE_WIFI_ONLY || mode == NETWORK_MODE_WIFI_PREFERRED) && wifi_usable) {
-            set_active_locked(NETWORK_IF_WIFI);
-        } else if (mode == NETWORK_MODE_ETHERNET_ONLY && eth_usable) {
-            set_active_locked(NETWORK_IF_ETHERNET);
+        if (mode == NETWORK_MODE_ETHERNET_PREFERRED && eth_usable && s_net.wifi_sta_started) {
+            wifi_stop_sta_locked();
         }
+        refresh_active_locked();
 
         bool eth_timed_out = (mode == NETWORK_MODE_ETHERNET_PREFERRED || mode == NETWORK_MODE_WIFI_PREFERRED || mode == NETWORK_MODE_ETHERNET_ONLY) &&
                              s_net.eth_started && !s_net.eth_has_ip &&
@@ -798,7 +844,7 @@ esp_err_t network_setup_ap_start_grace(uint32_t seconds)
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
     if (network_config_load(&cfg) == ESP_OK) s_net.cfg = cfg;
     s_net.setup_ap_grace_until_ms = now_ms() + ((uint64_t)seconds * 1000ULL);
-    ESP_LOGI(TAG, "setup_ap_grace_started seconds=%lu", (unsigned long)seconds);
+    ESP_LOGI(TAG, "fallback_ap_grace_started seconds=%lu", (unsigned long)seconds);
     esp_err_t err = setup_ap_allowed(&s_net.cfg) ? setup_ap_start_locked("grace") : ESP_ERR_INVALID_STATE;
     xSemaphoreGive(s_net.lock);
     return err;
@@ -840,7 +886,7 @@ esp_err_t network_get_status(network_status_t *out)
     memset(out, 0, sizeof(*out));
     if (s_net.lock) xSemaphoreTake(s_net.lock, portMAX_DELAY);
     out->mode = s_net.cfg.mode;
-    out->active_if = s_net.active_if;
+    out->active_if = compute_active_if_locked();
     strlcpy(out->hostname, s_net.cfg.hostname, sizeof(out->hostname));
     out->ethernet_started = s_net.eth_started;
     out->ethernet_link_up = s_net.eth_link_up || eth_link_is_up();
@@ -885,6 +931,20 @@ esp_err_t network_get_status(network_status_t *out)
                           &out->wifi_dhcp);
     out->wifi_dhcp = out->wifi_dhcp || s_net.cfg.wifi_dhcp;
     out->ethernet_dhcp = out->ethernet_dhcp || s_net.cfg.eth_dhcp;
+    if (!out->ethernet_has_ip) {
+        strlcpy(out->ethernet_ip, "0.0.0.0", sizeof(out->ethernet_ip));
+        strlcpy(out->ethernet_netmask, "0.0.0.0", sizeof(out->ethernet_netmask));
+        strlcpy(out->ethernet_gateway, "0.0.0.0", sizeof(out->ethernet_gateway));
+        strlcpy(out->ethernet_dns1, "0.0.0.0", sizeof(out->ethernet_dns1));
+        strlcpy(out->ethernet_dns2, "0.0.0.0", sizeof(out->ethernet_dns2));
+    }
+    if (!out->wifi_has_ip) {
+        strlcpy(out->wifi_ip, "0.0.0.0", sizeof(out->wifi_ip));
+        strlcpy(out->wifi_netmask, "0.0.0.0", sizeof(out->wifi_netmask));
+        strlcpy(out->wifi_gateway, "0.0.0.0", sizeof(out->wifi_gateway));
+        strlcpy(out->wifi_dns1, "0.0.0.0", sizeof(out->wifi_dns1));
+        strlcpy(out->wifi_dns2, "0.0.0.0", sizeof(out->wifi_dns2));
+    }
     wifi_ap_record_t ap = {0};
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
         out->wifi_rssi = ap.rssi;
@@ -902,8 +962,7 @@ esp_err_t network_status_append_json(cJSON *root)
     if (!root) return ESP_ERR_INVALID_ARG;
     network_status_t st;
     ESP_RETURN_ON_ERROR(network_get_status(&st), TAG, "status");
-    const bool real_connectivity = st.ethernet_has_ip || st.wifi_has_ip ||
-                                   st.active_if == NETWORK_IF_ETHERNET || st.active_if == NETWORK_IF_WIFI;
+    const bool real_connectivity = st.active_if == NETWORK_IF_ETHERNET || st.active_if == NETWORK_IF_WIFI;
     cJSON_AddStringToObject(root, "configured_mode", network_mode_to_str(st.mode));
     cJSON_AddStringToObject(root, "network_mode", network_mode_to_str(st.mode));
     cJSON_AddStringToObject(root, "active_interface", network_active_if_to_str(st.active_if));
@@ -915,6 +974,9 @@ esp_err_t network_status_append_json(cJSON *root)
 
     cJSON *eth = cJSON_AddObjectToObject(root, "ethernet");
     cJSON_AddBoolToObject(eth, "enabled", st.mode != NETWORK_MODE_WIFI_ONLY);
+    cJSON_AddBoolToObject(eth, "configured", st.mode != NETWORK_MODE_WIFI_ONLY);
+    cJSON_AddBoolToObject(eth, "initialized", st.ethernet_started);
+    cJSON_AddBoolToObject(eth, "active", st.active_if == NETWORK_IF_ETHERNET);
     cJSON_AddBoolToObject(eth, "started", st.ethernet_started);
     cJSON_AddBoolToObject(eth, "link_up", st.ethernet_link_up);
     cJSON_AddBoolToObject(eth, "has_ip", st.ethernet_has_ip);
@@ -928,6 +990,8 @@ esp_err_t network_status_append_json(cJSON *root)
 
     cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
     cJSON_AddBoolToObject(wifi, "enabled", network_mode_requires_wifi(st.mode));
+    cJSON_AddBoolToObject(wifi, "configured", network_mode_requires_wifi(st.mode));
+    cJSON_AddBoolToObject(wifi, "active", st.active_if == NETWORK_IF_WIFI);
     cJSON_AddStringToObject(wifi, "ssid", st.wifi_ssid);
     cJSON_AddBoolToObject(wifi, "password_set", st.wifi_password_set);
     cJSON_AddBoolToObject(wifi, "started", st.wifi_started);
@@ -947,6 +1011,7 @@ esp_err_t network_status_append_json(cJSON *root)
     cJSON *ap = cJSON_AddObjectToObject(root, "fallback_ap");
     cJSON_AddBoolToObject(ap, "enabled", st.fallback_ap_enabled);
     cJSON_AddBoolToObject(ap, "active", st.setup_ap_active);
+    cJSON_AddBoolToObject(ap, "runtime", st.setup_ap_active);
     cJSON_AddStringToObject(ap, "ssid", st.setup_ap_ssid);
     cJSON_AddStringToObject(ap, "ip", st.setup_ap_ip);
     cJSON_AddStringToObject(ap, "netmask", st.setup_ap_netmask);

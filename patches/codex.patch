@@ -1,214 +1,143 @@
-diff --git a/spiffs/js/admin.js b/spiffs/js/admin.js
-index f26d765724ba94c2ee8baf5ed3ed3421673a56fa..579655f1782520673ed1ae877057159066c1123e 100755
---- a/spiffs/js/admin.js
-+++ b/spiffs/js/admin.js
-@@ -38,83 +38,127 @@
-   })();
+diff --git a/spiffs/js/login.js b/spiffs/js/login.js
+index 5bdf095f0645ebdeb4102d5f1215eb537418e31b..b64ecb6a42b8702ea01ec409f2311488fff0c79f 100755
+--- a/spiffs/js/login.js
++++ b/spiffs/js/login.js
+@@ -11,50 +11,51 @@ import {
+   setSystemId,
+   setToken
+ } from './api.js';
  
-   // ========== Helpers UI / auth ==========
-   function toast(msg, ok=true){
-     let el = $("#toast");
-     if (!el){
-       el = document.createElement("div");
-       el.id = "toast";
-       el.className = "toast";
-       Object.assign(el.style, {position:"fixed",bottom:"18px",left:"18px",padding:".6rem .8rem",borderRadius:"10px",background:"rgba(20,28,44,.95)",border:"1px solid var(--border)",color:"var(--text)",zIndex:2000,boxShadow:"0 6px 24px rgba(0,0,0,.35)",maxWidth:"80%"});
-       document.body.appendChild(el);
-     }
-     el.textContent = msg;
-     el.style.borderColor = ok ? "rgba(16,185,129,.45)" : "rgba(239,68,68,.55)";
-     el.style.background = ok ? "rgba(10,20,24,.95)" : "rgba(32,12,12,.95)";
-     clearTimeout(el._t); el._t = setTimeout(()=>{ el.remove(); }, 2400);
+ const form = document.getElementById('loginForm');
+ const systemInput = document.getElementById('systemId');
+ const userInput = document.getElementById('username');
+ const passInput = document.getElementById('password');
+ const otpField = document.getElementById('otpField');
+ const otpInput = document.getElementById('otp');
+ const submitBtn = document.getElementById('loginSubmit');
+ const recoveryField = document.getElementById('recoveryField');
+ const recoveryInput = document.getElementById('recoveryCode');
+ const fallbackActions = document.getElementById('fallbackActions');
+ const btnSetupLimited = document.getElementById('btnSetupLimited');
+ const btnBrowserTime = document.getElementById('btnBrowserTime');
+ const btnUseRecovery = document.getElementById('btnUseRecovery');
+ const messageEl = document.getElementById('loginMessage');
+ const footYear = document.getElementById('footYear');
+ 
+ let otpRequired = false;
+ let pendingRequest = false;
+ let recoveryMode = false;
+ let setupLimitedMode = false;
+ let lanSystemLocked = false;
++let timeRetryTimer = null;
+ 
+ if (footYear) footYear.textContent = String(new Date().getFullYear());
+ 
+ const savedSuffix = getSystemSuffix();
+ if (savedSuffix) {
+   systemInput.value = savedSuffix;
+ }
+ 
+ function updateSystemInputLock(){
+   if (!systemInput) return;
+   if (lanSystemLocked) {
+     systemInput.readOnly = true;
+     systemInput.setAttribute('aria-readonly', 'true');
+     systemInput.classList.add('input-readonly');
+   } else {
+     systemInput.readOnly = false;
+     systemInput.removeAttribute('aria-readonly');
+     systemInput.classList.remove('input-readonly');
    }
-   const needLogin = () => location.replace("/login.html");
+ }
  
-   let currentUser = "";
-   let isAdmin = false;
- let setupLimited = false;
- let lastRecoveryCodes = [];
- 
-   async function apiGet(url){
--    const r = await fetch(url, { headers: { "Accept":"application/json" } });
-+    console.debug("[api] GET", url);
-+    let r;
-+    try {
-+      r = await fetch(url, { headers: { "Accept":"application/json" } });
-+    } catch (err) {
-+      console.warn("[api] GET fetch error", url, err);
-+      throw new Error("Impossibile raggiungere la centrale. Verifica se la rete è cambiata o ricarica la pagina.");
-+    }
-+    console.debug("[api] GET status", url, r.status);
-     if (r.status === 401) { needLogin(); throw new Error("401"); }
-     if (!r.ok) throw new Error(await r.text());
-     try {
--      return await r.json();
-+      const data = await r.json();
-+      console.debug("[api] GET json", url, data);
-+      return data;
-     } catch (err) {
-       throw new Error("Risposta JSON non valida");
+ function isLanHostname(hostname){
+   const value = (hostname || '').toLowerCase();
+   if (!value) return false;
+   if (value === 'localhost' || value === '::1') return true;
+@@ -160,60 +161,85 @@ function setDisabled(disabled){
+   [userInput, passInput, otpInput, recoveryInput, submitBtn, btnSetupLimited, btnBrowserTime, btnUseRecovery].forEach((el) => {
+     if (el) el.disabled = disabled;
+   });
+   if (systemInput) {
+     systemInput.disabled = disabled;
+     if (!disabled) {
+       updateSystemInputLock();
      }
    }
-   async function apiPost(url, body, opts = {}){
--    const r = await fetch(url, {
--      method: "POST",
--      headers: { "Content-Type": "application/json" },
--      body: body!=null ? JSON.stringify(body) : undefined,
--      __skipAuthRedirect: opts.skipAuthRedirect === true
--    });
-+    console.debug("[api] POST", url, redactNetworkPayload(body));
-+    let r;
-+    try {
-+      r = await fetch(url, {
-+        method: "POST",
-+        headers: { "Content-Type": "application/json", "Accept":"application/json" },
-+        body: body!=null ? JSON.stringify(body) : undefined,
-+        __skipAuthRedirect: opts.skipAuthRedirect === true
-+      });
-+    } catch (err) {
-+      console.warn("[api] POST fetch error", url, err);
-+      const e = new Error(opts.applyTransition === true
-+        ? "Configurazione inviata. Se la rete si sta riavviando, attendi la riconnessione o riapri la centrale dal nuovo IP."
-+        : "Impossibile raggiungere la centrale. Verifica se la rete è cambiata o ricarica la pagina.");
-+      e.status = 0;
-+      throw e;
-+    }
-+    console.debug("[api] POST status", url, r.status);
-     if (r.status === 401) { needLogin(); throw new Error("401"); }
-     if (!r.ok) {
-       let detail = "";
-       try {
-         const ct = r.headers.get("content-type") || "";
-         if (ct.includes("application/json")){
-           const data = await r.json();
-           detail = data?.message || data?.error || JSON.stringify(data);
-         } else {
-           detail = await r.text();
-         }
-       } catch (err) {
-         detail = err?.message || `${r.status} ${r.statusText}`;
-       }
--      throw new Error(detail || `${r.status} ${r.statusText}`);
-+      if (r.status === 403) detail = detail || "Sessione non autorizzata alla configurazione rete";
-+      else if (r.status === 404) detail = detail || "Endpoint configurazione rete non disponibile";
-+      const e = new Error(detail || `${r.status} ${r.statusText}`);
-+      e.status = r.status;
-+      throw e;
-     }
--    try { return await r.json(); } catch { return {}; }
-+    try {
-+      const data = await r.json();
-+      console.debug("[api] POST json", url, data);
-+      return data;
-+    } catch {
-+      throw new Error("Risposta JSON non valida");
-+    }
-+  }
+   if (submitBtn) submitBtn.textContent = disabled ? 'Attendere…' : 'Accedi';
+ }
+ 
+ function hideFallbackChoices(){
+   if (fallbackActions) fallbackActions.classList.add('hidden');
+ }
+ 
+ function showRecoveryField(){
+   recoveryMode = true;
+   setupLimitedMode = false;
+   if (recoveryField) recoveryField.classList.remove('hidden');
+   if (recoveryInput) { recoveryInput.required = true; recoveryInput.focus(); }
+   if (otpField) otpField.classList.add('hidden');
+   setMessage('Inserisci un codice di recupero monouso.');
+ }
+ 
++function stopTimeRetry(){
++  if (timeRetryTimer) clearInterval(timeRetryTimer);
++  timeRetryTimer = null;
++}
 +
-+  function redactNetworkPayload(body){
-+    try{
-+      if (!body || typeof body !== "object") return body;
-+      const copy = JSON.parse(JSON.stringify(body));
-+      if (copy.wifi?.password) copy.wifi.password = "***";
-+      if (copy.setup_ap?.password) copy.setup_ap.password = "***";
-+      if (copy.wifi_password) copy.wifi_password = "***";
-+      if (copy.fallback_ap_password) copy.fallback_ap_password = "***";
-+      return copy;
-+    }catch{ return "[payload redacted]"; }
-   }
++function startTimeRetry(){
++  if (timeRetryTimer) return;
++  setMessage('Sincronizzazione orario in corso via SNTP... ritento automaticamente.', 'success');
++  timeRetryTimer = setInterval(async () => {
++    try {
++      const status = await apiRequest('/api/network/status', { method: 'GET', auth: false });
++      if (status?.time?.time_valid || status?.time_valid) {
++        stopTimeRetry();
++        hideFallbackChoices();
++        showOtpField();
++        setMessage('Ora sincronizzata via SNTP. Inserisci il codice OTP.', 'success');
++      }
++    } catch {
++      // Durante il cambio rete è normale non ricevere risposta: non mostrare Failed to fetch.
++    }
++  }, 3000);
++}
++
+ function showTimeInvalidFallback(message){
+   otpRequired = false;
+   recoveryMode = false;
+   setupLimitedMode = false;
+   if (otpField) otpField.classList.add('hidden');
+   if (fallbackActions) fallbackActions.classList.remove('hidden');
+-  setMessage(message || 'La centrale non ha un orario valido. Puoi configurare la rete, sincronizzare l\'ora da questo dispositivo o usare un codice di recupero.');
++  setMessage(message || 'La centrale non ha un orario valido. Sincronizzazione SNTP in corso se la rete ha Internet; in alternativa configura la rete, sincronizza l\'ora dal dispositivo o usa un codice di recupero.');
++  startTimeRetry();
+ }
  
-   async function apiDelete(url){
-     const r = await fetch(url, { method:"DELETE", headers:{ "Accept":"application/json" } });
-     if (r.status === 401) { needLogin(); throw new Error("401"); }
-     if (!r.ok){
-       let detail = "";
-       try {
-         const ct = r.headers.get("content-type") || "";
-         if (ct.includes("application/json")){
-           const data = await r.json();
-           detail = data?.error || data?.message || JSON.stringify(data);
-         } else {
-           detail = await r.text();
-         }
-       } catch(err){
-         detail = err?.message || await r.text();
-       }
-       throw new Error(detail || `${r.status} ${r.statusText}`);
-     }
-     try { return await r.json(); } catch { return {}; }
+ function showOtpField(){
++  stopTimeRetry();
+   otpRequired = true;
+   if (otpField) otpField.classList.remove('hidden');
+   if (otpInput) {
+     otpInput.required = true;
+     otpInput.focus();
    }
+   hideFallbackChoices();
+   if (recoveryField) recoveryField.classList.add('hidden');
+   if (recoveryInput) recoveryInput.required = false;
+   setMessage('Inserisci il codice OTP generato dalla tua app.');
+ }
  
-   const escapeHtml = (value = "") => (value ?? "").toString()
-     .replace(/&/g, "&amp;")
-@@ -2436,67 +2480,67 @@ let lastRecoveryCodes = [];
-       $("#net_host") && ($("#net_host").value = c.hostname || "");
-       $("#net_wifi_ssid") && ($("#net_wifi_ssid").value = c.wifi?.ssid || "");
-       $("#net_wifi_password") && ($("#net_wifi_password").value = "");
-       const ap = c.fallback_ap || c.setup_ap || {};
-       $("#net_setup_enabled") && ($("#net_setup_enabled").value = ap.enabled === false ? "0" : "1");
-       $("#net_setup_password") && ($("#net_setup_password").value = "");
-     }catch(e){ toast("Errore caricando rete: " + e.message, false); }
-   }
-   function setupNetworkEventHandlers(){
-     $("#btnNetWifiScan")?.addEventListener("click", async ()=>{
-       try{
-         const res = await apiGet("/api/admin/network/wifi/scan");
-         const box = $("#netWifiScan");
-         if (box){
-           const nets = res.networks || [];
-           box.innerHTML = nets.length ? nets.map(n => `<button class="btn" type="button" data-ssid="${escapeHtml(n.ssid || "")}">${escapeHtml(n.ssid || "(nascosta)")} · ${n.rssi || 0} dBm · ${escapeHtml(n.security || "")}</button>`).join("") : "<div class=\"net-kv\"><span>Reti</span><strong>Nessuna rete trovata</strong></div>";
-           box.querySelectorAll("button[data-ssid]").forEach(b => b.addEventListener("click", ()=>{ const v=b.getAttribute("data-ssid")||""; if(v) $("#net_wifi_ssid").value=v; }));
-         }
-       }catch(e){ toast("Scansione Wi‑Fi fallita: " + e.message, false); }
-     });
-     $("#btnNetWifiTest")?.addEventListener("click", async ()=>{
-       const ssid = ($("#net_wifi_ssid")?.value || "").trim();
-       const password = $("#net_wifi_password")?.value || "";
-       if (!ssid) return toast("SSID Wi‑Fi obbligatorio", false);
-       try{
--        const r = await apiPost("/api/setup/wifi/test", { ssid, password });
-+        const r = await apiPost("/api/setup/wifi/test", { ssid, password }, { skipAuthRedirect: true });
-         const box = $("#netWifiTestResult");
-         if (box){
-           box.classList.remove("hidden");
-           box.innerHTML = `<strong>${escapeHtml(r.message || "Connessione Wi‑Fi riuscita")}</strong><div class="net-kv-grid">${netRows([["SSID", netValue(r.ssid)], ["IP", netValue(r.ip)], ["Netmask", netValue(r.netmask)], ["Gateway", netValue(r.gateway)], ["DNS 1", netValue(r.dns1)], ["DNS 2", netValue(r.dns2)], ["RSSI", r.rssi ? `${escapeHtml(String(r.rssi))} dBm` : "—"], ["Canale", netValue(r.channel)], ["BSSID", netValue(r.bssid)]])}</div><button class="btn primary" id="btnUseTestedWifi" type="button">Salva e applica questa rete</button>`;
-           $("#btnUseTestedWifi")?.addEventListener("click", () => $("#btnNetSaveApply")?.click());
-         }
-         toast(r.message || "Test Wi‑Fi riuscito");
-         await loadNetwork();
-       }catch(e){ toast("Test Wi‑Fi fallito: " + e.message, false); }
-     });
-     $("#btnNetSetupExit")?.addEventListener("click", async ()=>{ try{ await apiPost("/api/admin/network/setup/exit", {}); toast("Uscita setup richiesta"); setTimeout(loadNetwork, 1000); } catch(e){ toast("Uscita setup: " + e.message, false); } });
--    $("#btnNetRestart")?.addEventListener("click", async ()=>{ const btn=$("#btnNetRestart"); try{ if(btn) btn.disabled=true; const r=await apiPost("/api/admin/network/restart", {}); toast(r?.message || "Riavvio rete programmato"); setTimeout(loadNetwork, 2500); } catch(e){ toast("Riavvio rete: attendo riconnessione…", true); setTimeout(loadNetwork, 3500); } finally{ setTimeout(()=>{ if(btn) btn.disabled=false; }, 5000); } });
-+    $("#btnNetRestart")?.addEventListener("click", async ()=>{ const btn=$("#btnNetRestart"); try{ if(btn) btn.disabled=true; const r=await apiPost("/api/admin/network/restart", {}, { skipAuthRedirect: true, applyTransition: true }); toast(r?.message || "Riavvio rete programmato"); setTimeout(loadNetwork, 2500); } catch(e){ toast(e.status === 0 ? "Riavvio rete richiesto: attendo riconnessione…" : "Riavvio rete: " + e.message, e.status === 0); setTimeout(loadNetwork, 3500); } finally{ setTimeout(()=>{ if(btn) btn.disabled=false; }, 5000); } });
-     $("#btnSyncBrowserTime")?.addEventListener("click", async ()=>{ const status = $("#timeSyncStatus"); try{ const unix_time = Math.floor(Date.now() / 1000); const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "browser"; const resp = await apiPost("/api/setup/time", { unix_time, timezone }); const msg = resp?.message || "Ora sincronizzata. Ora puoi completare l'accesso con OTP."; if (status) status.textContent = msg; toast(msg); }catch(e){ const msg = "Sincronizzazione ora: " + e.message; if (status) status.textContent = msg; toast(msg, false); } });
-     $("#btnCompleteAdminLogin")?.addEventListener("click", async ()=>{ try{ await apiPost("/api/logout", {}); }catch{} try { localStorage.removeItem("alarmpro.token"); sessionStorage.removeItem("alarmpro.token"); } catch{} location.replace("/login.html"); });
--    $("#btnNetSave")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const r=await apiPost("/api/setup/network/save", body); toast(r?.message || "Configurazione salvata ma non ancora applicata"); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); await loadNetwork(); } catch(e){ toast("Errore salvataggio rete: " + e.message, false); } });
--    $("#btnNetSaveApply")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const ssid=body.wifi?.ssid || ""; const r=await apiPost("/api/setup/network/save-apply", body); toast(r?.message || "Configurazione salvata e applicazione avviata"); showApplying(r, ssid); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); setTimeout(loadNetwork, 3000); } catch(e){ toast("Salva e applica: " + e.message, false); } });
-+    $("#btnNetSave")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const r=await apiPost("/api/setup/network/save", body, { skipAuthRedirect: true }); toast(r?.message || "Configurazione salvata. Premi Salva e applica per usarla."); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); await loadNetwork(); } catch(e){ toast("Errore salvataggio rete: " + e.message, false); } });
-+    $("#btnNetSaveApply")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const ssid=body.wifi?.ssid || ""; const r=await apiPost("/api/setup/network/save-apply", body, { skipAuthRedirect: true, applyTransition: true }); toast(r?.message || "Configurazione salvata e applicazione avviata"); showApplying(r, ssid); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); setTimeout(loadNetwork, 6000); } catch(e){ toast("Salva e applica: " + e.message, e.status === 0); if (e.status === 0) showApplying({ message: e.message, setup_ap_grace_s: 120 }, ""); } });
-   }
+ function markInvalid(input){
+   if (!input) return;
+   input.classList.add('input-error');
+   input.addEventListener('input', () => input.classList.remove('input-error'), { once: true });
+ }
  
-   function normalizeMqttUriForTls(uri, tlsEnabled){
-     let value = (uri || "").trim();
-     if (!value) return value;
-     const targetScheme = tlsEnabled ? "mqtts://" : "mqtt://";
-     value = value.replace(/^mqtts?:\/\//i, targetScheme);
-     try {
-       const parsed = new URL(value);
-       const defaultPort = tlsEnabled ? "8883" : "1883";
-       if (!parsed.port || parsed.port === (tlsEnabled ? "1883" : "8883")) parsed.port = defaultPort;
-       return parsed.toString().replace(/\/$/, "");
-     } catch {
-       const withoutScheme = value.replace(/^mqtts?:\/\//i, "");
-       const hasPort = /:\d+$/.test(withoutScheme);
-       return targetScheme + withoutScheme + (hasPort ? "" : (tlsEnabled ? ":8883" : ":1883"));
-     }
-   }
+ form?.addEventListener('submit', async (event) => {
+   event.preventDefault();
+   if (pendingRequest) return;
  
-   function syncMqttTlsUri(){
-     const tls = (($("#mq_tls")?.value || "0") === "1");
-     const uriEl = $("#mq_uri");
-     if (uriEl && uriEl.value.trim()) uriEl.value = normalizeMqttUriForTls(uriEl.value, tls);
-   }
- 
+   const rawSuffix = systemInput?.value.trim() || '';
+   const suffix = sanitizeSystemId(rawSuffix);
+   const user = userInput?.value.trim() || '';

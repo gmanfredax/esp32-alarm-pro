@@ -63,29 +63,8 @@
 //#define TWAI_FRAME_MAX_DLC 8
 //#endif
 
-static void sntp_start_and_wait(void){
-    // API compatibile con IDF “classico” (LWIP SNTP)
-    sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    sntp_setservername(0, "time.google.com");          // puoi usare anche "time.google.com"
-    sntp_init();
-
-    // Attendi che time() diventi plausibile (> 2020-01-01)
-    time_t now = 0;
-    int tries = 0;
-    do {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        time(&now);
-    } while (now < 1577836800 && ++tries < 30);     // ~30s timeout
-
-    if (now < 1577836800) {
-        ESP_LOGW("time", "SNTP non sincronizzato (timeout)");
-    } else {
-        ESP_LOGI("time", "SNTP ok: %ld", (long)now);
-        system_time_mark_sntp_synced((int64_t)now);
-    }
-}
-
 static const char *TAG = "app";
+
 
 // #if defined(CONFIG_APP_CAN_ENABLED)
 // static const char *TAG_CAN = "can";
@@ -1605,7 +1584,7 @@ static void system_main_task(void *arg)
         }
     }
     if (network_ready_for_time) {
-        sntp_start_and_wait();
+        system_time_sntp_start_async("boot_network_ready");
     } else {
         ESP_LOGW(TAG, "Skipping SNTP start because network is not ready");
     }

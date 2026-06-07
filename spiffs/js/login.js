@@ -33,6 +33,7 @@ let pendingRequest = false;
 let recoveryMode = false;
 let setupLimitedMode = false;
 let lanSystemLocked = false;
+let timeRetryTimer = null;
 
 if (footYear) footYear.textContent = String(new Date().getFullYear());
 
@@ -182,16 +183,41 @@ function showRecoveryField(){
   setMessage('Inserisci un codice di recupero monouso.');
 }
 
+function stopTimeRetry(){
+  if (timeRetryTimer) clearInterval(timeRetryTimer);
+  timeRetryTimer = null;
+}
+
+function startTimeRetry(){
+  if (timeRetryTimer) return;
+  setMessage('Sincronizzazione orario in corso via SNTP... ritento automaticamente.', 'success');
+  timeRetryTimer = setInterval(async () => {
+    try {
+      const status = await apiRequest('/api/network/status', { method: 'GET', auth: false });
+      if (status?.time?.time_valid || status?.time_valid) {
+        stopTimeRetry();
+        hideFallbackChoices();
+        showOtpField();
+        setMessage('Ora sincronizzata via SNTP. Inserisci il codice OTP.', 'success');
+      }
+    } catch {
+      // Durante il cambio rete è normale non ricevere risposta: non mostrare Failed to fetch.
+    }
+  }, 3000);
+}
+
 function showTimeInvalidFallback(message){
   otpRequired = false;
   recoveryMode = false;
   setupLimitedMode = false;
   if (otpField) otpField.classList.add('hidden');
   if (fallbackActions) fallbackActions.classList.remove('hidden');
-  setMessage(message || 'La centrale non ha un orario valido. Puoi configurare la rete, sincronizzare l\'ora da questo dispositivo o usare un codice di recupero.');
+  setMessage(message || 'La centrale non ha un orario valido. Sincronizzazione SNTP in corso se la rete ha Internet; in alternativa configura la rete, sincronizza l\'ora dal dispositivo o usa un codice di recupero.');
+  startTimeRetry();
 }
 
 function showOtpField(){
+  stopTimeRetry();
   otpRequired = true;
   if (otpField) otpField.classList.remove('hidden');
   if (otpInput) {

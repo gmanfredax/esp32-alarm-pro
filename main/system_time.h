@@ -19,6 +19,7 @@ system_time_source_t system_time_source(void);
 const char *system_time_source_name(void);
 int64_t system_time_last_sync_unix(void);
 void system_time_mark_sntp_synced(int64_t unix_time);
+esp_err_t system_time_sntp_start_async(const char *reason);
 esp_err_t system_time_set_browser_manual(int64_t unix_time, const char *timezone);
 esp_err_t system_time_append_json(cJSON *root);
 
