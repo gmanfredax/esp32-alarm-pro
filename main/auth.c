@@ -195,7 +195,7 @@ static session_t* session_from_request(httpd_req_t* req){
                     session_t* s = find_by_atk(token);
                     if (s){
                         if (s->setup_limited && !setup_limited_uri_allowed(req->uri)) {
-                            ESP_LOGW(TAG, "setup_limited denied bearer uri=%s", req->uri ? req->uri : "");
+                            ESP_LOGW(TAG, "network_api: denied role=setup_limited uri=%s reason=not_allowlisted", req->uri ? req->uri : "");
                             free(hdr); return NULL;
                         }
                         if (touch_allowed) touch_session(s);
@@ -213,7 +213,7 @@ static session_t* session_from_request(httpd_req_t* req){
         if (s){
             if (s->setup_limited && !setup_limited_uri_allowed(req->uri)
                 && strcmp(req->uri, "/admin.html") != 0 && strcmp(req->uri, "/") != 0 && strcmp(req->uri, "/index.html") != 0) {
-                ESP_LOGW(TAG, "setup_limited denied cookie uri=%s", req->uri ? req->uri : "");
+                ESP_LOGW(TAG, "network_api: denied role=setup_limited uri=%s reason=not_allowlisted", req->uri ? req->uri : "");
                 return NULL;
             }
             if (touch_allowed) touch_session(s);
@@ -324,7 +324,7 @@ bool auth_check_bearer(httpd_req_t* req, user_info_t* out){
         session_t* s = find_by_atk(token);
         if (s){
             if (s->setup_limited && !setup_limited_uri_allowed(req->uri)) {
-                ESP_LOGW(TAG, "setup_limited denied bearer uri=%s", req->uri ? req->uri : "");
+                ESP_LOGW(TAG, "network_api: denied role=setup_limited uri=%s reason=not_allowlisted", req->uri ? req->uri : "");
                 free(h); return false;
             }
             touch_session(s);
@@ -342,7 +342,7 @@ bool auth_check_cookie(httpd_req_t* req, user_info_t* out){
     if (!s) return false;
     if (s->setup_limited && !setup_limited_uri_allowed(req->uri)
         && strcmp(req->uri, "/admin.html") != 0 && strcmp(req->uri, "/") != 0 && strcmp(req->uri, "/index.html") != 0) {
-        ESP_LOGW(TAG, "setup_limited denied cookie uri=%s", req->uri ? req->uri : "");
+        ESP_LOGW(TAG, "network_api: denied role=setup_limited uri=%s reason=not_allowlisted", req->uri ? req->uri : "");
         return false;
     }
     touch_session(s);

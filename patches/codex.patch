@@ -1,240 +1,192 @@
 diff --git a/spiffs/js/admin.js b/spiffs/js/admin.js
-index e86ed0c3c043928fd4c430cc9333dc3315babb94..f26d765724ba94c2ee8baf5ed3ed3421673a56fa 100755
+index f26d765724ba94c2ee8baf5ed3ed3421673a56fa..579655f1782520673ed1ae877057159066c1123e 100755
 --- a/spiffs/js/admin.js
 +++ b/spiffs/js/admin.js
-@@ -2330,162 +2330,173 @@ let lastRecoveryCodes = [];
-       $("#notify_repeat") && ($("#notify_repeat").value = c.repeat_critical_unacked ? "1" : "0");
-       $("#notify_interval") && ($("#notify_interval").value = c.repeat_interval_s ?? 300);
-     }catch(e){ toast("Errore caricando notifiche: " + e.message, false); }
+@@ -38,83 +38,127 @@
+   })();
+ 
+   // ========== Helpers UI / auth ==========
+   function toast(msg, ok=true){
+     let el = $("#toast");
+     if (!el){
+       el = document.createElement("div");
+       el.id = "toast";
+       el.className = "toast";
+       Object.assign(el.style, {position:"fixed",bottom:"18px",left:"18px",padding:".6rem .8rem",borderRadius:"10px",background:"rgba(20,28,44,.95)",border:"1px solid var(--border)",color:"var(--text)",zIndex:2000,boxShadow:"0 6px 24px rgba(0,0,0,.35)",maxWidth:"80%"});
+       document.body.appendChild(el);
+     }
+     el.textContent = msg;
+     el.style.borderColor = ok ? "rgba(16,185,129,.45)" : "rgba(239,68,68,.55)";
+     el.style.background = ok ? "rgba(10,20,24,.95)" : "rgba(32,12,12,.95)";
+     clearTimeout(el._t); el._t = setTimeout(()=>{ el.remove(); }, 2400);
+   }
+   const needLogin = () => location.replace("/login.html");
+ 
+   let currentUser = "";
+   let isAdmin = false;
+ let setupLimited = false;
+ let lastRecoveryCodes = [];
+ 
+   async function apiGet(url){
+-    const r = await fetch(url, { headers: { "Accept":"application/json" } });
++    console.debug("[api] GET", url);
++    let r;
++    try {
++      r = await fetch(url, { headers: { "Accept":"application/json" } });
++    } catch (err) {
++      console.warn("[api] GET fetch error", url, err);
++      throw new Error("Impossibile raggiungere la centrale. Verifica se la rete è cambiata o ricarica la pagina.");
++    }
++    console.debug("[api] GET status", url, r.status);
+     if (r.status === 401) { needLogin(); throw new Error("401"); }
+     if (!r.ok) throw new Error(await r.text());
+     try {
+-      return await r.json();
++      const data = await r.json();
++      console.debug("[api] GET json", url, data);
++      return data;
+     } catch (err) {
+       throw new Error("Risposta JSON non valida");
+     }
+   }
+   async function apiPost(url, body, opts = {}){
+-    const r = await fetch(url, {
+-      method: "POST",
+-      headers: { "Content-Type": "application/json" },
+-      body: body!=null ? JSON.stringify(body) : undefined,
+-      __skipAuthRedirect: opts.skipAuthRedirect === true
+-    });
++    console.debug("[api] POST", url, redactNetworkPayload(body));
++    let r;
++    try {
++      r = await fetch(url, {
++        method: "POST",
++        headers: { "Content-Type": "application/json", "Accept":"application/json" },
++        body: body!=null ? JSON.stringify(body) : undefined,
++        __skipAuthRedirect: opts.skipAuthRedirect === true
++      });
++    } catch (err) {
++      console.warn("[api] POST fetch error", url, err);
++      const e = new Error(opts.applyTransition === true
++        ? "Configurazione inviata. Se la rete si sta riavviando, attendi la riconnessione o riapri la centrale dal nuovo IP."
++        : "Impossibile raggiungere la centrale. Verifica se la rete è cambiata o ricarica la pagina.");
++      e.status = 0;
++      throw e;
++    }
++    console.debug("[api] POST status", url, r.status);
+     if (r.status === 401) { needLogin(); throw new Error("401"); }
+     if (!r.ok) {
+       let detail = "";
+       try {
+         const ct = r.headers.get("content-type") || "";
+         if (ct.includes("application/json")){
+           const data = await r.json();
+           detail = data?.message || data?.error || JSON.stringify(data);
+         } else {
+           detail = await r.text();
+         }
+       } catch (err) {
+         detail = err?.message || `${r.status} ${r.statusText}`;
+       }
+-      throw new Error(detail || `${r.status} ${r.statusText}`);
++      if (r.status === 403) detail = detail || "Sessione non autorizzata alla configurazione rete";
++      else if (r.status === 404) detail = detail || "Endpoint configurazione rete non disponibile";
++      const e = new Error(detail || `${r.status} ${r.statusText}`);
++      e.status = r.status;
++      throw e;
+     }
+-    try { return await r.json(); } catch { return {}; }
++    try {
++      const data = await r.json();
++      console.debug("[api] POST json", url, data);
++      return data;
++    } catch {
++      throw new Error("Risposta JSON non valida");
++    }
++  }
++
++  function redactNetworkPayload(body){
++    try{
++      if (!body || typeof body !== "object") return body;
++      const copy = JSON.parse(JSON.stringify(body));
++      if (copy.wifi?.password) copy.wifi.password = "***";
++      if (copy.setup_ap?.password) copy.setup_ap.password = "***";
++      if (copy.wifi_password) copy.wifi_password = "***";
++      if (copy.fallback_ap_password) copy.fallback_ap_password = "***";
++      return copy;
++    }catch{ return "[payload redacted]"; }
    }
  
-   function setupNotificationsSection(){
-     loadNotifications().catch(()=>{});
-     $("#btnNotifySave")?.addEventListener("click", async () => {
-       const body = {
-         mqtt_publish_enabled: ($("#notify_mqtt")?.value || "1") === "1",
-         min_severity: $("#notify_sev")?.value || "info",
-         repeat_critical_unacked: ($("#notify_repeat")?.value || "1") === "1",
-         repeat_interval_s: parseInt($("#notify_interval")?.value || "300", 10) || 300,
-       };
-       try{ await apiPost("/api/admin/notifications", body); toast("Notifiche salvate"); }
-       catch(e){ toast("Errore salvataggio notifiche: " + e.message, false); }
-     });
-     $("#btnNotifyTest")?.addEventListener("click", async () => {
-       try{ await apiPost("/api/admin/notifications/test", {}); toast("Evento di test pubblicato"); }
-       catch(e){ toast("Test notifica: " + e.message, false); }
-     });
+   async function apiDelete(url){
+     const r = await fetch(url, { method:"DELETE", headers:{ "Accept":"application/json" } });
+     if (r.status === 401) { needLogin(); throw new Error("401"); }
+     if (!r.ok){
+       let detail = "";
+       try {
+         const ct = r.headers.get("content-type") || "";
+         if (ct.includes("application/json")){
+           const data = await r.json();
+           detail = data?.error || data?.message || JSON.stringify(data);
+         } else {
+           detail = await r.text();
+         }
+       } catch(err){
+         detail = err?.message || await r.text();
+       }
+       throw new Error(detail || `${r.status} ${r.statusText}`);
+     }
+     try { return await r.json(); } catch { return {}; }
    }
  
-   // ========== RETE / MQTT
-   function netLabel(value){
--    return ({ ethernet_only:"Solo Ethernet", wifi_only:"Solo Wi-Fi", ethernet_preferred:"Ethernet preferita", wifi_preferred:"Wi-Fi preferito", ethernet:"Ethernet", wifi:"Wi-Fi", none:"Nessuna" })[value] || value || "—";
-+    return ({ ethernet_only:"Solo Ethernet", wifi_only:"Solo Wi‑Fi", ethernet_preferred:"Ethernet preferita", wifi_preferred:"Wi‑Fi preferito", ethernet:"Ethernet", wifi:"Wi‑Fi", setup_ap:"AP fallback", none:"Nessuna", connected:"connessa", disconnected:"disconnessa" })[value] || value || "—";
-+  }
-+  function netBool(ok, yes="Sì", no="No"){
-+    return `<span class="tag ${ok ? "ok" : "warn"}">${ok ? yes : no}</span>`;
-+  }
-+  function netValue(v){ return (v === 0 || v) ? escapeHtml(String(v)) : "—"; }
-+  function netRows(rows){
-+    return rows.map(([k,v]) => `<div class="net-kv"><span>${escapeHtml(k)}</span><strong>${v}</strong></div>`).join("");
-   }
--
-   function renderNetworkStatus(c){
--    const box = $("#netStatus");
-+    const wifi = c.wifi || {}, eth = c.ethernet || {}, ap = c.fallback_ap || c.setup_ap || {};
-+    const connOk = c.connectivity === "connected" || c.active_interface === "wifi" || c.active_interface === "ethernet";
-+    const general = $("#netGeneral");
-+    if (general) general.innerHTML = netRows([
-+      ["Modalità configurata", netLabel(c.configured_mode || c.network_mode)],
-+      ["Interfaccia attiva", `<span class="tag ${connOk ? "ok" : "warn"}">${escapeHtml(netLabel(c.active_interface))}</span>`],
-+      ["Hostname", netValue(c.hostname)],
-+      ["Connettività", netBool(connOk, "connessa", c.connectivity === "setup_ap" ? "solo setup" : "non connessa")],
-+      ["Ultimo errore", netValue(c.last_error)],
-+      ["Ultimo evento", netValue(c.last_event || c.active_interface)],
-+    ]);
-+    const ethBox = $("#netEthernet");
-+    if (ethBox) ethBox.innerHTML = netRows([
-+      ["Abilitata", netBool(eth.enabled !== false, "abilitata", "disabilitata")],
-+      ["Link", netBool(!!eth.link_up, "link up", "link down")],
-+      ["MAC", netValue(eth.mac)], ["IP", netValue(eth.ip)], ["Netmask", netValue(eth.netmask)],
-+      ["Gateway", netValue(eth.gateway)], ["DNS 1", netValue(eth.dns1)], ["DNS 2", netValue(eth.dns2)],
-+      ["DHCP/static", eth.dhcp === false ? "static" : "DHCP"],
-+    ]);
-+    const wifiBox = $("#netWifi");
-+    if (wifiBox) wifiBox.innerHTML = netRows([
-+      ["Abilitato", netBool(!!wifi.enabled, "abilitato", "disabilitato")],
-+      ["Stato", netBool(!!wifi.connected, "connesso", "disconnesso")],
-+      ["SSID", netValue(wifi.ssid)], ["BSSID", netValue(wifi.bssid)], ["Canale", netValue(wifi.channel)],
-+      ["RSSI", wifi.rssi ? `${escapeHtml(String(wifi.rssi))} dBm` : "—"], ["MAC", netValue(wifi.mac)],
-+      ["IP", netValue(wifi.ip)], ["Netmask", netValue(wifi.netmask)], ["Gateway", netValue(wifi.gateway)],
-+      ["DNS 1", netValue(wifi.dns1)], ["DNS 2", netValue(wifi.dns2)], ["DHCP/static", wifi.dhcp === false ? "static" : "DHCP"],
-+    ]);
-+    const apBox = $("#netFallback");
-+    if (apBox) apBox.innerHTML = netRows([
-+      ["Configurazione", netBool(ap.enabled !== false, "abilitato", "disabilitato")],
-+      ["Runtime", netBool(!!ap.active, "attivo", "non attivo")],
-+      ["SSID AP", netValue(ap.ssid)], ["IP AP", netValue(ap.ip || "192.168.4.1")], ["Netmask AP", netValue(ap.netmask)],
-+      ["Client", netValue(ap.clients)], ["Avvii AP", netValue(ap.start_count)],
-+      ["Periodo di grazia", ap.grace_active ? `<span class="tag warn">${Number(ap.grace_remaining_s || 0)} s</span>` : "—"],
-+      ["Ultimo motivo", netValue(ap.last_reason)], ["Ultimo evento client", netValue(ap.last_client_event)],
-+    ]);
-+  }
-+  function readNetworkBody(){
-+    const mode = $("#net_mode")?.value || "ethernet_only";
-+    const ssid = ($("#net_wifi_ssid")?.value || "").trim();
-+    const password = $("#net_wifi_password")?.value || "";
-+    const setupPass = $("#net_setup_password")?.value || "";
-+    if ((mode === "wifi_only" || mode === "ethernet_preferred" || mode === "wifi_preferred") && !ssid) throw new Error("SSID Wi‑Fi obbligatorio per la modalità scelta");
-+    const body = { network_mode: mode, hostname: ($("#net_host")?.value || "").trim(), wifi: { ssid }, setup_ap: { enabled: ($("#net_setup_enabled")?.value || "1") === "1" } };
-+    if (password) body.wifi.password = password;
-+    if (setupPass) body.setup_ap.password = setupPass;
-+    return body;
-+  }
-+  function showApplying(resp, ssid){
-+    const box = $("#networkApplying");
-     if (!box) return;
--    const wifi = c.wifi || {};
--    const eth = c.ethernet || {};
--    const items = [
--      ["Interfaccia attiva", netLabel(c.active_interface)],
--      ["Modalità", netLabel(c.network_mode)],
--      ["Hostname", c.hostname || "—"],
--      ["Ethernet", eth.link_up ? "link up" : "link down"],
--      ["IP Ethernet", eth.ip || "0.0.0.0"],
--      ["MAC Ethernet", eth.mac || "—"],
--      ["Wi-Fi", wifi.connected ? "connesso" : "disconnesso"],
--      ["SSID Wi-Fi", wifi.ssid || "—"],
--      ["RSSI Wi-Fi", wifi.rssi ? `${wifi.rssi} dBm` : "—"],
--      ["IP Wi-Fi", wifi.ip || "0.0.0.0"],
--      ["MAC Wi-Fi", wifi.mac || "—"],
--      ["Password Wi-Fi", wifi.password_set ? "configurata" : "non configurata"],
--      ["AP fallback", c.setup_ap?.active ? `attivo (${c.setup_ap.ssid || "—"})` : (c.setup_ap?.enabled ? "abilitato" : "disabilitato")],
--      ["IP AP fallback", c.setup_ap?.ip || "192.168.4.1"],
--      ["Client AP fallback", Number.isFinite(c.setup_ap?.clients) ? c.setup_ap.clients : "—"],
--      ["Avvii AP fallback", Number.isFinite(c.setup_ap?.start_count) ? c.setup_ap.start_count : "—"],
--      ["Motivo ultimo AP", c.setup_ap?.last_reason || "—"],
--      ["Ultimo evento client AP", c.setup_ap?.last_client_event || "—"],
--      ["Password AP", c.setup_ap?.password_set ? "configurata" : "non configurata"],
--      ["Ultimo errore", c.last_error || "—"],
--    ];
--    box.innerHTML = items.map(([k,v]) => `<div><span>${k}</span><strong>${v}</strong></div>`).join("");
-+    const host = resp?.hostname || ($("#net_host")?.value || "nsalarmpro").trim() || "nsalarmpro";
-+    const ip = resp?.new_ip || "";
-+    const grace = Number(resp?.setup_ap_grace_s || 120);
-+    const mdns = `http://${host}.local/`;
-+    const ipUrl = ip ? `http://${ip}/` : "";
-+    box.classList.remove("hidden");
-+    box.innerHTML = `<h3>Applicazione rete in corso</h3>
-+      <p>Configurazione salvata. Riconnetti telefono/PC alla rete principale ${ssid ? `<strong>${escapeHtml(ssid)}</strong>` : ""} e apri ${ipUrl ? `<a href="${ipUrl}">${ipUrl}</a>` : "il nuovo IP"} oppure <a href="${mdns}">${mdns}</a>.</p>
-+      <div class="net-kv-grid"><div class="net-kv"><span>Nuovo IP noto</span><strong>${escapeHtml(ip || "in attesa")}</strong></div><div class="net-kv"><span>Hostname</span><strong>${escapeHtml(host)}</strong></div><div class="net-kv"><span>AP fallback grace</span><strong><span id="netApplyCountdown">${grace}</span> s</strong></div></div>
-+      <p class="muted">Il redirect automatico partirà dopo un tempo ragionevole; se fallisce usa i link manuali.</p>`;
-+    let left = grace;
-+    const timer = setInterval(() => { left -= 1; const el = $("#netApplyCountdown"); if (el) el.textContent = String(Math.max(0,left)); if (left <= 0) clearInterval(timer); }, 1000);
-+    setTimeout(() => { if (ipUrl) location.href = ipUrl; }, 25000);
-   }
--
-   async function loadNetwork(){
-     try{
-       const c = await apiGet("/api/admin/network");
-       renderNetworkStatus(c);
--      $("#net_mode") && ($("#net_mode").value = c.network_mode || "ethernet_only");
-+      $("#net_mode") && ($("#net_mode").value = c.configured_mode || c.network_mode || "ethernet_only");
+   const escapeHtml = (value = "") => (value ?? "").toString()
+     .replace(/&/g, "&amp;")
+@@ -2436,67 +2480,67 @@ let lastRecoveryCodes = [];
        $("#net_host") && ($("#net_host").value = c.hostname || "");
        $("#net_wifi_ssid") && ($("#net_wifi_ssid").value = c.wifi?.ssid || "");
        $("#net_wifi_password") && ($("#net_wifi_password").value = "");
--      $("#net_setup_enabled") && ($("#net_setup_enabled").value = c.setup_ap?.enabled === false ? "0" : "1");
-+      const ap = c.fallback_ap || c.setup_ap || {};
-+      $("#net_setup_enabled") && ($("#net_setup_enabled").value = ap.enabled === false ? "0" : "1");
+       const ap = c.fallback_ap || c.setup_ap || {};
+       $("#net_setup_enabled") && ($("#net_setup_enabled").value = ap.enabled === false ? "0" : "1");
        $("#net_setup_password") && ($("#net_setup_password").value = "");
      }catch(e){ toast("Errore caricando rete: " + e.message, false); }
--
-+  }
-+  function setupNetworkEventHandlers(){
+   }
+   function setupNetworkEventHandlers(){
      $("#btnNetWifiScan")?.addEventListener("click", async ()=>{
        try{
          const res = await apiGet("/api/admin/network/wifi/scan");
          const box = $("#netWifiScan");
          if (box){
            const nets = res.networks || [];
--          box.innerHTML = nets.length ? nets.map(n => `<button class="btn" type="button" data-ssid="${escapeHtml(n.ssid || "")}">${escapeHtml(n.ssid || "(nascosta)")} · ${n.rssi || 0} dBm · ${escapeHtml(n.security || "")}</button>`).join("") : "<div><span>Reti</span><strong>Nessuna rete trovata</strong></div>";
-+          box.innerHTML = nets.length ? nets.map(n => `<button class="btn" type="button" data-ssid="${escapeHtml(n.ssid || "")}">${escapeHtml(n.ssid || "(nascosta)")} · ${n.rssi || 0} dBm · ${escapeHtml(n.security || "")}</button>`).join("") : "<div class=\"net-kv\"><span>Reti</span><strong>Nessuna rete trovata</strong></div>";
+           box.innerHTML = nets.length ? nets.map(n => `<button class="btn" type="button" data-ssid="${escapeHtml(n.ssid || "")}">${escapeHtml(n.ssid || "(nascosta)")} · ${n.rssi || 0} dBm · ${escapeHtml(n.security || "")}</button>`).join("") : "<div class=\"net-kv\"><span>Reti</span><strong>Nessuna rete trovata</strong></div>";
            box.querySelectorAll("button[data-ssid]").forEach(b => b.addEventListener("click", ()=>{ const v=b.getAttribute("data-ssid")||""; if(v) $("#net_wifi_ssid").value=v; }));
          }
--      }catch(e){ toast("Scansione Wi-Fi fallita: " + e.message, false); }
-+      }catch(e){ toast("Scansione Wi‑Fi fallita: " + e.message, false); }
+       }catch(e){ toast("Scansione Wi‑Fi fallita: " + e.message, false); }
      });
--
      $("#btnNetWifiTest")?.addEventListener("click", async ()=>{
        const ssid = ($("#net_wifi_ssid")?.value || "").trim();
        const password = $("#net_wifi_password")?.value || "";
--      if (!ssid) return toast("SSID Wi-Fi obbligatorio", false);
-+      if (!ssid) return toast("SSID Wi‑Fi obbligatorio", false);
+       if (!ssid) return toast("SSID Wi‑Fi obbligatorio", false);
        try{
--        await apiPost("/api/admin/network/wifi/test", { ssid, password });
--        toast("Test Wi-Fi riuscito");
-+        const r = await apiPost("/api/setup/wifi/test", { ssid, password });
-+        const box = $("#netWifiTestResult");
-+        if (box){
-+          box.classList.remove("hidden");
-+          box.innerHTML = `<strong>${escapeHtml(r.message || "Connessione Wi‑Fi riuscita")}</strong><div class="net-kv-grid">${netRows([["SSID", netValue(r.ssid)], ["IP", netValue(r.ip)], ["Netmask", netValue(r.netmask)], ["Gateway", netValue(r.gateway)], ["DNS 1", netValue(r.dns1)], ["DNS 2", netValue(r.dns2)], ["RSSI", r.rssi ? `${escapeHtml(String(r.rssi))} dBm` : "—"], ["Canale", netValue(r.channel)], ["BSSID", netValue(r.bssid)]])}</div><button class="btn primary" id="btnUseTestedWifi" type="button">Salva e applica questa rete</button>`;
-+          $("#btnUseTestedWifi")?.addEventListener("click", () => $("#btnNetSaveApply")?.click());
-+        }
-+        toast(r.message || "Test Wi‑Fi riuscito");
+-        const r = await apiPost("/api/setup/wifi/test", { ssid, password });
++        const r = await apiPost("/api/setup/wifi/test", { ssid, password }, { skipAuthRedirect: true });
+         const box = $("#netWifiTestResult");
+         if (box){
+           box.classList.remove("hidden");
+           box.innerHTML = `<strong>${escapeHtml(r.message || "Connessione Wi‑Fi riuscita")}</strong><div class="net-kv-grid">${netRows([["SSID", netValue(r.ssid)], ["IP", netValue(r.ip)], ["Netmask", netValue(r.netmask)], ["Gateway", netValue(r.gateway)], ["DNS 1", netValue(r.dns1)], ["DNS 2", netValue(r.dns2)], ["RSSI", r.rssi ? `${escapeHtml(String(r.rssi))} dBm` : "—"], ["Canale", netValue(r.channel)], ["BSSID", netValue(r.bssid)]])}</div><button class="btn primary" id="btnUseTestedWifi" type="button">Salva e applica questa rete</button>`;
+           $("#btnUseTestedWifi")?.addEventListener("click", () => $("#btnNetSaveApply")?.click());
+         }
+         toast(r.message || "Test Wi‑Fi riuscito");
          await loadNetwork();
--      }catch(e){ toast("Test Wi-Fi fallito: " + e.message, false); }
--    });
--
--    $("#btnNetSetupExit")?.addEventListener("click", async ()=>{
--      try{ await apiPost("/api/admin/network/setup/exit", {}); toast("Uscita setup richiesta"); setTimeout(loadNetwork, 1000); }
--      catch(e){ toast("Uscita setup: " + e.message, false); }
--    });
--
--    $("#btnNetRestart")?.addEventListener("click", async ()=>{
--      try{ await apiPost("/api/admin/network/restart", {}); toast("Riavvio rete avviato"); setTimeout(loadNetwork, 1500); }
--      catch(e){ toast("Riavvio rete: " + e.message, false); }
--    });
--
--    $("#btnSyncBrowserTime")?.addEventListener("click", async ()=>{
--      const status = $("#timeSyncStatus");
--      try{
--        const unix_time = Math.floor(Date.now() / 1000);
--        const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "browser";
--        const resp = await apiPost("/api/setup/time", { unix_time, timezone });
--        const msg = resp?.message || "Ora sincronizzata. Ora puoi completare l'accesso con OTP.";
--        if (status) status.textContent = msg;
--        toast(msg);
--      }catch(e){
--        const msg = "Sincronizzazione ora: " + e.message;
--        if (status) status.textContent = msg;
--        toast(msg, false);
--      }
--    });
--
--    $("#btnCompleteAdminLogin")?.addEventListener("click", async ()=>{
--      try{ await apiPost("/api/logout", {}); }catch{}
--      try { localStorage.removeItem("alarmpro.token"); sessionStorage.removeItem("alarmpro.token"); } catch{}
--      location.replace("/login.html");
--    });
--
--    $("#btnNetSave")?.addEventListener("click", async ()=>{
--      const mode = $("#net_mode")?.value || "ethernet_only";
--      const ssid = ($("#net_wifi_ssid")?.value || "").trim();
--      const password = $("#net_wifi_password")?.value || "";
--      if ((mode === "wifi_only" || mode === "ethernet_preferred" || mode === "wifi_preferred") && !ssid) return toast("SSID Wi-Fi obbligatorio per la modalità scelta", false);
--      const setupPass = $("#net_setup_password")?.value || "";
--      const body = { network_mode: mode, hostname: ($("#net_host")?.value || "").trim(), wifi: { ssid }, setup_ap: { enabled: ($("#net_setup_enabled")?.value || "1") === "1" } };
--      if (password) body.wifi.password = password;
--      if (setupPass) body.setup_ap.password = setupPass;
--      try{ await apiPost("/api/admin/network", body); toast("Configurazione rete salvata"); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); await loadNetwork(); }
--      catch(e){ toast("Errore salvataggio rete: " + e.message, false); }
-+      }catch(e){ toast("Test Wi‑Fi fallito: " + e.message, false); }
+       }catch(e){ toast("Test Wi‑Fi fallito: " + e.message, false); }
      });
-+    $("#btnNetSetupExit")?.addEventListener("click", async ()=>{ try{ await apiPost("/api/admin/network/setup/exit", {}); toast("Uscita setup richiesta"); setTimeout(loadNetwork, 1000); } catch(e){ toast("Uscita setup: " + e.message, false); } });
-+    $("#btnNetRestart")?.addEventListener("click", async ()=>{ const btn=$("#btnNetRestart"); try{ if(btn) btn.disabled=true; const r=await apiPost("/api/admin/network/restart", {}); toast(r?.message || "Riavvio rete programmato"); setTimeout(loadNetwork, 2500); } catch(e){ toast("Riavvio rete: attendo riconnessione…", true); setTimeout(loadNetwork, 3500); } finally{ setTimeout(()=>{ if(btn) btn.disabled=false; }, 5000); } });
-+    $("#btnSyncBrowserTime")?.addEventListener("click", async ()=>{ const status = $("#timeSyncStatus"); try{ const unix_time = Math.floor(Date.now() / 1000); const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "browser"; const resp = await apiPost("/api/setup/time", { unix_time, timezone }); const msg = resp?.message || "Ora sincronizzata. Ora puoi completare l'accesso con OTP."; if (status) status.textContent = msg; toast(msg); }catch(e){ const msg = "Sincronizzazione ora: " + e.message; if (status) status.textContent = msg; toast(msg, false); } });
-+    $("#btnCompleteAdminLogin")?.addEventListener("click", async ()=>{ try{ await apiPost("/api/logout", {}); }catch{} try { localStorage.removeItem("alarmpro.token"); sessionStorage.removeItem("alarmpro.token"); } catch{} location.replace("/login.html"); });
-+    $("#btnNetSave")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const r=await apiPost("/api/setup/network/save", body); toast(r?.message || "Configurazione salvata ma non ancora applicata"); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); await loadNetwork(); } catch(e){ toast("Errore salvataggio rete: " + e.message, false); } });
-+    $("#btnNetSaveApply")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const ssid=body.wifi?.ssid || ""; const r=await apiPost("/api/setup/network/save-apply", body); toast(r?.message || "Configurazione salvata e applicazione avviata"); showApplying(r, ssid); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); setTimeout(loadNetwork, 3000); } catch(e){ toast("Salva e applica: " + e.message, false); } });
+     $("#btnNetSetupExit")?.addEventListener("click", async ()=>{ try{ await apiPost("/api/admin/network/setup/exit", {}); toast("Uscita setup richiesta"); setTimeout(loadNetwork, 1000); } catch(e){ toast("Uscita setup: " + e.message, false); } });
+-    $("#btnNetRestart")?.addEventListener("click", async ()=>{ const btn=$("#btnNetRestart"); try{ if(btn) btn.disabled=true; const r=await apiPost("/api/admin/network/restart", {}); toast(r?.message || "Riavvio rete programmato"); setTimeout(loadNetwork, 2500); } catch(e){ toast("Riavvio rete: attendo riconnessione…", true); setTimeout(loadNetwork, 3500); } finally{ setTimeout(()=>{ if(btn) btn.disabled=false; }, 5000); } });
++    $("#btnNetRestart")?.addEventListener("click", async ()=>{ const btn=$("#btnNetRestart"); try{ if(btn) btn.disabled=true; const r=await apiPost("/api/admin/network/restart", {}, { skipAuthRedirect: true, applyTransition: true }); toast(r?.message || "Riavvio rete programmato"); setTimeout(loadNetwork, 2500); } catch(e){ toast(e.status === 0 ? "Riavvio rete richiesto: attendo riconnessione…" : "Riavvio rete: " + e.message, e.status === 0); setTimeout(loadNetwork, 3500); } finally{ setTimeout(()=>{ if(btn) btn.disabled=false; }, 5000); } });
+     $("#btnSyncBrowserTime")?.addEventListener("click", async ()=>{ const status = $("#timeSyncStatus"); try{ const unix_time = Math.floor(Date.now() / 1000); const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || "browser"; const resp = await apiPost("/api/setup/time", { unix_time, timezone }); const msg = resp?.message || "Ora sincronizzata. Ora puoi completare l'accesso con OTP."; if (status) status.textContent = msg; toast(msg); }catch(e){ const msg = "Sincronizzazione ora: " + e.message; if (status) status.textContent = msg; toast(msg, false); } });
+     $("#btnCompleteAdminLogin")?.addEventListener("click", async ()=>{ try{ await apiPost("/api/logout", {}); }catch{} try { localStorage.removeItem("alarmpro.token"); sessionStorage.removeItem("alarmpro.token"); } catch{} location.replace("/login.html"); });
+-    $("#btnNetSave")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const r=await apiPost("/api/setup/network/save", body); toast(r?.message || "Configurazione salvata ma non ancora applicata"); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); await loadNetwork(); } catch(e){ toast("Errore salvataggio rete: " + e.message, false); } });
+-    $("#btnNetSaveApply")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const ssid=body.wifi?.ssid || ""; const r=await apiPost("/api/setup/network/save-apply", body); toast(r?.message || "Configurazione salvata e applicazione avviata"); showApplying(r, ssid); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); setTimeout(loadNetwork, 3000); } catch(e){ toast("Salva e applica: " + e.message, false); } });
++    $("#btnNetSave")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const r=await apiPost("/api/setup/network/save", body, { skipAuthRedirect: true }); toast(r?.message || "Configurazione salvata. Premi Salva e applica per usarla."); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); await loadNetwork(); } catch(e){ toast("Errore salvataggio rete: " + e.message, false); } });
++    $("#btnNetSaveApply")?.addEventListener("click", async ()=>{ try{ const body=readNetworkBody(); const ssid=body.wifi?.ssid || ""; const r=await apiPost("/api/setup/network/save-apply", body, { skipAuthRedirect: true, applyTransition: true }); toast(r?.message || "Configurazione salvata e applicazione avviata"); showApplying(r, ssid); $("#net_wifi_password") && ($("#net_wifi_password").value = ""); $("#net_setup_password") && ($("#net_setup_password").value = ""); setTimeout(loadNetwork, 6000); } catch(e){ toast("Salva e applica: " + e.message, e.status === 0); if (e.status === 0) showApplying({ message: e.message, setup_ap_grace_s: 120 }, ""); } });
    }
  
    function normalizeMqttUriForTls(uri, tlsEnabled){
@@ -260,60 +212,3 @@ index e86ed0c3c043928fd4c430cc9333dc3315babb94..f26d765724ba94c2ee8baf5ed3ed3421
      if (uriEl && uriEl.value.trim()) uriEl.value = normalizeMqttUriForTls(uriEl.value, tls);
    }
  
-@@ -2614,54 +2625,56 @@ let lastRecoveryCodes = [];
- 
-   function setupDigitalFiltersSection(){
-     const reloadBtn = $("#digitalFiltersReloadBtn");
-     const saveBtn = $("#digitalFiltersSaveBtn");
-     reloadBtn?.addEventListener("click", () => { loadDigitalFilters().catch(()=>{}); });
-     saveBtn?.addEventListener("click", async () => {
-       try{
-         const filters = readDigitalFiltersForm();
-         saveBtn.disabled = true;
-         digitalFiltersStatus("Salvataggio…");
-         await apiPost("/api/admin/filters", { debounce_filters: filters });
-         digitalFiltersStatus("Filtri salvati.");
-         toast("Filtri digitali salvati");
-       }catch(err){
-         digitalFiltersStatus(err.message || "Errore durante il salvataggio filtri.", true);
-         toast(err.message || "Errore filtri", false);
-       }finally{
-         saveBtn.disabled = false;
-       }
-     });
-     return loadDigitalFilters().catch(()=>{});
-   }
- 
-   // ---- Wrapper come da tua init() originale
-   async function setupNetworkForms(){
-+    setupNetworkEventHandlers();
-     await loadNetwork();
-   }
- 
-   async function setupNetMqttForms(){
-+    setupNetworkEventHandlers();
-     await Promise.all([loadNetwork(), loadMqtt()]);
-   }
- 
-   function renderWebSecStatus(data){
-     const box = $("#websecStatus");
-     const fb = $("#websecFeedback");
-     if (!box) return;
-     if (!data){
-       box.textContent = "Stato non disponibile";
-       if (fb) fb.textContent = "";
-       return;
-     }
-     const activeLabel = data.using_builtin ? "Certificato predefinito incorporato" : "Certificato personalizzato";
-     let html = `<div><strong>Attivo:</strong> ${escapeHtml(activeLabel)}</div>`;
-     if (data.active_subject) html += `<div class="muted">Soggetto: ${escapeHtml(data.active_subject)}</div>`;
-     if (data.active_not_after) html += `<div class="muted">Valido fino al: ${escapeHtml(data.active_not_after)}</div>`;
-     if (data.active_fingerprint) html += `<div class="muted">SHA-256: <code>${escapeHtml(data.active_fingerprint)}</code></div>`;
-     if (data.custom_available){
-       if (data.custom_valid){
-         const subj = data.custom_subject ? escapeHtml(data.custom_subject) : "";
-         const installed = data.custom_installed_iso ? ` (${escapeHtml(data.custom_installed_iso)})` : "";
-         html += `<div class="muted" style="margin-top:.4rem">Ultimo certificato installato: ${subj}${installed}</div>`;
-         if (data.custom_not_after) html += `<div class="muted">Scadenza personalizzato: ${escapeHtml(data.custom_not_after)}</div>`;
-       } else {
-         html += `<div class="muted" style="margin-top:.4rem">Il certificato personalizzato salvato non è valido.</div>`;
