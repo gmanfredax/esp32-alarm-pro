@@ -17,6 +17,8 @@ typedef enum {
 bool system_time_is_valid(void);
 system_time_source_t system_time_source(void);
 const char *system_time_source_name(void);
+bool system_time_sntp_syncing(void);
+const char *system_time_sync_status(void);
 int64_t system_time_last_sync_unix(void);
 void system_time_mark_sntp_synced(int64_t unix_time);
 esp_err_t system_time_sntp_start_async(const char *reason);

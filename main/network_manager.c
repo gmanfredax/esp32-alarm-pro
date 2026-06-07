@@ -61,6 +61,8 @@ typedef struct {
     char setup_ap_last_reason[48];
     char setup_ap_last_client_event[96];
     bool wifi_test_active;
+    bool network_transition_in_progress;
+    uint32_t last_grace_log_remaining_s;
     wifi_mode_t wifi_current_mode;
     bool wifi_started;
     bool wifi_has_ip;
@@ -494,17 +496,25 @@ static esp_err_t setup_ap_start_locked(const char *reason)
     return ESP_OK;
 }
 
-static void setup_ap_stop_locked(void)
+static esp_err_t setup_ap_stop_force_locked(const char *reason, bool ignore_grace)
 {
-    if (setup_ap_grace_active_locked()) return;
-    if (!s_net.setup_ap_active || !s_net.wifi_driver_ready) return;
+    if (setup_ap_grace_active_locked() && !ignore_grace) return ESP_ERR_INVALID_STATE;
+    if (!s_net.setup_ap_active || !s_net.wifi_driver_ready) return ESP_OK;
     s_net.setup_ap_active = false;
     s_net.setup_ap_ssid[0] = '\0';
     s_net.setup_ap_ip[0] = '\0';
     if (s_net.active_if == NETWORK_IF_SETUP_AP) set_active_locked(NETWORK_IF_NONE);
-    wifi_apply_mode_locked();
-    if (!s_net.wifi_sta_started && !s_net.wifi_runtime_desired) wifi_stop_driver_locked();
-    ESP_LOGI(TAG, "AP fallback disattivato");
+    esp_err_t err = wifi_apply_mode_locked();
+    if (err == ESP_OK && !s_net.wifi_sta_started && !s_net.wifi_runtime_desired) wifi_stop_driver_locked();
+    refresh_active_locked();
+    ESP_LOGI(TAG, "fallback_ap_stopped active_interface=%s", network_active_if_to_str(s_net.active_if));
+    ESP_LOGI(TAG, "AP fallback disattivato reason=%s", reason ? reason : "manual");
+    return err;
+}
+
+static void setup_ap_stop_locked(void)
+{
+    (void)setup_ap_stop_force_locked("auto", false);
 }
 
 static esp_err_t wifi_apply_hostname(void)
@@ -628,7 +638,7 @@ static void network_ip_event_handler(void *arg, esp_event_base_t base, int32_t i
         if (s_net.cfg.mode == NETWORK_MODE_ETHERNET_PREFERRED && s_net.wifi_sta_started) wifi_stop_sta_locked();
         refresh_active_locked();
         start_sntp = has_real_link_locked();
-        start_mqtt = has_real_link_locked();
+        start_mqtt = has_real_link_locked() && !s_net.network_transition_in_progress;
     } else if (id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         s_net.wifi_has_ip = true;
@@ -644,7 +654,7 @@ static void network_ip_event_handler(void *arg, esp_event_base_t base, int32_t i
         s_net.wifi_failures = 0;
         refresh_active_locked();
         start_sntp = has_real_link_locked();
-        start_mqtt = has_real_link_locked();
+        start_mqtt = has_real_link_locked() && !s_net.network_transition_in_progress;
     }
     xSemaphoreGive(s_net.lock);
     if (start_sntp) {
@@ -783,16 +793,29 @@ static void manager_loop(void *arg)
             else if (mode == NETWORK_MODE_ETHERNET_ONLY && eth_timed_out) { needs_setup_ap = true; reason = "ethernet_no_ip"; }
         }
 
-        if (needs_setup_ap && !s_net.setup_ap_active) {
+        if (s_net.setup_ap_grace_until_ms && !setup_ap_grace_active_locked()) {
+            bool primary_ready = has_real_link_locked();
+            ESP_LOGI(TAG, "fallback_ap_grace_expired primary_ready=%s", primary_ready ? "true" : "false");
+            s_net.setup_ap_grace_until_ms = 0;
+            if (primary_ready && s_net.setup_ap_active) {
+                ESP_LOGI(TAG, "fallback_ap_stop_requested reason=grace_expired");
+                (void)setup_ap_stop_force_locked("grace_expired", true);
+            } else if (!primary_ready) {
+                set_error_locked("primary_not_ready_after_grace");
+                ESP_LOGW(TAG, "fallback_ap_grace_expired primary_ready=false keeping_setup_ap=true");
+            }
+        } else if (needs_setup_ap && !s_net.setup_ap_active) {
             setup_ap_start_locked(reason);
         } else if (has_real_link_locked() && s_net.setup_ap_active && !setup_ap_grace_active_locked()) {
             setup_ap_stop_locked();
-        } else if (s_net.setup_ap_grace_until_ms && !setup_ap_grace_active_locked()) {
-            ESP_LOGI(TAG, "setup_ap_grace_expired");
-            s_net.setup_ap_grace_until_ms = 0;
+        }
+        uint32_t grace_remaining = setup_ap_grace_remaining_locked();
+        if (grace_remaining && (s_net.last_grace_log_remaining_s == 0 || grace_remaining <= 5 || (grace_remaining % 15u) == 0u) && grace_remaining != s_net.last_grace_log_remaining_s) {
+            s_net.last_grace_log_remaining_s = grace_remaining;
+            ESP_LOGI(TAG, "fallback_ap_grace_remaining=%lu", (unsigned long)grace_remaining);
         }
         static network_active_if_t last_mqtt_iface = NETWORK_IF_NONE;
-        if (has_real_link_locked() && s_net.active_if != last_mqtt_iface) {
+        if (has_real_link_locked() && !s_net.network_transition_in_progress && s_net.active_if != last_mqtt_iface) {
             last_mqtt_iface = s_net.active_if;
             need_mqtt_reload = true;
         }
@@ -844,6 +867,7 @@ esp_err_t network_setup_ap_start_grace(uint32_t seconds)
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
     if (network_config_load(&cfg) == ESP_OK) s_net.cfg = cfg;
     s_net.setup_ap_grace_until_ms = now_ms() + ((uint64_t)seconds * 1000ULL);
+    s_net.last_grace_log_remaining_s = seconds;
     ESP_LOGI(TAG, "fallback_ap_grace_started seconds=%lu", (unsigned long)seconds);
     esp_err_t err = setup_ap_allowed(&s_net.cfg) ? setup_ap_start_locked("grace") : ESP_ERR_INVALID_STATE;
     xSemaphoreGive(s_net.lock);
@@ -855,6 +879,7 @@ esp_err_t network_manager_restart(void)
     network_config_t cfg;
     ESP_RETURN_ON_ERROR(network_config_load(&cfg), TAG, "config_load");
     xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    s_net.network_transition_in_progress = true;
     if (!setup_ap_grace_active_locked()) setup_ap_stop_locked();
     wifi_stop_sta_locked();
     stop_eth_locked();
@@ -868,6 +893,7 @@ esp_err_t network_manager_restart(void)
         if (cfg.mode != NETWORK_MODE_WIFI_ONLY) start_eth_locked();
     }
     if (cfg.mode == NETWORK_MODE_WIFI_ONLY || cfg.mode == NETWORK_MODE_WIFI_PREFERRED) wifi_start_sta_locked();
+    s_net.network_transition_in_progress = false;
     xSemaphoreGive(s_net.lock);
     mqtt_reload_config();
     return ESP_OK;
@@ -913,6 +939,7 @@ esp_err_t network_get_status(network_status_t *out)
     out->last_interface_change_ms = s_net.last_change_ms;
     out->setup_ap_grace_active = setup_ap_grace_active_locked();
     out->setup_ap_grace_remaining_s = setup_ap_grace_remaining_locked();
+    out->network_transition_in_progress = s_net.network_transition_in_progress;
     strlcpy(out->setup_ap_netmask, NETWORK_SETUP_AP_NETMASK, sizeof(out->setup_ap_netmask));
     if (s_net.lock) xSemaphoreGive(s_net.lock);
     mac_to_str(ESP_MAC_ETH, out->ethernet_mac, sizeof(out->ethernet_mac));
@@ -971,6 +998,8 @@ esp_err_t network_status_append_json(cJSON *root)
     cJSON_AddStringToObject(root, "last_error", st.last_error);
     cJSON_AddStringToObject(root, "last_event", network_active_if_to_str(st.active_if));
     cJSON_AddNumberToObject(root, "last_interface_change_ms", (double)st.last_interface_change_ms);
+    cJSON_AddBoolToObject(root, "network_transition_in_progress", st.network_transition_in_progress);
+    cJSON_AddBoolToObject(root, "primary_network_ready", st.active_if == NETWORK_IF_ETHERNET || st.active_if == NETWORK_IF_WIFI);
 
     cJSON *eth = cJSON_AddObjectToObject(root, "ethernet");
     cJSON_AddBoolToObject(eth, "enabled", st.mode != NETWORK_MODE_WIFI_ONLY);
@@ -1022,6 +1051,9 @@ esp_err_t network_status_append_json(cJSON *root)
     cJSON_AddStringToObject(ap, "last_client_event", st.setup_ap_last_client_event);
     cJSON_AddBoolToObject(ap, "password_set", st.fallback_ap_password_set);
     cJSON_AddBoolToObject(ap, "grace_active", st.setup_ap_grace_active);
+    cJSON_AddBoolToObject(root, "fallback_ap_active", st.setup_ap_active);
+    cJSON_AddBoolToObject(root, "fallback_ap_grace_active", st.setup_ap_grace_active);
+    cJSON_AddNumberToObject(root, "fallback_ap_grace_remaining_s", (double)st.setup_ap_grace_remaining_s);
     cJSON_AddNumberToObject(ap, "grace_remaining_s", st.setup_ap_grace_remaining_s);
     cJSON *ap_alias = cJSON_Duplicate(ap, true);
     if (ap_alias) cJSON_AddItemToObject(root, "setup_ap", ap_alias);
@@ -1209,4 +1241,86 @@ bool network_wifi_test_recent_ok(const char *ssid, const char *password)
          (now_ms() - s_net.last_wifi_test_ok_ms) <= NETWORK_WIFI_TEST_MAX_AGE_MS;
     xSemaphoreGive(s_net.lock);
     return ok;
+}
+
+bool network_wifi_sta_ready_for(const char *ssid)
+{
+    if (!ssid || !ssid[0] || !s_net.lock) return false;
+    bool ok = false;
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    ok = s_net.wifi_connected && s_net.wifi_has_ip && s_net.wifi_ip[0] && strcmp(s_net.wifi_ip, "0.0.0.0") != 0;
+    xSemaphoreGive(s_net.lock);
+    if (!ok) return false;
+    wifi_ap_record_t ap = {0};
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return false;
+    if (strcmp((const char *)ap.ssid, ssid) != 0) return false;
+    if (s_wifi_netif) {
+        esp_netif_ip_info_t info = {0};
+        if (esp_netif_get_ip_info(s_wifi_netif, &info) != ESP_OK || info.ip.addr == 0 || info.gw.addr == 0) return false;
+    }
+    return true;
+}
+
+esp_err_t network_apply_runtime_non_destructive(const network_config_t *cfg)
+{
+    if (!cfg || !s_net.lock) return ESP_ERR_INVALID_ARG;
+    if (!network_mode_requires_wifi(cfg->mode) || !network_wifi_sta_ready_for(cfg->wifi_ssid)) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    s_net.cfg = *cfg;
+    s_net.wifi_runtime_desired = true;
+    s_net.wifi_sta_started = true;
+    s_net.network_transition_in_progress = false;
+    set_error_locked("");
+    refresh_active_locked();
+    esp_err_t err = wifi_apply_mode_locked();
+    xSemaphoreGive(s_net.lock);
+    ESP_LOGI(TAG, "network_apply_non_destructive mode=%s ssid=%s active_interface=%s", network_mode_to_str(cfg->mode), cfg->wifi_ssid, network_active_if_to_str(s_net.active_if));
+    return err;
+}
+
+esp_err_t network_setup_ap_stop_grace(void)
+{
+    if (!s_net.lock) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    bool primary_ready = has_real_link_locked();
+    ESP_LOGI(TAG, "fallback_ap_stop_requested reason=manual primary_ready=%s", primary_ready ? "true" : "false");
+    esp_err_t err = ESP_OK;
+    if (!primary_ready) {
+        set_error_locked("primary_not_ready");
+        err = ESP_ERR_INVALID_STATE;
+    } else {
+        s_net.setup_ap_grace_until_ms = 0;
+        err = setup_ap_stop_force_locked("manual", true);
+    }
+    xSemaphoreGive(s_net.lock);
+    return err;
+}
+
+bool network_transition_in_progress(void)
+{
+    if (!s_net.lock) return false;
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    bool in_progress = s_net.network_transition_in_progress;
+    xSemaphoreGive(s_net.lock);
+    return in_progress;
+}
+
+bool network_primary_ready(void)
+{
+    if (!s_net.lock) return false;
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    bool ready = has_real_link_locked() && !s_net.network_transition_in_progress;
+    xSemaphoreGive(s_net.lock);
+    return ready;
+}
+
+
+esp_err_t network_mark_transition_pending(bool pending)
+{
+    if (!s_net.lock) return ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(s_net.lock, portMAX_DELAY);
+    s_net.network_transition_in_progress = pending;
+    xSemaphoreGive(s_net.lock);
+    ESP_LOGI(TAG, "network_transition_in_progress=%s", pending ? "true" : "false");
+    return ESP_OK;
 }

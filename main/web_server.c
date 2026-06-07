@@ -2440,6 +2440,59 @@ static const char *network_request_role(httpd_req_t *req)
     return "anonymous";
 }
 
+
+static esp_err_t append_transition_json(cJSON *root)
+{
+    if (!root) return ESP_ERR_INVALID_ARG;
+    network_status_t st = {0};
+    ESP_RETURN_ON_ERROR(network_get_status(&st), TAG, "transition_status");
+    const bool primary_ready = st.active_if == NETWORK_IF_ETHERNET || st.active_if == NETWORK_IF_WIFI;
+    const char *primary_ip = st.active_if == NETWORK_IF_ETHERNET ? st.ethernet_ip : (st.active_if == NETWORK_IF_WIFI ? st.wifi_ip : "");
+    char redirect[64] = "";
+    char mdns[96] = "";
+    if (primary_ip[0] && strcmp(primary_ip, "0.0.0.0") != 0) snprintf(redirect, sizeof(redirect), "http://%s/", primary_ip);
+    snprintf(mdns, sizeof(mdns), "http://%s.local/", st.hostname[0] ? st.hostname : "nsalarmpro");
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddStringToObject(root, "configured_mode", network_mode_to_str(st.mode));
+    cJSON_AddStringToObject(root, "active_interface", network_active_if_to_str(st.active_if));
+    cJSON_AddBoolToObject(root, "network_transition_in_progress", st.network_transition_in_progress);
+    cJSON_AddBoolToObject(root, "primary_network_ready", primary_ready);
+    cJSON_AddStringToObject(root, "primary_ip", primary_ip);
+    cJSON_AddStringToObject(root, "hostname", st.hostname);
+    cJSON_AddStringToObject(root, "redirect_url", redirect);
+    cJSON_AddStringToObject(root, "mdns_url", mdns);
+    cJSON_AddBoolToObject(root, "fallback_ap_active", st.setup_ap_active);
+    cJSON_AddBoolToObject(root, "fallback_ap_grace_active", st.setup_ap_grace_active);
+    cJSON_AddNumberToObject(root, "fallback_ap_grace_remaining_s", (double)st.setup_ap_grace_remaining_s);
+    system_time_append_json(root);
+    cJSON *time_obj = cJSON_GetObjectItemCaseSensitive(root, "time");
+    bool time_valid = time_obj && cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(time_obj, "time_valid"));
+    const char *time_status = time_valid ? "valid" : (system_time_sntp_syncing() ? "syncing" : "invalid");
+    cJSON_AddBoolToObject(root, "time_valid", time_valid);
+    cJSON_AddStringToObject(root, "time_sync_status", time_status);
+    return ESP_OK;
+}
+
+static esp_err_t api_setup_network_transition_get(httpd_req_t* req)
+{
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    append_transition_json(root);
+    return json_reply_cjson(req, root);
+}
+
+static esp_err_t api_setup_ap_stop_grace_post(httpd_req_t* req)
+{
+    if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
+    esp_err_t err = network_setup_ap_stop_grace();
+    if (err != ESP_OK) return network_json_error(req, HTTPD_400_BAD_REQUEST, "primary_not_ready", "La rete principale non è pronta: AP fallback mantenuto attivo");
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "json"), ESP_FAIL;
+    append_transition_json(root);
+    return json_reply_cjson(req, root);
+}
+
 static esp_err_t api_admin_network_get(httpd_req_t* req)
 {
     if (setup_or_admin(req)!=ESP_OK) return ESP_FAIL;
@@ -2620,6 +2673,8 @@ static esp_err_t api_setup_network_apply_post(httpd_req_t* req)
     if (reply_err != ESP_OK) return reply_err;
     ESP_LOGI(TAG_NETWORK_API, "apply response sent, scheduling apply in 1000 ms");
     (void)network_setup_ap_start_grace(120);
+    (void)network_mark_transition_pending(true);
+    mqtt_stop();
     esp_err_t err = schedule_network_restart(1000);
     if (err != ESP_OK) ESP_LOGW(TAG_NETWORK_API, "apply schedule failed err=%s", esp_err_to_name(err));
     return ESP_OK;
@@ -2676,12 +2731,23 @@ static esp_err_t api_setup_network_save_apply_post(httpd_req_t* req)
     cJSON_AddNumberToObject(root, "setup_ap_grace_s", 120);
     cJSON_AddStringToObject(root, "redirect_url", redirect);
     cJSON_AddStringToObject(root, "mdns_url", mdns);
+    bool non_destructive = network_wifi_sta_ready_for(saved_cfg.wifi_ssid) &&
+                           (saved_cfg.mode == NETWORK_MODE_WIFI_ONLY || saved_cfg.mode == NETWORK_MODE_WIFI_PREFERRED);
+    cJSON_AddBoolToObject(root, "non_destructive_apply", non_destructive);
     esp_err_t reply_err = json_reply_cjson(req, root);
     if (reply_err != ESP_OK) return reply_err;
-    ESP_LOGI(TAG_NETWORK_API, "network_apply_scheduled delay_ms=1000");
     (void)network_setup_ap_start_grace(120);
-    err = schedule_network_restart(1000);
-    if (err != ESP_OK) ESP_LOGW(TAG_NETWORK_API, "save_apply schedule failed err=%s", esp_err_to_name(err));
+    if (non_destructive) {
+        err = network_apply_runtime_non_destructive(&saved_cfg);
+        ESP_LOGI(TAG_NETWORK_API, "network_apply_non_destructive selected err=%s", esp_err_to_name(err));
+        if (err != ESP_OK) ESP_LOGW(TAG_NETWORK_API, "non destructive apply failed, keeping current runtime: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGI(TAG_NETWORK_API, "network_apply_scheduled delay_ms=1000 destructive=true");
+        (void)network_mark_transition_pending(true);
+        mqtt_stop();
+        err = schedule_network_restart(1000);
+        if (err != ESP_OK) ESP_LOGW(TAG_NETWORK_API, "save_apply schedule failed err=%s", esp_err_to_name(err));
+    }
     return ESP_OK;
 }
 
@@ -6982,6 +7048,8 @@ static const httpd_uri_t s_http_routes[] = {
     { .uri = "/api/setup/network/save", .method = HTTP_POST, .handler = api_admin_network_post },
     { .uri = "/api/setup/network/apply", .method = HTTP_POST, .handler = api_setup_network_apply_post },
     { .uri = "/api/setup/network/save-apply", .method = HTTP_POST, .handler = api_setup_network_save_apply_post },
+    { .uri = "/api/setup/network/transition", .method = HTTP_GET, .handler = api_setup_network_transition_get },
+    { .uri = "/api/setup/ap/stop-grace", .method = HTTP_POST, .handler = api_setup_ap_stop_grace_post },
     { .uri = "/api/admin/network/restart", .method = HTTP_POST, .handler = api_admin_network_restart_post },
     { .uri = "/api/admin/network/wifi/test", .method = HTTP_POST, .handler = api_admin_network_wifi_test_post },
     { .uri = "/api/setup/wifi/test", .method = HTTP_POST, .handler = api_admin_network_wifi_test_post },

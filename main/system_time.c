@@ -20,6 +20,8 @@ static int64_t s_last_sync_unix;
 static char s_timezone[48] = "UTC";
 static TaskHandle_t s_sntp_task;
 static bool s_sntp_initialized;
+static bool s_sntp_syncing;
+static bool s_sntp_failed;
 
 static bool unix_time_plausible(int64_t unix_time)
 {
@@ -35,6 +37,19 @@ bool system_time_is_valid(void)
 system_time_source_t system_time_source(void)
 {
     return system_time_is_valid() ? s_time_source : SYSTEM_TIME_SOURCE_UNKNOWN;
+}
+
+bool system_time_sntp_syncing(void)
+{
+    return s_sntp_syncing;
+}
+
+const char *system_time_sync_status(void)
+{
+    if (system_time_is_valid()) return "valid";
+    if (s_sntp_syncing) return "syncing";
+    if (s_sntp_failed) return "failed";
+    return "invalid";
 }
 
 const char *system_time_source_name(void)
@@ -58,7 +73,9 @@ static void sntp_sync_task(void *arg)
         strlcpy(reason, (const char *)arg, sizeof(reason));
         free(arg);
     }
-    ESP_LOGI(TAG, "sntp_start_after_ip reason=%s", reason[0] ? reason : "network_ip");
+    s_sntp_syncing = true;
+    s_sntp_failed = false;
+    ESP_LOGI(TAG, "sntp_start_after_ip reason=%s time_sync_status=syncing", reason[0] ? reason : "network_ip");
     if (!s_sntp_initialized && !sntp_enabled()) {
         sntp_setoperatingmode(SNTP_OPMODE_POLL);
         sntp_setservername(0, "time.google.com");
@@ -77,8 +94,10 @@ static void sntp_sync_task(void *arg)
         system_time_mark_sntp_synced((int64_t)now);
         ESP_LOGI(TAG, "sntp_sync_ok time_valid=true unix=%ld", (long)now);
     } else {
-        ESP_LOGW(TAG, "sntp_sync_timeout time_valid=false");
+        s_sntp_failed = true;
+        ESP_LOGW(TAG, "sntp_sync_timeout time_valid=false time_sync_status=failed");
     }
+    s_sntp_syncing = false;
     s_sntp_task = NULL;
     vTaskDelete(NULL);
 }
@@ -86,7 +105,7 @@ static void sntp_sync_task(void *arg)
 esp_err_t system_time_sntp_start_async(const char *reason)
 {
     if (system_time_is_valid() && system_time_source() == SYSTEM_TIME_SOURCE_SNTP) return ESP_OK;
-    if (s_sntp_task) return ESP_OK;
+    if (s_sntp_task) { s_sntp_syncing = true; return ESP_OK; }
     char *task_reason = NULL;
     if (reason && reason[0]) {
         task_reason = strdup(reason);
@@ -132,6 +151,7 @@ esp_err_t system_time_append_json(cJSON *root)
     time_t now = time(NULL);
     cJSON_AddBoolToObject(time_obj, "time_valid", system_time_is_valid());
     cJSON_AddStringToObject(time_obj, "source", system_time_source_name());
+    cJSON_AddStringToObject(time_obj, "sync_status", system_time_sync_status());
     cJSON_AddNumberToObject(time_obj, "unix_time", (double)now);
     cJSON_AddNumberToObject(time_obj, "last_sync_unix", (double)system_time_last_sync_unix());
     cJSON_AddStringToObject(time_obj, "timezone", s_timezone);

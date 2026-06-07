@@ -283,6 +283,7 @@ esp_err_t ads1115_install(const ads1115_device_config_t* configs, size_t count)
     size_t ready = 0;
     for (size_t i = 0; i < count; ++i) {
         const ads1115_device_config_t* cfg = &configs[i];
+        ESP_LOGI(TAG, "i2c_optional: ADS1115 addr=0x%02X configured, probe", cfg->address);
         ads1115_device_t* dev = &s_devices[ready];
 
         i2c_device_config_t dev_cfg = {
@@ -323,6 +324,7 @@ esp_err_t ads1115_install(const ads1115_device_config_t* configs, size_t count)
         err = apply_config_to_device(dev, cfg->default_mux);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "ADS1115 @0x%02X configuration failed: %s", cfg->address, esp_err_to_name(err));
+            ESP_LOGW(TAG, "i2c_optional: ADS1115 addr=0x%02X configured but not detected after 3 attempts, marked offline", cfg->address);
             goto skip_device;
         }
 

@@ -17,6 +17,7 @@
 #include "esp_event.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "esp_eth.h"
 #include "esp_log.h"
@@ -59,6 +60,23 @@ static const char *TAG = "cloud_mqtt";
 
 static esp_mqtt_client_handle_t s_client = NULL;
 
+typedef enum {
+    MQTT_STATE_DISABLED = 0,
+    MQTT_STATE_STOPPED,
+    MQTT_STATE_WAIT_NETWORK,
+    MQTT_STATE_STARTING,
+    MQTT_STATE_CONNECTED,
+    MQTT_STATE_DISCONNECTING,
+    MQTT_STATE_BACKOFF
+} mqtt_runtime_state_t;
+
+static SemaphoreHandle_t        s_mqtt_lock = NULL;
+static StaticSemaphore_t        s_mqtt_lock_buf;
+static mqtt_runtime_state_t     s_runtime_state = MQTT_STATE_STOPPED;
+static bool                     s_connected_stable = false;
+static bool                     s_discovery_sent_boot = false;
+static bool                     s_initial_sent_session = false;
+
 static bool                     s_connected = false;
 static bool                     s_config_initialized = false;
 static char                     s_device_id[64] = {0};
@@ -95,10 +113,13 @@ static bool                     s_secret_ready = false;
 
 typedef enum {
     MQTT_ASYNC_PUBLISH_STATE = 1,
+    MQTT_ASYNC_CONNECTED_STABLE,
 } mqtt_async_job_t;
 
 static QueueHandle_t            s_publish_queue = NULL;
 static TaskHandle_t             s_publish_task = NULL;
+
+static esp_err_t mqtt_publish_initial_states(void);
 
 static void mqtt_publish_worker(void *arg)
 {
@@ -111,6 +132,19 @@ static void mqtt_publish_worker(void *arg)
         switch (job) {
         case MQTT_ASYNC_PUBLISH_STATE:
             (void)mqtt_publish_state();
+            break;
+        case MQTT_ASYNC_CONNECTED_STABLE:
+            vTaskDelay(pdMS_TO_TICKS(750));
+            if (!mqtt_is_connected() || network_transition_in_progress() || !network_primary_ready()) break;
+            if (s_discovery_enabled && !s_discovery_sent_boot) {
+                esp_err_t d_err = mqtt_publish_discovery();
+                if (d_err == ESP_OK) s_discovery_sent_boot = true;
+                vTaskDelay(pdMS_TO_TICKS(250));
+            }
+            if (!s_initial_sent_session && mqtt_is_connected()) {
+                esp_err_t i_err = mqtt_publish_initial_states();
+                if (i_err == ESP_OK) s_initial_sent_session = true;
+            }
             break;
         default:
             break;
@@ -137,7 +171,7 @@ static esp_err_t mqtt_async_ensure_worker(void)
 
 esp_err_t mqtt_publish_state_async(void)
 {
-    if (!s_enabled || !s_client) {
+    if (!s_enabled || !mqtt_is_connected()) {
         return ESP_OK;
     }
     esp_err_t err = mqtt_async_ensure_worker();
@@ -319,10 +353,27 @@ static inline const char* alarm_state_to_name(alarm_state_t st)
     }
 }
 
+static bool mqtt_lock_take(TickType_t ticks)
+{
+    if (!s_mqtt_lock) s_mqtt_lock = xSemaphoreCreateMutexStatic(&s_mqtt_lock_buf);
+    return !s_mqtt_lock || xSemaphoreTake(s_mqtt_lock, ticks) == pdTRUE;
+}
+
+static void mqtt_lock_give(void)
+{
+    if (s_mqtt_lock) xSemaphoreGive(s_mqtt_lock);
+}
+
+static bool mqtt_connected_stable(void)
+{
+    return s_client && s_connected && s_connected_stable && s_runtime_state == MQTT_STATE_CONNECTED &&
+           !network_transition_in_progress() && network_primary_ready();
+}
+
 static esp_err_t publish_raw(const char *topic, const char *payload, int qos, bool retain)
 {
-    if (!s_client) {
-        ESP_LOGE(TAG, "publish error topic=%s code=%s", topic ? topic : "(null)", esp_err_to_name(ESP_ERR_INVALID_STATE));
+    if (!mqtt_connected_stable()) {
+        ESP_LOGW(TAG, "publish skipped topic=%s reason=mqtt_not_connected_stable", topic ? topic : "(null)");
         return ESP_ERR_INVALID_STATE;
     }
     if (!topic || !payload) {
@@ -430,7 +481,7 @@ static int first_zone_in_mask(const zone_mask_t *mask, uint16_t total)
 // ─────────────────────────────────────────────────────────────────────────────
 esp_err_t mqtt_publish_state(void)
 {
-    if (!s_client) return ESP_ERR_INVALID_STATE;
+    if (!mqtt_connected_stable()) return ESP_ERR_INVALID_STATE;
 
     alarm_state_t st = alarm_get_state();
     uint32_t exit_ms = 0, entry_ms = 0;
@@ -626,7 +677,7 @@ esp_err_t mqtt_publish_state(void)
 
 static esp_err_t publish_zones_internal(const zone_mask_t *mask, bool force)
 {
-    if (!s_client) return ESP_ERR_INVALID_STATE;
+    if (!mqtt_connected_stable()) return ESP_ERR_INVALID_STATE;
     uint16_t total = roster_effective_zones(inputs_master_zone_capacity());
     if (total > SCENES_MAX_ZONES) {
         total = SCENES_MAX_ZONES;
@@ -716,7 +767,7 @@ esp_err_t mqtt_publish_zones(const zone_mask_t *mask)
 
 esp_err_t mqtt_publish_scenes(void)
 {
-    if (!s_client) return ESP_ERR_INVALID_STATE;
+    if (!mqtt_connected_stable()) return ESP_ERR_INVALID_STATE;
 
     zone_mask_t mask_home, mask_night, mask_custom, mask_active;
     scenes_get_mask(SCENE_HOME, &mask_home);
@@ -821,14 +872,14 @@ static esp_err_t mqtt_publish_initial_states(void)
 
 esp_err_t mqtt_publish_event_json(const char *payload, const char *severity)
 {
-    if (!s_client || !payload) return ESP_ERR_INVALID_STATE;
+    if (!mqtt_connected_stable() || !payload) return ESP_ERR_INVALID_STATE;
     esp_err_t err = publish_raw(s_topic_events, payload, CONFIG_APP_CLOUD_QOS_STATE, false);
     if (severity && strcmp(severity, "critical") == 0) publish_raw(s_topic_events_critical, payload, CONFIG_APP_CLOUD_QOS_STATE, false);
     if (severity && strcmp(severity, "technical") == 0) publish_raw(s_topic_events_technical, payload, CONFIG_APP_CLOUD_QOS_STATE, false);
     return err;
 }
 
-bool mqtt_is_connected(void) { return s_connected; }
+bool mqtt_is_connected(void) { return mqtt_connected_stable(); }
 
 static void publish_discovery_config_payload(const char *topic, const char *payload, size_t *count, esp_err_t *first_err)
 {
@@ -853,7 +904,7 @@ static bool mqtt_command_pin_valid(cJSON *root)
 
 esp_err_t mqtt_publish_discovery(void)
 {
-    if (!s_client || !s_discovery_enabled) return ESP_OK;
+    if (!mqtt_connected_stable() || !s_discovery_enabled) return ESP_OK;
     size_t discovery_count = 0;
     char topic[MQTT_TOPIC_MAX_LEN];
     snprintf(topic, sizeof(topic), "%s/alarm_control_panel/%s/panel/config", s_discovery_prefix, s_device_id);
@@ -1296,17 +1347,24 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     switch ((esp_mqtt_event_id_t)event_id) {
     case MQTT_EVENT_CONNECTED:
         s_connected = true;
+        s_connected_stable = true;
+        s_runtime_state = MQTT_STATE_CONNECTED;
+        s_initial_sent_session = false;
         ESP_LOGI(TAG, "MQTT connected");
-        publish_availability("online");
-        notification_events_emit_simple("mqtt_connected", NOTIFY_SEVERITY_TECHNICAL, "mqtt", -1, "MQTT connesso", "Connessione broker attiva", false);
         esp_mqtt_client_subscribe(s_client, s_topic_cmd_sub, CONFIG_APP_CLOUD_QOS_COMMANDS);
         esp_mqtt_client_subscribe(s_client, s_topic_alarm_cmd, CONFIG_APP_CLOUD_QOS_COMMANDS);
         esp_mqtt_client_subscribe(s_client, s_topic_notify_ack, CONFIG_APP_CLOUD_QOS_COMMANDS);
-        mqtt_publish_discovery();
-        mqtt_publish_initial_states();
+        publish_availability("online");
+        notification_events_emit_simple("mqtt_connected", NOTIFY_SEVERITY_TECHNICAL, "mqtt", -1, "MQTT connesso", "Connessione broker attiva", false);
+        if (mqtt_async_ensure_worker() == ESP_OK) {
+            mqtt_async_job_t job = MQTT_ASYNC_CONNECTED_STABLE;
+            (void)xQueueSend(s_publish_queue, &job, 0);
+        }
         break;
     case MQTT_EVENT_DISCONNECTED:
         s_connected = false;
+        s_connected_stable = false;
+        s_runtime_state = MQTT_STATE_BACKOFF;
         ESP_LOGW(TAG, "MQTT disconnected");
         notification_events_emit_simple("mqtt_disconnected", NOTIFY_SEVERITY_TECHNICAL, "mqtt", -1, "MQTT disconnesso", "Broker MQTT non raggiungibile", false);
         break;
@@ -1341,23 +1399,33 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
 esp_err_t mqtt_start(void)
 {
     static int64_t s_last_deferred_log_us = 0;
-    if (s_client) return ESP_OK;
+    if (!mqtt_lock_take(pdMS_TO_TICKS(2000))) return ESP_ERR_TIMEOUT;
+    if (s_client || s_runtime_state == MQTT_STATE_STARTING || s_runtime_state == MQTT_STATE_CONNECTED) {
+        mqtt_lock_give();
+        ESP_LOGD(TAG, "mqtt_start idempotent state=%d", (int)s_runtime_state);
+        return ESP_OK;
+    }
 
     if (!s_config_initialized) {
         mqtt_prepare_configuration();
     }
     if (!s_enabled) {
+        s_runtime_state = MQTT_STATE_DISABLED;
+        mqtt_lock_give();
         ESP_LOGI(TAG, "MQTT disabled");
         return ESP_OK;
     }
-    if (!network_has_real_connectivity()) {
+    if (!network_has_real_connectivity() || network_transition_in_progress() || !network_primary_ready()) {
         int64_t now = esp_timer_get_time();
         if (s_last_deferred_log_us == 0 || (now - s_last_deferred_log_us) >= 30000000LL) {
             ESP_LOGW(TAG, "MQTT sospeso: nessuna connettività reale (eventuale solo AP setup)");
             s_last_deferred_log_us = now;
         }
+        s_runtime_state = MQTT_STATE_WAIT_NETWORK;
+        mqtt_lock_give();
         return ESP_ERR_INVALID_STATE;
     }
+    s_runtime_state = MQTT_STATE_STARTING;
 
     bool tls_uri = (strncasecmp(s_mqtt_uri, "mqtts://", 8) == 0) ||
                    (strncasecmp(s_mqtt_uri, "wss://", 6) == 0);
@@ -1396,13 +1464,15 @@ esp_err_t mqtt_start(void)
     }
 
     s_client = esp_mqtt_client_init(&cfg);
-    ESP_RETURN_ON_FALSE(s_client != NULL, ESP_ERR_NO_MEM, TAG, "mqtt init");
+    if (!s_client) { s_runtime_state = MQTT_STATE_STOPPED; mqtt_lock_give(); return ESP_ERR_NO_MEM; }
 
     esp_err_t err = esp_mqtt_client_register_event(s_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "MQTT register evt failed: %s", esp_err_to_name(err));
         esp_mqtt_client_destroy(s_client);
         s_client = NULL;
+        s_runtime_state = MQTT_STATE_STOPPED;
+        mqtt_lock_give();
         return err;
     }
 
@@ -1412,9 +1482,13 @@ esp_err_t mqtt_start(void)
         esp_mqtt_client_destroy(s_client);
         s_client = NULL;
         s_connected = false;
+        s_connected_stable = false;
+        s_runtime_state = MQTT_STATE_BACKOFF;
+        mqtt_lock_give();
         return err;
     }
     ESP_LOGI(TAG, "MQTT client started (device_id=%s)", s_device_id);
+    mqtt_lock_give();
 
     return ESP_OK;
 }
@@ -1422,11 +1496,18 @@ esp_err_t mqtt_start(void)
 
 esp_err_t mqtt_stop(void)
 {
+    if (!mqtt_lock_take(pdMS_TO_TICKS(3000))) return ESP_ERR_TIMEOUT;
     if (!s_client) {
         s_connected = false;
+        s_connected_stable = false;
+        s_initial_sent_session = false;
         s_config_initialized = false;
+        s_runtime_state = MQTT_STATE_STOPPED;
+        mqtt_lock_give();
         return ESP_OK;
     }
+    s_runtime_state = MQTT_STATE_DISCONNECTING;
+    s_connected_stable = false;
 
     esp_err_t stop_err = esp_mqtt_client_stop(s_client);
     if (stop_err != ESP_OK) {
@@ -1440,7 +1521,11 @@ esp_err_t mqtt_stop(void)
 
     s_client = NULL;
     s_connected = false;
+    s_connected_stable = false;
+    s_initial_sent_session = false;
     s_config_initialized = false;
+    s_runtime_state = MQTT_STATE_STOPPED;
+    mqtt_lock_give();
 
     if (stop_err != ESP_OK) {
         return stop_err;
@@ -1450,6 +1535,10 @@ esp_err_t mqtt_stop(void)
 
 esp_err_t mqtt_reload_config(void)
 {
+    if (network_transition_in_progress() || !network_primary_ready()) {
+        ESP_LOGW(TAG, "MQTT reload deferred: network transition or primary not ready");
+        return ESP_OK;
+    }
     esp_err_t err = mqtt_stop();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "MQTT reload failed to stop client: %s", esp_err_to_name(err));

@@ -393,16 +393,16 @@ static void ads_modules_load_defaults(void)
     memset(s_ads_modules, 0, sizeof(s_ads_modules));
     s_ads_module_count = 0;
 #if ADS1115_COUNT > 0
-    ads_fill_default_module(s_ads_module_count++, ADS1115_ADDR_0);
+    ESP_LOGI(TAG, "i2c_optional: ADS1115 addr=0x%02X not configured, skip probe", ADS1115_ADDR_0);
 #endif
 #if ADS1115_COUNT > 1
-    ads_fill_default_module(s_ads_module_count++, ADS1115_ADDR_1);
+    ESP_LOGI(TAG, "i2c_optional: ADS1115 addr=0x%02X not configured, skip probe", ADS1115_ADDR_1);
 #endif
 #if ADS1115_COUNT > 2
-    ads_fill_default_module(s_ads_module_count++, ADS1115_ADDR_2);
+    ESP_LOGI(TAG, "i2c_optional: ADS1115 addr=0x%02X not configured, skip probe", ADS1115_ADDR_2);
 #endif
 #if ADS1115_COUNT > 3
-    ads_fill_default_module(s_ads_module_count++, ADS1115_ADDR_3);
+    ESP_LOGI(TAG, "i2c_optional: ADS1115 addr=0x%02X not configured, skip probe", ADS1115_ADDR_3);
 #endif
 }
 
@@ -644,9 +644,11 @@ esp_err_t inputs_init(void)
 
 #if ADS1115_COUNT > 0
     ESP_RETURN_ON_ERROR(ads_modules_load_config(), TAG, "ads cfg");
-    esp_err_t scan_err = inputs_ads1115_scan();
-    if (scan_err != ESP_OK) {
-        ESP_LOGW(TAG, "Scan ADS1115 iniziale fallito: %s", esp_err_to_name(scan_err));
+    if (s_ads_module_count > 0) {
+        esp_err_t scan_err = inputs_ads1115_scan();
+        if (scan_err != ESP_OK) {
+            ESP_LOGW(TAG, "Scan ADS1115 iniziale fallito: %s", esp_err_to_name(scan_err));
+        }
     }
     esp_err_t ads_err = ads_reinstall_enabled_devices();
     if (ads_err == ESP_ERR_NOT_FOUND) {
@@ -798,6 +800,12 @@ static void ads_refresh_runtime_from_scan_result(const ads1115_scan_result_t* sc
     for (size_t i = 0; i < s_ads_module_count; ++i) {
         input_ads1115_module_t* mod = &s_ads_modules[i];
         if (!mod->configured || !ads1115_is_valid_address(mod->cfg.address)) continue;
+        if (!mod->enabled) {
+            ESP_LOGI(TAG, "i2c_optional: ADS1115 addr=0x%02X configured disabled, skip probe", mod->cfg.address);
+            mod->detected = false;
+            mod->online = false;
+            continue;
+        }
         bool was_online = mod->online;
         mod->detected = scan->detected[mod->cfg.address - 0x48];
         mod->last_scan_ms = scan->scan_time_ms;
@@ -811,6 +819,9 @@ static void ads_refresh_runtime_from_scan_result(const ads1115_scan_result_t* sc
             mod->last_error = ESP_ERR_NOT_FOUND;
             mod->consecutive_failures++;
             strlcpy(s_ads_last_error, "missing", sizeof(s_ads_last_error));
+            if (mod->consecutive_failures == 3) {
+                ESP_LOGW(TAG, "i2c_optional: ADS1115 addr=0x%02X configured but not detected after 3 attempts, marked offline", mod->cfg.address);
+            }
             if (was_online) ads_emit_module_event(mod, "ads1115_offline", NOTIFY_SEVERITY_TECHNICAL, "ADS1115 offline");
             else if (mod->consecutive_failures == 1) ads_emit_module_event(mod, "ads1115_missing", NOTIFY_SEVERITY_WARNING, "ADS1115 non rilevato");
         }

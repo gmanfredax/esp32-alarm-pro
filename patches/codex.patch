@@ -1,143 +1,162 @@
-diff --git a/spiffs/js/login.js b/spiffs/js/login.js
-index 5bdf095f0645ebdeb4102d5f1215eb537418e31b..b64ecb6a42b8702ea01ec409f2311488fff0c79f 100755
---- a/spiffs/js/login.js
-+++ b/spiffs/js/login.js
-@@ -11,50 +11,51 @@ import {
-   setSystemId,
-   setToken
- } from './api.js';
+diff --git a/spiffs/js/admin.js b/spiffs/js/admin.js
+index 8544071a7b6d2b8420e6cdb51b65a3d505814a87..2ccd189a106b2e827b7ee4720c683948d48335c0 100755
+--- a/spiffs/js/admin.js
++++ b/spiffs/js/admin.js
+@@ -37,55 +37,55 @@
+     };
+   })();
  
- const form = document.getElementById('loginForm');
- const systemInput = document.getElementById('systemId');
- const userInput = document.getElementById('username');
- const passInput = document.getElementById('password');
- const otpField = document.getElementById('otpField');
- const otpInput = document.getElementById('otp');
- const submitBtn = document.getElementById('loginSubmit');
- const recoveryField = document.getElementById('recoveryField');
- const recoveryInput = document.getElementById('recoveryCode');
- const fallbackActions = document.getElementById('fallbackActions');
- const btnSetupLimited = document.getElementById('btnSetupLimited');
- const btnBrowserTime = document.getElementById('btnBrowserTime');
- const btnUseRecovery = document.getElementById('btnUseRecovery');
- const messageEl = document.getElementById('loginMessage');
- const footYear = document.getElementById('footYear');
- 
- let otpRequired = false;
- let pendingRequest = false;
- let recoveryMode = false;
- let setupLimitedMode = false;
- let lanSystemLocked = false;
-+let timeRetryTimer = null;
- 
- if (footYear) footYear.textContent = String(new Date().getFullYear());
- 
- const savedSuffix = getSystemSuffix();
- if (savedSuffix) {
-   systemInput.value = savedSuffix;
- }
- 
- function updateSystemInputLock(){
-   if (!systemInput) return;
-   if (lanSystemLocked) {
-     systemInput.readOnly = true;
-     systemInput.setAttribute('aria-readonly', 'true');
-     systemInput.classList.add('input-readonly');
-   } else {
-     systemInput.readOnly = false;
-     systemInput.removeAttribute('aria-readonly');
-     systemInput.classList.remove('input-readonly');
+   // ========== Helpers UI / auth ==========
+   function toast(msg, ok=true){
+     let el = $("#toast");
+     if (!el){
+       el = document.createElement("div");
+       el.id = "toast";
+       el.className = "toast";
+       Object.assign(el.style, {position:"fixed",bottom:"18px",left:"18px",padding:".6rem .8rem",borderRadius:"10px",background:"rgba(20,28,44,.95)",border:"1px solid var(--border)",color:"var(--text)",zIndex:2000,boxShadow:"0 6px 24px rgba(0,0,0,.35)",maxWidth:"80%"});
+       document.body.appendChild(el);
+     }
+     el.textContent = msg;
+     el.style.borderColor = ok ? "rgba(16,185,129,.45)" : "rgba(239,68,68,.55)";
+     el.style.background = ok ? "rgba(10,20,24,.95)" : "rgba(32,12,12,.95)";
+     clearTimeout(el._t); el._t = setTimeout(()=>{ el.remove(); }, 2400);
    }
- }
+   const needLogin = () => location.replace("/login.html");
  
- function isLanHostname(hostname){
-   const value = (hostname || '').toLowerCase();
-   if (!value) return false;
-   if (value === 'localhost' || value === '::1') return true;
-@@ -160,60 +161,85 @@ function setDisabled(disabled){
-   [userInput, passInput, otpInput, recoveryInput, submitBtn, btnSetupLimited, btnBrowserTime, btnUseRecovery].forEach((el) => {
-     if (el) el.disabled = disabled;
-   });
-   if (systemInput) {
-     systemInput.disabled = disabled;
-     if (!disabled) {
-       updateSystemInputLock();
+   let currentUser = "";
+   let isAdmin = false;
+ let setupLimited = false;
+ let lastRecoveryCodes = [];
+ 
+-  async function apiGet(url){
++  async function apiGet(url, opts = {}){
+     console.debug("[api] GET", url);
+     let r;
+     try {
+-      r = await fetch(url, { headers: { "Accept":"application/json" } });
++      r = await fetch(url, { headers: { "Accept":"application/json" }, __skipAuthRedirect: opts.skipAuthRedirect === true });
+     } catch (err) {
+       console.warn("[api] GET fetch error", url, err);
+       throw new Error("Impossibile raggiungere la centrale. Verifica se la rete è cambiata o ricarica la pagina.");
+     }
+     console.debug("[api] GET status", url, r.status);
+     if (r.status === 401) { needLogin(); throw new Error("401"); }
+     if (!r.ok) throw new Error(await r.text());
+     try {
+       const data = await r.json();
+       console.debug("[api] GET json", url, data);
+       return data;
+     } catch (err) {
+       throw new Error("Risposta JSON non valida");
      }
    }
-   if (submitBtn) submitBtn.textContent = disabled ? 'Attendere…' : 'Accedi';
- }
- 
- function hideFallbackChoices(){
-   if (fallbackActions) fallbackActions.classList.add('hidden');
- }
- 
- function showRecoveryField(){
-   recoveryMode = true;
-   setupLimitedMode = false;
-   if (recoveryField) recoveryField.classList.remove('hidden');
-   if (recoveryInput) { recoveryInput.required = true; recoveryInput.focus(); }
-   if (otpField) otpField.classList.add('hidden');
-   setMessage('Inserisci un codice di recupero monouso.');
- }
- 
-+function stopTimeRetry(){
-+  if (timeRetryTimer) clearInterval(timeRetryTimer);
-+  timeRetryTimer = null;
-+}
-+
-+function startTimeRetry(){
-+  if (timeRetryTimer) return;
-+  setMessage('Sincronizzazione orario in corso via SNTP... ritento automaticamente.', 'success');
-+  timeRetryTimer = setInterval(async () => {
-+    try {
-+      const status = await apiRequest('/api/network/status', { method: 'GET', auth: false });
-+      if (status?.time?.time_valid || status?.time_valid) {
-+        stopTimeRetry();
-+        hideFallbackChoices();
-+        showOtpField();
-+        setMessage('Ora sincronizzata via SNTP. Inserisci il codice OTP.', 'success');
-+      }
-+    } catch {
-+      // Durante il cambio rete è normale non ricevere risposta: non mostrare Failed to fetch.
-+    }
-+  }, 3000);
-+}
-+
- function showTimeInvalidFallback(message){
-   otpRequired = false;
-   recoveryMode = false;
-   setupLimitedMode = false;
-   if (otpField) otpField.classList.add('hidden');
-   if (fallbackActions) fallbackActions.classList.remove('hidden');
--  setMessage(message || 'La centrale non ha un orario valido. Puoi configurare la rete, sincronizzare l\'ora da questo dispositivo o usare un codice di recupero.');
-+  setMessage(message || 'La centrale non ha un orario valido. Sincronizzazione SNTP in corso se la rete ha Internet; in alternativa configura la rete, sincronizza l\'ora dal dispositivo o usa un codice di recupero.');
-+  startTimeRetry();
- }
- 
- function showOtpField(){
-+  stopTimeRetry();
-   otpRequired = true;
-   if (otpField) otpField.classList.remove('hidden');
-   if (otpInput) {
-     otpInput.required = true;
-     otpInput.focus();
+   async function apiPost(url, body, opts = {}){
+     console.debug("[api] POST", url, redactNetworkPayload(body));
+     let r;
+     try {
+       r = await fetch(url, {
+         method: "POST",
+         headers: { "Content-Type": "application/json", "Accept":"application/json" },
+         body: body!=null ? JSON.stringify(body) : undefined,
+         __skipAuthRedirect: opts.skipAuthRedirect === true
+       });
+@@ -2437,64 +2437,89 @@ let lastRecoveryCodes = [];
+     const apBox = $("#netFallback");
+     if (apBox) apBox.innerHTML = netRows([
+       ["Configurazione", netBool(ap.enabled !== false, "abilitato", "disabilitato")],
+       ["Runtime", netBool(!!ap.active, "attivo", "non attivo")],
+       ["SSID AP", netValue(ap.ssid)], ["IP AP", netValue(ap.ip || "192.168.4.1")], ["Netmask AP", netValue(ap.netmask)],
+       ["Client", netValue(ap.clients)], ["Avvii AP", netValue(ap.start_count)],
+       ["Periodo di grazia", ap.grace_active ? `<span class="tag warn">${Number(ap.grace_remaining_s || 0)} s</span>` : "—"],
+       ["Ultimo motivo", netValue(ap.last_reason)], ["Ultimo evento client", netValue(ap.last_client_event)],
+     ]);
    }
-   hideFallbackChoices();
-   if (recoveryField) recoveryField.classList.add('hidden');
-   if (recoveryInput) recoveryInput.required = false;
-   setMessage('Inserisci il codice OTP generato dalla tua app.');
- }
- 
- function markInvalid(input){
-   if (!input) return;
-   input.classList.add('input-error');
-   input.addEventListener('input', () => input.classList.remove('input-error'), { once: true });
- }
- 
- form?.addEventListener('submit', async (event) => {
-   event.preventDefault();
-   if (pendingRequest) return;
- 
-   const rawSuffix = systemInput?.value.trim() || '';
-   const suffix = sanitizeSystemId(rawSuffix);
-   const user = userInput?.value.trim() || '';
+   function readNetworkBody(){
+     const mode = $("#net_mode")?.value || "ethernet_only";
+     const ssid = ($("#net_wifi_ssid")?.value || "").trim();
+     const password = $("#net_wifi_password")?.value || "";
+     const setupPass = $("#net_setup_password")?.value || "";
+     if ((mode === "wifi_only" || mode === "ethernet_preferred" || mode === "wifi_preferred") && !ssid) throw new Error("SSID Wi‑Fi obbligatorio per la modalità scelta");
+     const body = { network_mode: mode, hostname: ($("#net_host")?.value || "").trim(), wifi: { ssid }, setup_ap: { enabled: ($("#net_setup_enabled")?.value || "1") === "1" } };
+     if (password) body.wifi.password = password;
+     if (setupPass) body.setup_ap.password = setupPass;
+     return body;
+   }
+   function showApplying(resp, ssid){
+     const box = $("#networkApplying");
+     if (!box) return;
+     const host = resp?.hostname || ($("#net_host")?.value || "nsalarmpro").trim() || "nsalarmpro";
+-    const ip = resp?.new_ip || "";
+-    const grace = Number(resp?.setup_ap_grace_s || 120);
++    const ip = resp?.primary_ip || resp?.new_ip || "";
++    const grace = Number(resp?.fallback_ap_grace_remaining_s || resp?.setup_ap_grace_s || 120);
+     const ipUrl = resp?.redirect_url || (ip ? `http://${ip}/` : "");
+     const mdns = resp?.mdns_url || `http://${host}.local/`;
+     box.classList.remove("hidden");
+-    box.innerHTML = `<h3>Configurazione rete salvata</h3>
+-      <p>Configurazione salvata. Riconnetti telefono/PC alla rete principale ${ssid ? `<strong>${escapeHtml(ssid)}</strong>` : ""} e apri ${ipUrl ? `<a href="${ipUrl}">${ipUrl}</a>` : "il nuovo IP"} oppure <a href="${mdns}">${mdns}</a>.</p>
+-      <div class="net-kv-grid"><div class="net-kv"><span>Nuovo IP noto</span><strong>${escapeHtml(ip || "in attesa")}</strong></div><div class="net-kv"><span>Hostname</span><strong>${escapeHtml(host)}</strong></div><div class="net-kv"><span>AP fallback grace</span><strong><span id="netApplyCountdown">${grace}</span> s</strong></div></div>
+-      <p>La centrale si sta collegando alla rete principale. Riconnetti questo dispositivo alla rete Wi‑Fi/rete principale, poi apri il nuovo URL.</p>
+-      <p><a class="btn" href="/setup">Torna al setup fallback</a></p>
+-      <p class="muted">Il polling/redirect automatico partirà dopo un tempo ragionevole; se fallisce usa i link manuali. Non considerare errori di fetch durante il cambio rete.</p>`;
++    box.classList.add("network-transition-overlay");
++    box.innerHTML = `<div class="network-transition-backdrop"></div><div class="card network-transition-modal" role="dialog" aria-modal="true" aria-labelledby="netTransitionTitle">
++      <div class="modal-head"><h3 id="netTransitionTitle">Configurazione rete salvata</h3><span class="tag ${resp?.non_destructive_apply ? 'ok' : 'warn'}">${resp?.non_destructive_apply ? 'apply non distruttivo' : 'transizione rete'}</span></div>
++      <div class="modal-body">
++        <p>Finché questo dispositivo resta collegato all’AP fallback, potrebbe non passare automaticamente alla rete principale. Riconnetti telefono/PC alla rete principale ${ssid ? `<strong>${escapeHtml(ssid)}</strong>` : ""} e apri il nuovo indirizzo.</p>
++        <div class="net-kv-grid">
++          <div class="net-kv"><span>IP principale</span><strong id="netTransitionIp">${escapeHtml(ip || "in attesa rete")}</strong></div>
++          <div class="net-kv"><span>Hostname</span><strong>${escapeHtml(host)}</strong></div>
++          <div class="net-kv"><span>Grace AP fallback</span><strong><span id="netApplyCountdown">${grace}</span> s</strong></div>
++          <div class="net-kv"><span>Rete principale</span><strong id="netTransitionPrimary">${resp?.primary_network_ready ? 'pronta' : 'verifica in corso'}</strong></div>
++          <div class="net-kv"><span>SNTP</span><strong id="netTransitionTime">${resp?.time_sync_status === 'syncing' ? 'Sincronizzazione orario in corso...' : (resp?.time_valid ? 'orario valido' : 'in attesa')}</strong></div>
++        </div>
++        <p class="transition-links">${ipUrl ? `<a class="btn" id="netTransitionIpLink" href="${ipUrl}">${ipUrl}</a>` : `<span class="muted" id="netTransitionIpLink">IP in attesa</span>`}<a class="btn outline" href="${mdns}">${mdns}</a></p>
++        <div class="modal-actions"><button class="btn" id="btnStopApGrace" type="button">Spegni AP fallback e passa alla rete principale</button><a class="btn outline" href="/setup">Torna al setup fallback</a></div>
++        <p class="muted">Il polling continua durante il grace period. Gli errori di fetch sono normali se cambi rete.</p>
++      </div></div>`;
+     let left = grace;
+-    const timer = setInterval(() => { left -= 1; const el = $("#netApplyCountdown"); if (el) el.textContent = String(Math.max(0,left)); if (left <= 0) clearInterval(timer); }, 1000);
+-    setTimeout(() => { if (ipUrl) location.href = ipUrl; }, 25000);
++    const refresh = async () => {
++      try {
++        const st = await apiGet('/api/setup/network/transition', { skipAuthRedirect: true });
++        left = Number(st.fallback_ap_grace_remaining_s ?? left);
++        const ip2 = st.primary_ip || ip;
++        const url2 = st.redirect_url || (ip2 ? `http://${ip2}/` : "");
++        const ipEl = $("#netTransitionIp"); if (ipEl) ipEl.textContent = ip2 || "in attesa rete";
++        const linkEl = $("#netTransitionIpLink"); if (linkEl && url2) { linkEl.textContent = url2; linkEl.href = url2; linkEl.classList.add('btn'); }
++        const pEl = $("#netTransitionPrimary"); if (pEl) pEl.textContent = st.primary_network_ready ? `pronta (${st.active_interface})` : 'non pronta';
++        const tEl = $("#netTransitionTime"); if (tEl) tEl.textContent = st.time_sync_status === 'syncing' ? 'Sincronizzazione orario in corso...' : (st.time_valid ? 'orario valido' : 'orario non sincronizzato');
++      } catch {}
++    };
++    const timer = setInterval(() => { left = Math.max(0, left - 1); const el = $("#netApplyCountdown"); if (el) el.textContent = String(left); if (left <= 0) clearInterval(timer); }, 1000);
++    const poll = setInterval(refresh, 3000);
++    setTimeout(()=>clearInterval(poll), Math.max(130000, grace * 1000 + 5000));
++    $("#btnStopApGrace")?.addEventListener('click', async () => { try { const r = await apiPost('/api/setup/ap/stop-grace', {}, { skipAuthRedirect: true }); toast('AP fallback spento'); if (r.redirect_url) location.href = r.redirect_url; } catch(e) { toast('Stop AP fallback: ' + e.message, false); } });
++    refresh();
+   }
+   async function loadNetwork(){
+     try{
+       const c = await apiGet("/api/admin/network");
+       renderNetworkStatus(c);
+       $("#net_mode") && ($("#net_mode").value = c.configured_mode || c.network_mode || "ethernet_only");
+       $("#net_host") && ($("#net_host").value = c.hostname || "");
+       $("#net_wifi_ssid") && ($("#net_wifi_ssid").value = c.wifi?.ssid || "");
+       $("#net_wifi_password") && ($("#net_wifi_password").value = "");
+       const ap = c.fallback_ap || c.setup_ap || {};
+       $("#net_setup_enabled") && ($("#net_setup_enabled").value = ap.enabled === false ? "0" : "1");
+       $("#net_setup_password") && ($("#net_setup_password").value = "");
+     }catch(e){ toast("Errore caricando rete: " + e.message, false); }
+   }
+   function setupNetworkEventHandlers(){
+     $("#btnNetWifiScan")?.addEventListener("click", async ()=>{
+       try{
+         const res = await apiGet("/api/admin/network/wifi/scan");
+         const box = $("#netWifiScan");
+         if (box){
+           const nets = res.networks || [];
+           box.innerHTML = nets.length ? nets.map(n => `<button class="btn" type="button" data-ssid="${escapeHtml(n.ssid || "")}">${escapeHtml(n.ssid || "(nascosta)")} · ${n.rssi || 0} dBm · ${escapeHtml(n.security || "")}</button>`).join("") : "<div class=\"net-kv\"><span>Reti</span><strong>Nessuna rete trovata</strong></div>";
+           box.querySelectorAll("button[data-ssid]").forEach(b => b.addEventListener("click", ()=>{ const v=b.getAttribute("data-ssid")||""; if(v) $("#net_wifi_ssid").value=v; }));
+         }
+       }catch(e){ toast("Scansione Wi‑Fi fallita: " + e.message, false); }

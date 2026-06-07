@@ -59,11 +59,11 @@
 let setupLimited = false;
 let lastRecoveryCodes = [];
 
-  async function apiGet(url){
+  async function apiGet(url, opts = {}){
     console.debug("[api] GET", url);
     let r;
     try {
-      r = await fetch(url, { headers: { "Accept":"application/json" } });
+      r = await fetch(url, { headers: { "Accept":"application/json" }, __skipAuthRedirect: opts.skipAuthRedirect === true });
     } catch (err) {
       console.warn("[api] GET fetch error", url, err);
       throw new Error("Impossibile raggiungere la centrale. Verifica se la rete è cambiata o ricarica la pagina.");
@@ -2459,20 +2459,45 @@ let lastRecoveryCodes = [];
     const box = $("#networkApplying");
     if (!box) return;
     const host = resp?.hostname || ($("#net_host")?.value || "nsalarmpro").trim() || "nsalarmpro";
-    const ip = resp?.new_ip || "";
-    const grace = Number(resp?.setup_ap_grace_s || 120);
+    const ip = resp?.primary_ip || resp?.new_ip || "";
+    const grace = Number(resp?.fallback_ap_grace_remaining_s || resp?.setup_ap_grace_s || 120);
     const ipUrl = resp?.redirect_url || (ip ? `http://${ip}/` : "");
     const mdns = resp?.mdns_url || `http://${host}.local/`;
     box.classList.remove("hidden");
-    box.innerHTML = `<h3>Configurazione rete salvata</h3>
-      <p>Configurazione salvata. Riconnetti telefono/PC alla rete principale ${ssid ? `<strong>${escapeHtml(ssid)}</strong>` : ""} e apri ${ipUrl ? `<a href="${ipUrl}">${ipUrl}</a>` : "il nuovo IP"} oppure <a href="${mdns}">${mdns}</a>.</p>
-      <div class="net-kv-grid"><div class="net-kv"><span>Nuovo IP noto</span><strong>${escapeHtml(ip || "in attesa")}</strong></div><div class="net-kv"><span>Hostname</span><strong>${escapeHtml(host)}</strong></div><div class="net-kv"><span>AP fallback grace</span><strong><span id="netApplyCountdown">${grace}</span> s</strong></div></div>
-      <p>La centrale si sta collegando alla rete principale. Riconnetti questo dispositivo alla rete Wi‑Fi/rete principale, poi apri il nuovo URL.</p>
-      <p><a class="btn" href="/setup">Torna al setup fallback</a></p>
-      <p class="muted">Il polling/redirect automatico partirà dopo un tempo ragionevole; se fallisce usa i link manuali. Non considerare errori di fetch durante il cambio rete.</p>`;
+    box.classList.add("network-transition-overlay");
+    box.innerHTML = `<div class="network-transition-backdrop"></div><div class="card network-transition-modal" role="dialog" aria-modal="true" aria-labelledby="netTransitionTitle">
+      <div class="modal-head"><h3 id="netTransitionTitle">Configurazione rete salvata</h3><span class="tag ${resp?.non_destructive_apply ? 'ok' : 'warn'}">${resp?.non_destructive_apply ? 'apply non distruttivo' : 'transizione rete'}</span></div>
+      <div class="modal-body">
+        <p>Finché questo dispositivo resta collegato all’AP fallback, potrebbe non passare automaticamente alla rete principale. Riconnetti telefono/PC alla rete principale ${ssid ? `<strong>${escapeHtml(ssid)}</strong>` : ""} e apri il nuovo indirizzo.</p>
+        <div class="net-kv-grid">
+          <div class="net-kv"><span>IP principale</span><strong id="netTransitionIp">${escapeHtml(ip || "in attesa rete")}</strong></div>
+          <div class="net-kv"><span>Hostname</span><strong>${escapeHtml(host)}</strong></div>
+          <div class="net-kv"><span>Grace AP fallback</span><strong><span id="netApplyCountdown">${grace}</span> s</strong></div>
+          <div class="net-kv"><span>Rete principale</span><strong id="netTransitionPrimary">${resp?.primary_network_ready ? 'pronta' : 'verifica in corso'}</strong></div>
+          <div class="net-kv"><span>SNTP</span><strong id="netTransitionTime">${resp?.time_sync_status === 'syncing' ? 'Sincronizzazione orario in corso...' : (resp?.time_valid ? 'orario valido' : 'in attesa')}</strong></div>
+        </div>
+        <p class="transition-links">${ipUrl ? `<a class="btn" id="netTransitionIpLink" href="${ipUrl}">${ipUrl}</a>` : `<span class="muted" id="netTransitionIpLink">IP in attesa</span>`}<a class="btn outline" href="${mdns}">${mdns}</a></p>
+        <div class="modal-actions"><button class="btn" id="btnStopApGrace" type="button">Spegni AP fallback e passa alla rete principale</button><a class="btn outline" href="/setup">Torna al setup fallback</a></div>
+        <p class="muted">Il polling continua durante il grace period. Gli errori di fetch sono normali se cambi rete.</p>
+      </div></div>`;
     let left = grace;
-    const timer = setInterval(() => { left -= 1; const el = $("#netApplyCountdown"); if (el) el.textContent = String(Math.max(0,left)); if (left <= 0) clearInterval(timer); }, 1000);
-    setTimeout(() => { if (ipUrl) location.href = ipUrl; }, 25000);
+    const refresh = async () => {
+      try {
+        const st = await apiGet('/api/setup/network/transition', { skipAuthRedirect: true });
+        left = Number(st.fallback_ap_grace_remaining_s ?? left);
+        const ip2 = st.primary_ip || ip;
+        const url2 = st.redirect_url || (ip2 ? `http://${ip2}/` : "");
+        const ipEl = $("#netTransitionIp"); if (ipEl) ipEl.textContent = ip2 || "in attesa rete";
+        const linkEl = $("#netTransitionIpLink"); if (linkEl && url2) { linkEl.textContent = url2; linkEl.href = url2; linkEl.classList.add('btn'); }
+        const pEl = $("#netTransitionPrimary"); if (pEl) pEl.textContent = st.primary_network_ready ? `pronta (${st.active_interface})` : 'non pronta';
+        const tEl = $("#netTransitionTime"); if (tEl) tEl.textContent = st.time_sync_status === 'syncing' ? 'Sincronizzazione orario in corso...' : (st.time_valid ? 'orario valido' : 'orario non sincronizzato');
+      } catch {}
+    };
+    const timer = setInterval(() => { left = Math.max(0, left - 1); const el = $("#netApplyCountdown"); if (el) el.textContent = String(left); if (left <= 0) clearInterval(timer); }, 1000);
+    const poll = setInterval(refresh, 3000);
+    setTimeout(()=>clearInterval(poll), Math.max(130000, grace * 1000 + 5000));
+    $("#btnStopApGrace")?.addEventListener('click', async () => { try { const r = await apiPost('/api/setup/ap/stop-grace', {}, { skipAuthRedirect: true }); toast('AP fallback spento'); if (r.redirect_url) location.href = r.redirect_url; } catch(e) { toast('Stop AP fallback: ' + e.message, false); } });
+    refresh();
   }
   async function loadNetwork(){
     try{
